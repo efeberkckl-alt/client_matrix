@@ -1,0 +1,459 @@
+import { i18nService } from '../../services/i18n';
+import { getBackendApiUrl } from '../../services/endpoints';
+import { noobClawAuth } from '../../services/noobclawAuth';
+
+/**
+ * 云手机 — shared types, strings and helpers for MyPhonesView / PhoneCard / PhoneTaskDetail / PhoneTaskEditor.
+ * API: /api/mobile-console (desktop login token). See the cloud phone contract (devices, tasks, steps, commands).
+ */
+
+// ───────────────────────── i18n ─────────────────────────
+/** Simplified (zh) · Traditional (zh-TW) · English (everything else). */
+export const L = (zh: string, tw: string, en: string): string => {
+  const lang = i18nService.currentLanguage;
+  return lang === 'zh' ? zh : lang === 'zh-TW' ? tw : en;
+};
+export const isZh = (): boolean => i18nService.currentLanguage === 'zh' || i18nService.currentLanguage === 'zh-TW';
+
+// ───────────────────────── types ─────────────────────────
+export type Counts = Record<string, number>;
+export type PlatformId = 'tiktok' | 'douyin' | 'xhs';
+/** t = 剧本带的兜底文字:不认识的步骤代号就显示它(新步骤热更即可见) */
+export interface Step { ts: number; c: string; a?: Record<string, unknown> | null; t?: string }
+export type Schedule = { kind: 'every'; hours: number } | { kind: 'daily'; at: string } | { kind: 'random'; from: string; to: string } | { kind: 'manual' };
+
+export interface Progress {
+  run_id: string; task_id: string; counts: Counts; targets: Counts; credits: number; usd: number; started_at: number; steps: Step[];
+}
+export interface TaskView {
+  id: string; name: string; script_id: string; platform: string; schedule: Schedule | null; tz: string;
+  mode: 'keywords' | 'precise'; keywords: string[]; targets: string[]; level: string; persona: string;
+  caps: { likes: number; comments: number; follows: number; leads: number };
+  last_run_at: number | null; last_status: string | null; next_run_at: number | null;
+  totals: Counts; credits_total: number; usd_total: number;
+  last_counts: Counts; last_credits: number; last_usd: number; runs: number;
+  /** The stored task; absent only if the server didn't send it (then the phone's list must not be written). */
+  raw?: RawTask;
+}
+/** Full task object as stored (mobile_tasks.data.tasks[]); unknown fields are kept untouched. */
+export interface RawTask {
+  id: string; name: string; script_id: string; platform?: string; schedule?: Schedule; tz?: string;
+  max_likes?: number; max_comments?: number; max_follows?: number; persona?: string;
+  config?: Record<string, unknown>;
+  [k: string]: unknown;
+}
+export interface Device {
+  id: string; vendor: string; app_ver: string; ip?: string;
+  /** IP 归属地(服务端查好的;没有 = null) */
+  ip_geo?: { cc: string; zh: string; en: string } | null;
+  online: boolean; last_seen: number; created_at: number;
+  a11y: boolean; running: boolean; over_limit?: boolean;
+  /** Installed apps (older phone apps only send tiktok). */
+  apps?: { tiktok?: boolean; douyin?: boolean; xhs?: boolean };
+  /** Detected accounts; for douyin / xhs `handle` is the 抖音号 / 小红书号 (no '@'). */
+  accounts?: Partial<Record<PlatformId, { handle?: string; nickname?: string } | null>>;
+  tasks: TaskView[];
+  progress: Progress | null;
+}
+/** Fills in fields an older or partial server response may lack, so rendering never hits undefined. */
+export function normTask(t: any): TaskView {
+  const o = t && typeof t === 'object' ? t : {};
+  const arr = (x: any) => (Array.isArray(x) ? x.map(String) : []);
+  const obj = (x: any) => (x && typeof x === 'object' && !Array.isArray(x) ? x : {});
+  return {
+    ...o,
+    id: String(o.id || ''), name: String(o.name || ''), script_id: String(o.script_id || ''), platform: String(o.platform || 'tiktok'),
+    schedule: o.schedule && typeof o.schedule === 'object' ? o.schedule : null, tz: String(o.tz || ''),
+    mode: o.mode === 'keywords' ? 'keywords' : 'precise', keywords: arr(o.keywords), targets: arr(o.targets),
+    level: String(o.level || ''), persona: String(o.persona || ''),
+    caps: { likes: 0, comments: 0, follows: 0, leads: 0, ...obj(o.caps) },
+    last_run_at: o.last_run_at ?? null, last_status: o.last_status ?? null, next_run_at: o.next_run_at ?? null,
+    totals: obj(o.totals), credits_total: Number(o.credits_total) || 0, usd_total: Number(o.usd_total) || 0,
+    last_counts: obj(o.last_counts), last_credits: Number(o.last_credits) || 0, last_usd: Number(o.last_usd) || 0,
+    runs: Number(o.runs) || 0,
+    raw: o.raw && typeof o.raw === 'object' && !Array.isArray(o.raw) && typeof o.raw.id === 'string' ? o.raw : undefined,
+  } as TaskView;
+}
+export function normDevice(d: any): Device {
+  const o = d && typeof d === 'object' ? d : {};
+  return {
+    ...o,
+    id: String(o.id || ''), vendor: String(o.vendor || ''), app_ver: String(o.app_ver || ''),
+    online: o.online === true, last_seen: Number(o.last_seen) || 0, created_at: Number(o.created_at) || 0,
+    a11y: o.a11y === true, running: o.running === true,
+    apps: o.apps && typeof o.apps === 'object' ? o.apps : {},
+    accounts: o.accounts && typeof o.accounts === 'object' ? o.accounts : {},
+    tasks: (Array.isArray(o.tasks) ? o.tasks : []).filter((t: any) => t && typeof t === 'object' && t.id).map(normTask),
+    progress: o.progress && typeof o.progress === 'object' ? o.progress : null,
+    ip_geo: o.ip_geo && typeof o.ip_geo === 'object' ? { cc: String(o.ip_geo.cc || ''), zh: String(o.ip_geo.zh || ''), en: String(o.ip_geo.en || '') } : null,
+  } as Device;
+}
+export interface Run {
+  run_id: string; status: string; reason: string; dry_run: boolean; task_id: string; counts: Counts;
+  credits: number; usd: number; duration_ms: number; at: number;
+}
+export interface ConsoleConfig { apk_url?: string; vmos_url?: string; vmos_name?: string }
+
+// ───────────────────────── API ─────────────────────────
+export class ApiError extends Error {
+  status: number;
+  constructor(code: string, status: number) { super(code); this.status = status; }
+}
+
+const API_TIMEOUT_MS = 20_000;
+
+export async function api<T = any>(path: string, init?: RequestInit): Promise<T> {
+  // Every request gives up after 20 s so nothing (e.g. a batch in progress) can hang forever.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), API_TIMEOUT_MS);
+  try {
+    let res: Response;
+    try {
+      res = await fetch(`${getBackendApiUrl()}/api/mobile-console${path}`, {
+        ...init,
+        signal: ctrl.signal,
+        headers: { 'Content-Type': 'application/json', ...noobClawAuth.getAuthHeaders(), ...((init?.headers as Record<string, string>) || {}) },
+      });
+    } catch {
+      throw new ApiError(ctrl.signal.aborted ? 'timeout' : 'network_error', 0);
+    }
+    if (res.status === 401) noobClawAuth.handleAuthExpired();
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new ApiError(String(j?.error || `HTTP ${res.status}`), res.status);
+    return j as T;
+  } catch (e) {
+    if (ctrl.signal.aborted && !(e instanceof ApiError && e.message === 'timeout')) throw new ApiError('timeout', 0);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Turns an API error code into a short sentence. */
+export function errText(e: unknown): string {
+  const code = e instanceof Error ? e.message : String(e);
+  switch (code) {
+    case 'phone_offline': return L('手机离线', '手機離線', 'The phone is offline');
+    case 'concurrency_limit': return L('同时运行的手机已达会员上限，等其他手机跑完或升级会员', '同時運行的手機已達會員上限，等其他手機跑完或升級會員', 'Your plan’s limit of phones running at once is reached — wait or upgrade');
+    case 'phone_over_limit': return L('超出会员可用手机数，升级会员或移除不用的手机', '超出會員可用手機數，升級會員或移除不用的手機', "Over your plan's phone limit — upgrade or remove unused phones");
+    case 'app_update_required': return L('请先把手机上的 NoobClaw App 更新到最新版', '請先把手機上的 NoobClaw App 更新到最新版', 'Update the NoobClaw app on the phone first');
+    case 'phone_online': return L('手机在线，不能移除', '手機在線，不能移除', 'The phone is online and cannot be removed');
+    case 'one_task_per_platform': return L('每个平台只能建 1 个任务', '每個平台只能建 1 個任務', 'Only one task per platform');
+    case 'task_not_found': return L('任务不存在，可能已被删除', '任務不存在，可能已被刪除', 'Task not found — it may have been deleted');
+    case 'device_not_found': return L('手机不存在，可能已被移除', '手機不存在，可能已被移除', 'Phone not found — it may have been removed');
+    case 'too_many_tasks': return L('任务数量超出上限', '任務數量超出上限', 'Too many tasks on this phone');
+    case 'duplicate_task_id': return L('任务编号重复，请刷新后重试', '任務編號重複，請重新整理後重試', 'Duplicate task id — refresh and try again');
+    case 'invalid_action': return L('不支持的操作', '不支援的操作', 'Unsupported action');
+    case 'invalid_tasks': return L('任务设置有误', '任務設定有誤', 'Invalid task settings');
+    case 'timeout': return L('请求超时，请检查网络后重试', '請求逾時，請檢查網路後重試', 'The request timed out — check the network and try again');
+    case 'network_error': return L('网络连接失败，请稍后重试', '網路連線失敗，請稍後重試', 'Network error — try again later');
+    case 'server_outdated': return L('服务器版本过旧，请先更新后台', '伺服器版本過舊，請先更新後台', 'The server is outdated — update the backend first');
+    case 'server_error': return L('服务器出错，请稍后重试', '伺服器出錯，請稍後重試', 'Server error — try again later');
+    default:
+      if (/^HTTP 5\d\d$/.test(code)) return L('服务器出错，请稍后重试', '伺服器出錯，請稍後重試', 'Server error — try again later');
+      if (code.startsWith('invalid_')) return L('任务设置有误：', '任務設定有誤：', 'Invalid task settings: ') + code.slice(8);
+      return code;
+  }
+}
+
+export async function putTasks(deviceId: string, tasks: RawTask[]): Promise<void> {
+  await api(`/devices/${encodeURIComponent(deviceId)}/tasks`, { method: 'PUT', body: JSON.stringify({ tasks }) });
+}
+/** Fresh raw task list of a phone, read right before a write so we never PUT a stale snapshot. */
+async function freshRawTasks(deviceId: string): Promise<RawTask[]> {
+  const r = await api<{ device: Device }>(`/devices/${encodeURIComponent(deviceId)}`);
+  return rawListOf(r.device);
+}
+/** The phone's stored task list from a device response. Throws rather than returning a partial / empty list,
+ *  so a write can never wipe tasks the server didn't send us (e.g. an older backend). */
+export function rawListOf(dev: any): RawTask[] {
+  if (!dev || typeof dev !== 'object' || !Array.isArray(dev.tasks)) throw new ApiError('server_outdated', 0);
+  const ts = normDevice(dev).tasks;
+  if (ts.length !== dev.tasks.length || ts.some((t) => !t.raw)) throw new ApiError('server_outdated', 0);
+  return ts.map((t) => t.raw as RawTask);
+}
+/** Replace (same id) or append one task; every other task is sent back exactly as the server has it now. */
+export async function saveTask(device: Device, task: RawTask): Promise<void> {
+  const list = await freshRawTasks(device.id);
+  const next = list.some((t) => t.id === task.id) ? list.map((t) => (t.id === task.id ? task : t)) : [...list, task];
+  await putTasks(device.id, next);
+}
+export async function deleteTask(device: Device, taskId: string): Promise<void> {
+  const list = await freshRawTasks(device.id);
+  await putTasks(device.id, list.filter((t) => t.id !== taskId));
+}
+export async function sendCommand(deviceId: string, action: 'run' | 'stop', taskId?: string): Promise<void> {
+  await api(`/devices/${encodeURIComponent(deviceId)}/command`, { method: 'POST', body: JSON.stringify({ action, task_id: taskId }) });
+}
+
+/** Opens an https: URL in the system browser; anything else is ignored. */
+export function openExternal(url: string | undefined): void {
+  if (!url) return;
+  try { if (new URL(url).protocol !== 'https:') return; } catch { return; }
+  try {
+    if (window.electron?.shell?.openExternal) { void window.electron.shell.openExternal(url); return; }
+  } catch { /* fall through */ }
+  window.open(url, '_blank', 'noopener');
+}
+
+// ───────────────────────── scripts / levels ─────────────────────────
+export interface Platform { id: PlatformId; name: () => string; live: boolean }
+/** Short device id for display: the first block of the id (e.g. "c520ac72"); full id stays in tooltips. */
+export const shortId = (id: string): string => { const h = String(id || '').split('-')[0]; return h.length >= 6 ? h : String(id || '').slice(0, 12); };
+
+export const PLATFORMS: Platform[] = [
+  { id: 'tiktok', name: () => 'TikTok', live: true },
+  { id: 'douyin', name: () => L('抖音', '抖音', 'Douyin'), live: true },
+  { id: 'xhs', name: () => L('小红书', '小紅書', 'RedNote'), live: true },
+];
+/** Narrows any string to a platform id ('' / unknown → tiktok, like tasks without a platform). */
+export const asPlatform = (p: string | null | undefined): PlatformId => (p === 'douyin' || p === 'xhs' ? p : 'tiktok');
+/** Display name of a platform id (unknown → TikTok). */
+export const platformName = (p: string | null | undefined): string => (PLATFORMS.find((x) => x.id === asPlatform(p)) || PLATFORMS[0]).name();
+
+/** Platforms not hidden by the compliance config (complianceHiddenPlatforms from /api/matrix/config). */
+export const visiblePlatforms = (hidden: string[]): Platform[] => PLATFORMS.filter((p) => !hidden.includes(p.id));
+/**
+ * The phone is running a task of a compliance-hidden platform. The run goes on untouched; the UI just shows the phone
+ * as not running (no running pill / glow / count). Same rule as PhoneCard: the progress task, else — when the
+ * phone has tasks but none of a visible platform — treated as hidden.
+ */
+export function runHidden(d: Device, visible: Platform[]): boolean {
+  if (!d.online || !d.running) return false;
+  const vis = (p?: string) => visible.some((x) => x.id === asPlatform(p));
+  const t = d.tasks.find((x) => x.id === d.progress?.task_id);
+  if (t) return !vis(t.platform);
+  return d.tasks.length > 0 && !d.tasks.some((x) => vis(x.platform));
+}
+
+export const SCRIPT_IDS = [
+  'tiktok_comment_like', 'tiktok_lead_engage', 'douyin_auto_engage', 'douyin_lead_engage', 'xhs_auto_engage', 'xhs_lead_engage',
+] as const;
+export type ScriptId = typeof SCRIPT_IDS[number];
+const SCRIPTS_BY_PLATFORM: Record<PlatformId, readonly ScriptId[]> = {
+  tiktok: ['tiktok_comment_like', 'tiktok_lead_engage'],
+  douyin: ['douyin_auto_engage', 'douyin_lead_engage'],
+  xhs: ['xhs_auto_engage', 'xhs_lead_engage'],
+};
+/** Task types a platform offers (unknown platform → none). */
+export const scriptsFor = (platform: string | null | undefined): readonly ScriptId[] =>
+  (platform === 'tiktok' || platform === 'douyin' || platform === 'xhs' ? SCRIPTS_BY_PLATFORM[platform] : []);
+export const isLead = (scriptId: string): boolean => scriptId.endsWith('_lead_engage');
+/** 互动涨粉 (douyin_auto_engage / xhs_auto_engage). */
+export const isEngage = (scriptId: string): boolean => scriptId.endsWith('_auto_engage');
+export const scriptName = (scriptId: string): string => (isLead(scriptId)
+  ? L('定向获客任务', '定向獲客任務', 'Lead engage task')
+  : isEngage(scriptId) ? L('互动涨粉任务', '互動漲粉任務', 'Engagement task')
+  : L('评论区点赞评论任务', '評論區點讚評論任務', 'Comment like & reply task'));
+/** Task name, or the script's name when the task has none. */
+// 手机端默认任务名存的是繁体(「評論區點讚任務」等):默认名按界面语言显示,用户自己起的名字原样显示
+export const taskName = (t: { name?: string; script_id: string }): string => {
+  const n = (t.name || '').trim();
+  if (!n || n === '評論區點讚任務' || n === '定向獲客任務' || n === '互動漲粉任務' || n === '评论区点赞任务' || n === '定向获客任务' || n === '互动涨粉任务') return scriptName(t.script_id);
+  for (const [tw, zh, en] of [['評論區點讚 · ', '评论区点赞 · ', 'Comment likes · '], ['定向獲客 · ', '定向获客 · ', 'Lead engage · '], ['互動漲粉 · ', '互动涨粉 · ', 'Engagement · ']] as const)
+    if (n.startsWith(tw)) return L(zh, tw, en) + n.slice(tw.length);
+  return n;
+};
+export const scriptShort = (scriptId: string): string => (isLead(scriptId)
+  ? L('定向获客', '定向獲客', 'Lead engage')
+  : isEngage(scriptId) ? L('互动涨粉', '互動漲粉', 'Engagement')
+  : L('评论区点赞评论', '評論區點讚評論', 'Comment like & reply'));
+
+export interface Caps { likes: number; comments: number; follows: number; leads: number }
+export const LEVELS: Partial<Record<ScriptId, Record<'low' | 'mid' | 'high', Caps>>> = {
+  tiktok_comment_like: { low: { likes: 30, comments: 5, follows: 0, leads: 0 }, mid: { likes: 100, comments: 15, follows: 0, leads: 0 }, high: { likes: 300, comments: 30, follows: 0, leads: 0 } },
+  tiktok_lead_engage: { low: { likes: 10, comments: 5, follows: 10, leads: 10 }, mid: { likes: 30, comments: 15, follows: 30, leads: 30 }, high: { likes: 100, comments: 30, follows: 50, leads: 100 } },
+};
+
+/** Count keys shown for a script, in display order, with emoji + label. */
+export function countKeys(scriptId: string): { k: string; icon: string; label: () => string }[] {
+  return isLead(scriptId)
+    ? [
+      { k: 'lead_new', icon: '🎯', label: () => L('新客户', '新客戶', 'Leads') },
+      { k: 'follow', icon: '➕', label: () => L('关注', '關注', 'Follows') },
+      { k: 'comment', icon: '💬', label: () => L('评论', '評論', 'Comments') },
+      { k: 'like', icon: '👍', label: () => L('点赞', '點讚', 'Likes') },
+    ]
+    : isEngage(scriptId) ? [
+      { k: 'like', icon: '👍', label: () => L('点赞', '點讚', 'Likes') },
+      { k: 'favorite', icon: '⭐', label: () => L('收藏', '收藏', 'Favorites') },
+      { k: 'follow', icon: '➕', label: () => L('关注', '關注', 'Follows') },
+      { k: 'comment', icon: '💬', label: () => L('评论', '評論', 'Comments') },
+    ]
+    : [
+      { k: 'like', icon: '👍', label: () => L('点赞', '點讚', 'Likes') },
+      { k: 'comment', icon: '💬', label: () => L('回复', '回覆', 'Replies') },
+    ];
+}
+/** "点赞 1,286 · 回复 174" (lead scripts skip likes unless there are some). */
+export function fmtTotals(scriptId: string, c: Counts | null | undefined): string {
+  return countKeys(scriptId)
+    .filter(({ k }) => !(isLead(scriptId) && k === 'like' && !(c?.[k])))
+    .map(({ k, label }) => `${label()} ${num(c?.[k] || 0)}`).join(' · ');
+}
+/** "👍 86 · 💬 12" for run rows. */
+export function fmtCountsIcons(scriptId: string, c: Counts | null | undefined): string {
+  const parts = countKeys(scriptId).filter(({ k }) => (c?.[k] || 0) > 0).map(({ k, icon }) => `${icon} ${num(c![k])}`);
+  return parts.join(' · ') || '—';
+}
+/** `raw` = the stored task (engage tasks read max_favorites from its config). */
+export function capsText(scriptId: string, caps: Partial<Caps> | null | undefined, raw?: RawTask | null): string {
+  const c = caps || {};
+  if (isEngage(scriptId)) {
+    const fav = Number((raw?.config as Record<string, unknown> | undefined)?.max_favorites) || 0;
+    return `${L('点赞', '點讚', 'Likes')} ${c.likes || 0} · ${L('收藏', '收藏', 'Favorites')} ${fav} · ${L('关注', '關注', 'Follows')} ${c.follows || 0} · ${L('评论', '評論', 'Comments')} ${c.comments || 0}`;
+  }
+  return isLead(scriptId)
+    ? `${L('点赞目标', '點讚目標', 'Like target')} ${(c.likes || 0) >= 1e8 ? '∞' : c.likes || 0} · ${L('关注', '關注', 'Follows')} ${c.follows || 0} · ${L('评论', '評論', 'Comments')} ${c.comments || 0}`
+    : `${L('点赞', '點讚', 'Likes')} ${c.likes || 0} · ${L('回复', '回覆', 'Replies')} ${c.comments || 0}`;
+}
+/** Label of the "where" row: keywords, or links (comment likes / engage) / rival accounts (TikTok lead) / rival links (douyin, xhs lead). */
+export function targetLabel(scriptId: string, mode: string): string {
+  if (mode !== 'precise') return L('关键词', '關鍵詞', 'Keywords');
+  if (!isLead(scriptId)) return L('链接', '連結', 'Links');
+  return scriptId.startsWith('tiktok_') ? L('同行账号', '同行帳號', 'Rival accounts') : L('同行 / 作品链接', '同行 / 作品連結', 'Rival / post links');
+}
+export const modeName = (mode: string): string => (mode === 'precise' ? L('精准模式', '精準模式', 'Precise mode') : L('关键词模式', '關鍵詞模式', 'Keyword mode'));
+export const shortTarget = (s: string): string => s.replace(/^https?:\/\/(www\.)?/i, '');
+
+// ───────────────────────── formatting ─────────────────────────
+export const num = (n: number): string => Number(n || 0).toLocaleString('en-US');
+export const fmtUsd = (usd: number): string => `$${Number(usd || 0).toFixed(4)}`;
+export const fmtCost = (credits: number, usd: number): string => `💎 ${num(credits)} ≈ ${fmtUsd(usd)}`;
+const pad = (n: number) => String(n).padStart(2, '0');
+const sameDay = (a: Date, b: Date) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+export const hhmm = (ms: number): string => { const d = new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+/** IP 归属地文字(按界面语言);没有返回 '' */
+export const ipGeoText = (d: { ip_geo?: { zh: string; en: string } | null }): string => {
+  const g = d.ip_geo;
+  if (!g) return '';
+  return L(g.zh, g.zh, g.en || g.zh) || '';
+};
+/** 日志时间:年-月-日 时:分:秒 */
+export const fullTime = (ms: number): string => { const d = new Date(ms); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; };
+/** "10:12" today, "10/30 21:10" otherwise. */
+export function fmtWhen(ms: number | null | undefined): string {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  return sameDay(d, new Date()) ? hhmm(ms) : `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${hhmm(ms)}`;
+}
+/** "今天 20:00" / "明天 09:30" / "11/02 09:30". */
+export function fmtNext(ms: number): string {
+  const d = new Date(ms);
+  const now = new Date();
+  const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
+  const day = sameDay(d, now) ? L('今天', '今天', 'Today') : sameDay(d, tomorrow) ? L('明天', '明天', 'Tomorrow') : `${pad(d.getMonth() + 1)}/${pad(d.getDate())}`;
+  return `${day} ${hhmm(ms)}`;
+}
+export function fmtRelFuture(ms: number): string {
+  const mins = Math.max(0, Math.round((ms - Date.now()) / 60000));
+  if (mins < 60) return L(`${mins} 分钟后`, `${mins} 分鐘後`, `in ${mins} min`);
+  if (mins < 24 * 60) { const h = Math.round(mins / 60); return L(`${h} 小时后`, `${h} 小時後`, `in ${h} h`); }
+  const dd = Math.round(mins / 1440); return L(`${dd} 天后`, `${dd} 天後`, `in ${dd} d`);
+}
+export const fmtDuration = (ms: number): string => {
+  const m = Math.max(1, Math.round((ms || 0) / 60000));
+  return L(`${m} 分钟`, `${m} 分鐘`, `${m} min`);
+};
+
+export function scheduleText(s: Schedule | null | undefined): string {
+  if (!s || s.kind === 'manual') return L('手动', '手動', 'Manual');
+  if (s.kind === 'daily') return L(`每天 ${s.at}`, `每天 ${s.at}`, `Daily ${s.at}`);
+  if (s.kind === 'random') return L(`每天随机 ${s.from}–${s.to}`, `每天隨機 ${s.from}–${s.to}`, `Daily, random ${s.from}–${s.to}`);
+  if (s.hours === 0.5) return L('每 30 分钟', '每 30 分鐘', 'Every 30 min');
+  return L(`每 ${s.hours} 小时`, `每 ${s.hours} 小時`, `Every ${s.hours} h`);
+}
+export const isManual = (s: Schedule | null | undefined): boolean => !s || s.kind === 'manual';
+export function nextRunText(t: TaskView): string {
+  if (isManual(t.schedule)) return L('手动运行', '手動運行', 'Manual');
+  return t.next_run_at ? fmtNext(t.next_run_at) : '—';
+}
+/** Warning for the last run when it was cut short by something the user should know about. `platform` = the task's platform. */
+export function lastWarn(status: string | null | undefined, platform?: string): string {
+  const pn = platformName(platform);
+  switch (status) {
+    case 'verify_stop': return L('上次被验证打断', '上次被驗證打斷', `Last run hit a ${pn} verification`);
+    case 'not_logged_in': return L(`上次 ${pn} 未登录`, `上次 ${pn} 未登入`, `${pn} was logged out last time`);
+    case 'error': case 'failed': return L('上次运行出错', '上次運行出錯', 'Last run failed');
+    default: return '';
+  }
+}
+/** Status chip of a finished run. */
+export function runStatus(r: Run): { text: string; tone: 'done' | 'stop' } {
+  if (r.status === 'done') return { text: L('完成', '完成', 'Done'), tone: 'done' };
+  if (r.status === 'stopped') return { text: L('已停止', '已停止', 'Stopped'), tone: 'stop' };
+  return { text: L('被打断', '被打斷', 'Interrupted'), tone: 'stop' };
+}
+
+// ───────────────────────── friendly steps ─────────────────────────
+const str = (v: unknown): string => (v == null ? '' : String(v));
+/** Renders one step code; unknown codes return '' (the caller skips them). `platform` = the task's platform (default TikTok). */
+export function stepText(step: Step, platform?: string): string {
+  const a = step.a || {};
+  const pn = platformName(platform);
+  switch (step.c) {
+    case 'open_app': return L(`打开 ${pn}`, `打開 ${pn}`, `Open ${pn}`);
+    case 'account_ok': return L('确认账号', '確認帳號', 'Account checked');
+    case 'search': return L(`搜索「${str(a.kw)}」`, `搜尋「${str(a.kw)}」`, `Search “${str(a.kw)}”`);
+    case 'open_link': return L('打开指定作品', '打開指定作品', 'Open the chosen video');
+    case 'open_rival': return L('打开同行主页', '打開同行主頁', "Open a rival's profile");
+    case 'open_comments': return L('打开视频，看评论区', '打開影片，看評論區', 'Open a video and read the comments');
+    case 'ai_writing': return L('AI 正在写回复', 'AI 正在寫回覆', 'AI is writing a reply');
+    case 'replied': return L(`回复已发出：“${str(a.text)}”`, `回覆已發出：「${str(a.text)}」`, `Reply sent: “${str(a.text)}”`);
+    case 'liked': return L('点了一个赞', '點了一個讚', 'Liked a post');
+    case 'commented': return L(`评论已发出：“${str(a.text)}”`, `評論已發出：「${str(a.text)}」`, `Comment sent: “${str(a.text)}”`);
+    case 'video_summary': return L(`这条视频：点赞 ${str(a.likes || 0)} · 回复 ${str(a.replies || 0)}`, `這條影片：點讚 ${str(a.likes || 0)} · 回覆 ${str(a.replies || 0)}`, `This video: ${str(a.likes || 0)} likes · ${str(a.replies || 0)} replies`);
+    case 'next_video': return L('换下一条视频', '換下一條影片', 'Next video');
+    case 'reach_old_leads': return L('先联系之前找到的潜在客户', '先聯繫之前找到的潛在客戶', 'Reaching leads found earlier');
+    case 'collect_leads': return L('在评论区找潜在客户', '在評論區找潛在客戶', 'Looking for leads in the comments');
+    case 'leads_found': return L(`已找到 ${str(a.n || 0)} 个潜在客户`, `已找到 ${str(a.n || 0)} 個潛在客戶`, `Found ${str(a.n || 0)} leads`);
+    case 'reach_leads': return L('开始联系潜在客户', '開始聯繫潛在客戶', 'Reaching out to leads');
+    case 'reach_lead': return L('打开一位潜在客户的主页', '打開一位潛在客戶的主頁', "Open a lead's profile");
+    case 'lead_liked': return L('给 TA 的作品点了赞', '給 TA 的作品點了讚', 'Liked their video');
+    case 'lead_commented': return L(`给 TA 留言：“${str(a.text)}”`, `給 TA 留言：「${str(a.text)}」`, `Commented: “${str(a.text)}”`);
+    case 'lead_followed': return L('关注了 TA', '關注了 TA', 'Followed them');
+    case 'done': return L('本次运行完成', '本次運行完成', 'Run finished');
+    case 'cap_reached': return L('达到本次上限，结束', '達到本次上限，結束', 'Reached the limit for this run');
+    case 'time_up': return L('到达本次运行时长，结束', '到達本次運行時長，結束', 'Time is up for this run');
+    case 'not_logged_in': return L(`${pn} 未登录，已停止`, `${pn} 未登入，已停止`, `${pn} is logged out — stopped`);
+    case 'verify_stop': return L(`${pn} 弹出验证，已自动停止`, `${pn} 彈出驗證，已自動停止`, `${pn} asked for verification — stopped`);
+    case 'stopped': return L('已停止', '已停止', 'Stopped');
+    case 'no_keywords': return L('没有填写关键词', '沒有填寫關鍵詞', 'No keywords set');
+    case 'no_urls': case 'no_seed_accounts': return L('没有填写链接', '沒有填寫連結', 'No links set');
+    case 'nothing_to_do': return L('本次额度已用完', '本次額度已用完', 'Nothing left to do this run');
+    case 'stopped_other': return L('运行中断', '運行中斷', 'Run interrupted');
+    default: return typeof step.t === 'string' ? step.t.trim().slice(0, 80) : '';
+  }
+}
+/** Steps → [{time, text}] with unknown codes dropped. */
+export function stepLines(steps: Step[] | null | undefined, platform?: string): { time: string; text: string }[] {
+  return (Array.isArray(steps) ? steps : []).filter((s) => s && typeof s === 'object').map((s) => ({ time: s.ts ? fullTime(s.ts) : '', text: stepText(s, platform) })).filter((x) => x.text);
+}
+
+// ───────────────────────── account avatar ─────────────────────────
+const AV = ['#7b5cf6', '#00a3ff', '#ff6a3d', '#e2468a', '#14b8a6', '#f59e0b', '#6366f1', '#22c55e'];
+/** Stable colour per account: the same handle always gets the same colour. */
+export function avatarColor(handle: string): string {
+  let n = 0;
+  for (const c of String(handle)) n = (n * 31 + c.charCodeAt(0)) >>> 0;
+  return AV[n % AV.length];
+}
+/** Detected account of `platform` (default TikTok). TikTok handles get an '@'; 抖音号 / 小红书号 are shown as-is. */
+export function accountOf(d: Device, platform: string = 'tiktok'): { handle: string; nickname: string } | null {
+  const pf = asPlatform(platform);
+  const a = d.accounts?.[pf];
+  if (!a || !a.handle) return null;
+  const h = String(a.handle);
+  const handle = pf !== 'tiktok' || h.startsWith('@') ? h : `@${h}`;
+  return { handle, nickname: a.nickname || '' };
+}
+
+// ───────────────────────── shared class names ─────────────────────────
+export const txt = 'dark:text-claude-darkText text-claude-text';
+export const sub = 'dark:text-claude-darkTextSecondary text-claude-textSecondary';
+export const bd = 'dark:border-claude-darkBorder border-claude-border';
+export const surface = 'dark:bg-claude-darkSurface bg-claude-surface';
+export const surface2 = 'dark:bg-claude-darkSurfaceHover bg-claude-surfaceHover';
+export const btnBase = 'inline-flex items-center justify-center font-bold rounded-[10px] border transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
+export const btnGhost = `${btnBase} ${bd} ${surface2} ${txt} hover:border-claude-accent/60`;
+export const btnPrimary = `${btnBase} border-claude-accent bg-claude-accent text-[#04140c] hover:opacity-90`;

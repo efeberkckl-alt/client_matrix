@@ -1,0 +1,172 @@
+/**
+ * 矩阵号「登录态过期 → 自动弹窗扫码重连」。
+ *
+ * 发布/任务流程检到某号登录失效时调用 promptReloginForExpiredAccount:
+ *   ① 把该号的指纹窗口(一号一窗)提到前台;
+ *   ② 导航到该平台登录页 + 注入【红色过期角标】(不横幅,左上角小标,见 kernelShowExpiredBadge);
+ *   ③ 后台轮询(~10min)扫码成功 → 翻 idle + 读身份 + 推 SSE 更新「我的矩阵账号」。
+ *
+ * 复用 sidecar openLogin 的恢复逻辑(同一套 launchKernel/checkKernelLogin/kernelReadIdentity)。
+ * 设计要点:
+ *   · 自带 launchKernel(skipLease:true)→ refCount+1,确保调用方随后 closeKernel 时窗口【不被关】(留给用户扫码),
+ *     且不占「按账号使用互斥锁」(不阻塞别的任务排队)。
+ *   · setup 部分(置顶 + 导航 + 角标)await 完才返回,保证在调用方 closeKernel 之前已 refCount+1;轮询循环 detached 跑,
+ *     不阻塞调用方(发布该跳过就跳过、继续下一个号)。
+ *   · 同号已有看护在跑则直接返回(watching 去重)。
+ */
+
+import {
+  getAccount, setAccountStatus, setAccountIdentity, captureAssociation, isCurrentAssociation, commitIdentity, confirmAvailability, accountEventVersion, accountBadgeLabel, matrixGroupTitle, platformKey, findAccountByUid, markAccountBindingConflict,
+} from './accountManager';
+import {
+  launchKernel, kernelNavigate, kernelBringToFront, kernelShowExpiredBadge,
+  checkKernelLogin, kernelReadIdentity, getSession, persistKernelCookies, closeKernel, acquireKernel, releaseKernel,
+} from './kernelPool';
+
+// 登录/读身份导航 URL(与 renderer MatrixView.LOGIN_URL 一致;快手按场景分流创作端/主站)。
+const LOGIN_URL: Record<string, string> = {
+  douyin: 'https://www.douyin.com/', xhs: 'https://www.xiaohongshu.com/', bilibili: 'https://passport.bilibili.com/login',
+  kuaishou: 'https://www.kuaishou.com/', tiktok: 'https://www.tiktok.com/login', x: 'https://x.com/login',
+  binance: 'https://www.binance.com/zh-CN/square', youtube: 'https://www.youtube.com/',
+  shipinhao: 'https://channels.weixin.qq.com/', toutiao: 'https://mp.toutiao.com/',
+  // 海外发帖/互动三平台(原来漏了 → 登录失效弹重连窗却导航不到登录页,用户看着像卡住)。
+  instagram: 'https://www.instagram.com/accounts/login/', facebook: 'https://www.facebook.com/login/', reddit: 'https://www.reddit.com/login/',
+  // 交易所广场四家(2026-08-03 补:这里【原来整个漏了】,注释却写着"与 MatrixView.LOGIN_URL 一致" —— 实际不一致)。
+  //   漏的后果有两处:① 登录失效弹重连窗导航不到页(同上面 IG/FB 那条老毛病);② 更隐蔽 —— keepAlive
+  //   保活拿 home='' 就【不导航】,内核停在 about:blank 上做登录判定。bitget/okx 的判据依赖【落在自家
+  //   广场页】(接口同域 / 侧栏 DOM),在 about:blank 上必然拿不到答案 → 严格模式会把好号误标「登录过期」。
+  //   四家都落各自广场页(未登录也能浏览,用户点右上角登录即可,登录完就停在该待的位置)。
+  gate: 'https://www.gate.com/post',
+  bitget: 'https://www.bitget.com/insights',
+  bybit: 'https://www.bybit.com/social/',
+  okx: 'https://www.okx.com/orbit',
+};
+export function loginUrlFor(platform: string, loginScope?: string): string {
+  if (platform === 'kuaishou') return loginScope === 'creator' ? 'https://cp.kuaishou.com/profile' : 'https://www.kuaishou.com/';
+  return LOGIN_URL[platform] || '';
+}
+
+// 动态 require 避免与 sidecar-server 静态循环依赖;SSE 不可用时不致命(状态已落盘,列表下次 reload 也会对)。
+function emitAccount(data: Record<string, unknown>): void {
+  try { const { broadcastSSE } = require('../../sidecar-server'); broadcastSSE('matrix:account', data); } catch { /* ignore */ }
+}
+
+const watching = new Set<string>();
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 对一个登录态过期的号:弹窗置顶 + 红色角标 + 导航登录页,后台等扫码成功并翻状态。
+ * fire-and-forget:调用方不必 await(await 也只等到 setup 完、不等轮询)。重复调用同号会被去重忽略。
+ */
+export async function promptReloginForExpiredAccount(accountId: string): Promise<void> {
+  if (watching.has(accountId)) return;
+  const acc = getAccount(accountId);
+  if (!acc || acc.manualDisconnect) return;
+  const fence = acc.authority ? captureAssociation(accountId) : undefined;
+  if (fence?.attemptId || acc.authority?.cleanup) return;
+  watching.add(accountId);
+
+  const pk = platformKey(acc);
+  const loginUrl = loginUrlFor(acc.platform, (acc as { loginScope?: string }).loginScope);
+
+  let receipt: Awaited<ReturnType<typeof acquireKernel>> | undefined;
+  let leasedSession: ReturnType<typeof getSession>;
+  const release = () => {
+    if (receipt) releaseKernel(receipt);
+    else closeKernel(accountId, { skipLease: true });
+  };
+  try {
+    // 自带 refCount(+1)+ skipLease:窗口在调用方 closeKernel 后仍存活、且不抢使用锁。
+    const options = {
+      accountId: acc.id, kernelVersion: acc.kernelVersion, userDataDir: acc.userDataDir,
+      fingerprint: acc.fingerprint, proxy: acc.proxy,
+      label: accountBadgeLabel(acc), groupTitle: matrixGroupTitle(acc.platform), skipLease: true,
+    };
+    if (fence) {
+      receipt = await acquireKernel(options);
+      leasedSession = getSession(acc.id);
+      if (leasedSession?.diagnosticsId !== receipt.sessionInstanceId || !isCurrentAssociation(fence)) throw Error('navigation:cancelled');
+    } else await launchKernel(options);
+  } catch {
+    if (receipt) release();
+    watching.delete(accountId);
+    return;
+  }
+
+  // setup:导航登录页 + 置顶 + 红色过期角标(await 完才返回,确保 refCount 已 +1)。
+  try { if (loginUrl) await kernelNavigate(acc.id, loginUrl); }
+  catch (error) {
+    watching.delete(accountId);
+    try { release(); } catch { /* already closed */ }
+    const message = (error as Error)?.message;
+    emitAccount({ id: acc.id, error: /^navigation:[a-z_0-9]+$/.test(message) ? message : '无法打开扫码页面' });
+    return;
+  }
+  await kernelBringToFront(acc.id);
+  await kernelShowExpiredBadge(acc.id, `⚠️ ${accountBadgeLabel(acc)} 登录态已过期,请重新扫码登录`);
+  const session = getSession(acc.id);
+  const identityRevision = session?.identityRevision;
+  const current = () => !!session && getSession(acc.id) === session && session.identityRevision === identityRevision &&
+    (fence ? leasedSession === session && isCurrentAssociation(fence) : !getAccount(acc.id)?.manualDisconnect);
+
+  // 轮询循环 detached:不阻塞调用方;窗口被关或超时即止。
+  void (async () => {
+    try {
+      for (let i = 0; i < 200; i++) { // ~10min
+        await sleep(3000);
+        if (!current()) break;
+        let ok: boolean | null = null;
+        try { ok = await checkKernelLogin(acc.id, pk); } catch { /* Wait for a conclusive login check. */ }
+        if (!current()) break;
+        if (ok !== true) continue;
+
+        // 登录刚成功页面常停在回跳页 → 先导航平台页再读身份(否则读太早拿空,同 openLogin)。
+        try { if (pk !== 'tiktok' && loginUrl) await kernelNavigate(acc.id, loginUrl); }
+        catch (error) {
+          const message = (error as Error)?.message;
+          emitAccount({ id: acc.id, error: /^navigation:[a-z_0-9]+$/.test(message) ? message : '无法打开扫码页面' });
+          break;
+        }
+        await sleep(3000);
+        // 关键:把刚扫到的【会话 cookie】固化落盘,否则内核被强杀后 sessionid 丢失 →
+        //   下次任务新起内核读空 cookie 又判「登录过期」(见 persistKernelCookies 注释)。
+        if (!current()) break;
+        try { await persistKernelCookies(acc.id); } catch { /* ignore */ }
+        let ident: { nickname?: string; displayId?: string; avatar?: string; uid?: string } = {};
+        try { ident = await kernelReadIdentity(acc.id, pk); } catch { /* 身份读取失败不影响翻状态 */ }
+        if (!current()) break;
+
+        // 去重:拒绝重复关联,保留浏览器登录态供用户核对。
+        const dup = ident.uid ? findAccountByUid(pk, String(ident.uid), acc.id) : undefined;
+        if (dup) {
+          markAccountBindingConflict(acc.id);
+          emitAccount({ id: acc.id, status: getAccount(acc.id)?.status, error: `该账号已被「${dup.displayName}」关联,一个真实账号只能关联一个矩阵号` });
+          break;
+        }
+
+        if (acc.bindingConflict && !ident.uid) continue;
+        const identity = { nickname: ident.nickname, displayId: ident.displayId, avatar: ident.avatar, boundUid: ident.uid };
+        if (fence) {
+          if (!commitIdentity(fence, identity)) break;
+        } else {
+          setAccountIdentity(acc.id, identity);
+          setAccountStatus(acc.id, 'idle', '');
+        }
+        const confirmed = fence ? confirmAvailability(fence, true) : undefined;
+        const saved = getAccount(acc.id);
+        const available = fence ? confirmed?.available === true
+          : saved?.status === 'idle' && !saved.bindingConflict && !saved.chargeUncertain && !saved.manualDisconnect;
+        emitAccount({ id: acc.id, ...(fence ? accountEventVersion(acc.id) : undefined), status: saved?.status, statusReason: saved?.statusReason, loginVerified: true, available,
+          nickname: saved?.nickname, displayId: saved?.displayId, avatar: saved?.avatar });
+        break;
+      }
+    } finally {
+      watching.delete(accountId);
+      // 平衡本次 launchKernel 的 +1:轮询收尾(扫码成功/重复关联/超时/窗口被手关)即释放 ——
+      // 原来这条路永不 closeKernel,引用计数被 pin 住:任务后续复用同内核后 closeKernel 归不了 0,
+      // 重连窗永远关不掉、越积越多(同 openLogin 的修法)。skipLease 起的 → 关闭也 skipLease(不动别人的锁)。
+      try { if (receipt || !fence) release(); } catch { /* ignore */ }
+    }
+  })().catch(() => emitAccount({ id: acc.id, error: '扫码检测未完成' }));
+}

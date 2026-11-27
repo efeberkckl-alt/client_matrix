@@ -1,0 +1,4003 @@
+/**
+ * ScenarioView — top-level replacement for QuickUseView.
+ *
+ * Owns the internal navigation state for the "一键使用" area:
+ *   - Platform tab (xhs / x / douyin / tiktok / youtube)
+ *   - Page within that platform (workflows list / workflow detail / task detail)
+ *   - Modals (config wizard)
+ *
+ * Only xhs is functional in Phase 1. Everything else renders a placeholder.
+ */
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import SidebarToggleIcon from '../icons/SidebarToggleIcon';
+import ComposeIcon from '../icons/ComposeIcon';
+import WindowTitleBar from '../window/WindowTitleBar';
+import { i18nService } from '../../services/i18n';
+import { noobClawAuth } from '../../services/noobclawAuth';
+import { getBackendApiUrl } from '../../services/endpoints';
+import { scenarioService, mxTaskToScenario, type Scenario, type Task, type Draft } from '../../services/scenario';
+import { DEFAULT_SCENARIOS } from '../../data/defaultScenarios';
+import { XhsWorkflowsPage } from './XhsWorkflowsPage';
+import { XWorkflowsPage } from './XWorkflowsPage';
+import { TaskDetailPage } from './TaskDetailPage';
+import { PlatformPlaceholder } from './PlatformPlaceholder';
+import { ConfigWizard } from './ConfigWizard';
+import { SensitiveCheckPage } from './SensitiveCheckPage';
+import { MyTasksPage } from './MyTasksPage';
+import { RunHistoryPage } from './RunHistoryPage';
+import { RunRecordDetailPage } from './RunRecordDetailPage';
+import { BinanceWorkflowsPage } from './BinanceWorkflowsPage';
+import { YoutubeWorkflowsPage } from './YoutubeWorkflowsPage';
+import { TikTokWorkflowsPage } from './TikTokWorkflowsPage';
+import { DouyinWorkflowsPage } from './DouyinWorkflowsPage';
+import { ShipinhaoWorkflowsPage } from './ShipinhaoWorkflowsPage';
+import { ToutiaoWorkflowsPage } from './ToutiaoWorkflowsPage';
+import { KuaishouWorkflowsPage } from './KuaishouWorkflowsPage';
+import { BilibiliWorkflowsPage } from './BilibiliWorkflowsPage';
+import { VideoWorkflowsPage } from './video/VideoWorkflowsPage';
+import { videoTaskStore } from '../../services/videoTaskStore';
+import { WalletBadge } from '../common/WalletBadge';
+import LuckyBag from '../cowork/LuckyBag';
+import { ErrorBoundary } from '../ErrorBoundary';
+import MatrixTaskWizard, { type WizardAccount } from '../matrix/MatrixTaskWizard';
+import MatrixReplyFansWizard from '../matrix/MatrixReplyFansWizard';
+import MatrixLeadEngageWizard from '../matrix/MatrixLeadEngageWizard';
+import MatrixVideoDownloadWizard from '../matrix/MatrixVideoDownloadWizard';
+import MatrixCommentLikeWizard, { type CommentAssignmentPreviewInput, type CommentLikeWizardInput } from '../matrix/MatrixCommentLikeWizard';
+import MatrixBlockWizard from '../matrix/MatrixBlockWizard';
+import MatrixFolderPostWizard from '../matrix/MatrixFolderPostWizard';
+import MatrixReportWizard from '../matrix/MatrixReportWizard';
+import { MATRIX_REPORT_SCENARIO_ID } from '../../services/scenario';
+import MatrixImageTextWizard, { type ImageTextWizardSave } from '../matrix/MatrixImageTextWizard';
+import MatrixTweetPostWizard, { type TweetPostWizardSave } from '../matrix/MatrixTweetPostWizard';
+import MatrixBinancePostWizard, { type BinancePostWizardSave } from '../matrix/MatrixBinancePostWizard';
+import MatrixFacebookPostWizard, { type FacebookPostWizardSave } from '../matrix/MatrixFacebookPostWizard';
+import MatrixRedditPostWizard, { type RedditPostWizardSave } from '../matrix/MatrixRedditPostWizard';
+import MatrixInstagramPostWizard, { type InstagramPostWizardSave } from '../matrix/MatrixInstagramPostWizard';
+import MatrixBinanceRepostWizard, { type BinanceRepostWizardSave } from '../matrix/MatrixBinanceRepostWizard';
+import MatrixViralRewriteWizard, { type ViralRewriteWizardSave } from '../matrix/MatrixViralRewriteWizard';
+import SimpleCreateModal, { type SimpleTaskType } from '../matrix/SimpleCreateModal';
+import SimpleSelect from '../common/SimpleSelect';
+import { clearPresetAccounts, GLOBAL_TOPBAR } from '../../uiEdition';
+
+type PlatformId = 'xhs' | 'x' | 'binance' | 'gate' | 'bitget' | 'bybit' | 'okx' | 'douyin' | 'shipinhao' | 'toutiao' | 'kuaishou' | 'bilibili' | 'tiktok' | 'youtube' | 'instagram' | 'facebook' | 'reddit' | 'video';
+
+// 矩阵 tab 顺序:与「我的矩阵账号」平台顺序一致(含视频号/头条),多平台视频创作放【最后】
+//   (2026-08-14 用户要求:首屏优先露出各平台的精准获客/互动入口)。
+// ⚠️ 这是【平台 tab 的唯一顺序来源】,账号页(MatrixView 的 PLATFORMS)必须与它保持一致
+//    —— 两处曾经漂移过(本文件末尾是 facebook/reddit/instagram,账号页却是 instagram/facebook/reddit,
+//    而旧注释还写着"已与 PLATFORMS 一致"),用户在两个页面之间来回切会觉得错乱。改任一处都要同步另一处。
+// 交易所广场三家紧跟在币安广场后面(同类平台聚在一起,用户按"广场"找得到)。
+const MATRIX_TAB_ORDER: PlatformId[] = ['douyin', 'xhs', 'kuaishou', 'bilibili', 'shipinhao', 'toutiao', 'x', 'binance', 'okx', 'bitget', 'bybit', 'gate', 'youtube', 'tiktok', 'facebook', 'reddit', 'instagram', 'video'];
+// 后端 backend/matrix/scenarios 有 <platform>_auto_engage 互动涨粉剧本的平台(共 8 个)。
+// 视频号/头条暂无 engage 剧本 → tab 仍展示(与账号页一致),但「开始创作」标注「即将上线」不放行,避免跑出错任务。
+const MATRIX_ENGAGE_PLATFORMS = new Set<PlatformId>(['douyin', 'xhs', 'kuaishou', 'bilibili', 'x', 'binance', 'gate', 'bitget', 'bybit', 'okx', 'youtube', 'tiktok', 'facebook', 'reddit', 'instagram']);
+// 后端 backend/matrix/scenarios 有 <platform>_reply_fans_comment「自动回复粉丝」剧本的平台。
+// 小红书(逐篇笔记进详情页回复,主站登录态即覆盖创作者中心)+ 快手(创作者中心评论管理,需
+// loginScope='creator' 账号)+ 哔哩哔哩(member.bilibili.com 创作中心评论管理,登录 cookie 挂
+// 父域 .bilibili.com,主站登录态即覆盖创作中心,取主站号即可);其余平台后续逐步开放。
+// 账号 scope 过滤见 replyAccountFilter。
+// 头条号(mp.toutiao.com 后台「评论管理」集中回复,主站登录态即覆盖创作端,无 loginScope → 取主站号即可)。
+// 视频号(channels.weixin.qq.com/platform 视频号助手「互动管理 · 评论」集中回复,助手即创作端、无独立主站,
+// 无 loginScope → 取主站号即可;页面为 wujie 微前端 open shadowRoot,剧本已处理)。
+// 抖音(creator.douyin.com 创作者中心「评论管理」集中回复,登录 cookie 挂父域 .douyin.com,主站登录态即覆盖
+// 创作者中心,取主站号即可,无 loginScope;后端剧本 douyin_reply_fans_comment 已就位)。
+const MATRIX_REPLY_FAN_PLATFORMS = new Set<PlatformId>(['douyin', 'xhs', 'kuaishou', 'bilibili', 'toutiao', 'shipinhao']);
+// 定向获客:有 <平台>_lead_engage 剧本的平台。每个平台一张独立卡片、独立任务(type='lead_engage'
+//   按平台各存一条)、独立向导与详情 —— 与互动涨粉/回复粉丝互不影响。
+// ⚠️ 加平台时这里【和 MyTasksPage 的 LEAD_NAMES】要一起改 —— 剧本写好、卡片也注册了,
+//   漏了这张白名单,新建任务页就是没有那张卡(Instagram 2026-08-26 实测:等了一整天没人发现)。
+const MATRIX_LEAD_PLATFORMS = new Set<PlatformId>(['tiktok', 'douyin', 'xhs', 'kuaishou', 'bilibili', 'youtube', 'x', 'instagram']);
+// YouTube 的「关注」在平台上叫【订阅】,卡片/向导/详情的文案都要说平台自己的词
+//   (用户 2026-08-23:「任务详情要独立、和自己平台名字切合」)。计数键仍统一是 follow。
+const LEAD_FOLLOW_WORD = (p: PlatformId | string): [string, string] =>
+  (p === 'youtube' ? ['订阅', 'subscribe'] : ['关注', 'follow']);
+// 后端 backend/matrix/scenarios 有 <platform>_video_download「视频无水印下载」剧本的平台(单账号工具任务)。
+// 抖音(页面 fetch wrapper 签名拿 detail)/快手(读 <video> src)/哔哩哔哩(playurl html5 单文件 mp4)/
+// TikTok(SSR __UNIVERSAL_DATA__ + 多级 fallback,须 VPN 真机)。都走【主站】登录态,取主站号。
+const MATRIX_VIDEO_DOWNLOAD_PLATFORMS = new Set<PlatformId>(['douyin', 'kuaishou', 'bilibili', 'tiktok', 'xhs']);
+// 后端有 <platform>_comment_like「评论区点赞评论」剧本的平台(粘贴作品链接 → 多账号逐条翻评论区给留言点赞)。目前仅 TikTok。
+const MATRIX_COMMENT_LIKE_PLATFORMS = new Set<PlatformId>(['tiktok']);
+// 后端有 <platform>_block「批量拉黑」剧本的平台。目前仅抖音。
+const MATRIX_BLOCK_PLATFORMS = new Set<PlatformId>(['douyin']);
+// 「文件夹定时发布」(folder_post,客户端 runner + matrix driver douyin / douyin_images)。目前仅抖音。
+const MATRIX_FOLDER_POST_PLATFORMS = new Set<PlatformId>(['douyin']);
+// 2026-10-29 用户:先隐藏过「文件夹定时发布」卡片,当天又要求显示回来(false = 显示)。
+const FOLDER_POST_CARD_HIDDEN = false;
+// 后端 backend/matrix/scenarios 有 <platform>_image_text「图文创作」剧本的平台(N 号各自生成图文+发布)。
+// 抖音(creator.douyin.com)/小红书(creator.xiaohongshu.com)/视频号(channels.weixin.qq.com 助手「发表新动态」,
+// wujie 微前端 shadowRoot 发布)/头条号(mp.toutiao.com 微头条,byte-design 普通页,无标题/封面)。
+// 视频号/头条本身无图文搜索,网络图借抖音下图号取——见 imageDownloadAccountId。
+const MATRIX_IMAGE_TEXT_PLATFORMS = new Set<PlatformId>(['douyin', 'xhs', 'shipinhao', 'toutiao']);
+// 「爆款批量仿写」目前仅小红书。
+const MATRIX_VIRAL_PLATFORMS = new Set<PlatformId>(['xhs']);
+// 后端 backend/matrix/scenarios 有 x_post「自动发推」剧本的平台(N 号各自 AI 原创一条推+可选配图→发时间线)。目前仅推特。
+const MATRIX_TWEET_POST_PLATFORMS = new Set<PlatformId>(['x']);
+// 后端 backend/matrix/scenarios 有 binance_post「币安广场自动发帖」剧本的平台(N 号各自抓 web3 资讯 AI 原创一条币安广场图文+可选配图→发币安广场)。目前仅币安。
+const MATRIX_BINANCE_POST_PLATFORMS = new Set<PlatformId>(['binance']);
+// 后端 backend/matrix/scenarios 有 facebook_post「Facebook 自动发帖」剧本的平台(N 号各自按人设从所选数据源取材 AI 原创一条帖 + 可选配图 → 发 FB)。目前仅 FB。
+const MATRIX_FB_POST_PLATFORMS = new Set<PlatformId>(['facebook']);
+// 后端有 reddit_post「Reddit 自动发帖」剧本的平台(取材可选源 + subreddit,API 发 self 帖)。目前仅 Reddit。
+const MATRIX_REDDIT_POST_PLATFORMS = new Set<PlatformId>(['reddit']);
+// 后端有 instagram_post「Instagram 自动发帖」剧本的平台(取材可选源,IG「新建帖子」多步弹窗发图文,图必带)。目前仅 Instagram。
+const MATRIX_IG_POST_PLATFORMS = new Set<PlatformId>(['instagram']);
+// 「币安广场批量搬运」(binance_repost):1 个源平台采集号搜+下 → N 个币安号各领一条仿写发。发布目标=币安。
+const MATRIX_BINANCE_REPOST_PLATFORMS = new Set<PlatformId>(['binance']);
+// 交易所广场四家的「批量搬运」。⚠️ 与币安那张卡分开渲染:共用 runner 和向导,但卡片文案
+//   必须只出现当前平台自己的名字。另:这四家【没有视频发布 driver】,只支持图文搬运。
+const MATRIX_EXCHANGE_REPOST_PLATFORMS = new Set<PlatformId>(['gate', 'bitget', 'bybit', 'okx']);
+const isSquareRepostScenario = (id: string): boolean => /^(binance|gate|bitget|bybit|okx)_repost$/.test(String(id || ''));
+// 交易所广场三家的「自动发帖」。⚠️ 故意【不并进 MATRIX_BINANCE_POST_PLATFORMS】——
+//   它们是三个完全独立的平台,卡片文案/剧本/账号体系各自独立,合并会导致 UI 上出现
+//   别家平台的文案(用户明确要求:每个平台的界面不能混入其他平台的字样)。
+const MATRIX_EXCHANGE_POST_PLATFORMS = new Set<PlatformId>(['gate', 'bitget', 'bybit', 'okx']);
+
+// Top-level navigation:
+//   create  — scenario cards (current XhsWorkflowsPage / XWorkflowsPage,
+//             but with the bottom task list stripped out — those are now
+//             over in `tasks`).
+//   tasks   — unified "我的自动化运营任务" page across all platforms,
+//             filtered by the active platform sub-tab.
+//   history — unified "运行记录" page across all platforms, filtered by
+//             the active platform sub-tab.
+type SectionId = 'create' | 'tasks' | 'history';
+
+type ViewState =
+  | { kind: 'main'; section: SectionId; platform: PlatformId; filterTaskId?: string | null }
+  | { kind: 'task_detail'; task_id: string; from?: SectionId }
+  | { kind: 'record_detail'; record_id: string; from_platform: PlatformId; filterTaskId?: string | null }
+  | { kind: 'sensitive_check' };
+
+interface ScenarioViewProps {
+  isSidebarCollapsed?: boolean;
+  onToggleSidebar?: () => void;
+  onNewChat?: () => void;
+  updateBadge?: React.ReactNode;
+  /** v4.31.44: 主页涨粉标签传入,初始选中对应 platform tab。undefined 时默认 video
+   *  (多平台视频创作)—— 视频创作是当下主推入口,直接进 3 个菜单(新建/我的/运行记录)
+   *  时落在它上面,比早期落在「币安广场」更贴当前产品方向。 */
+  initialPlatform?: PlatformId;
+  /** v1.x: 顶栏右上角"分享给好友"按钮点击 → 跳邀请返佣页 */
+  onShowInvite?: () => void;
+  /** v6.x: 左侧菜单拆分 —— 同一个 ScenarioView 现在被三个顶级菜单复用:
+   *   'create'  = 「✨ 新建涨粉任务」新建页(只显示平台 tab + 新建内容,隐藏段标题)。
+   *   'manage'  = 「📋 我的涨粉任务」(段标题 + 平台 tab + 任务列表)。
+   *   'runs'    = 「📊 涨粉运行记录」(段标题 + 平台 tab + 运行记录列表)。
+   *  三者是独立的顶级菜单实例(App 里 ErrorBoundary key={mainView} 切换时重挂载)。
+   *  原 manage 内的「我的涨粉任务 / 运行记录」L1 段 tab 已拆成两个独立菜单,不再内切。 */
+  mode?: 'create' | 'manage' | 'runs';
+  /** manage 模式下任何「新建涨粉任务」入口 → 切到「一键涨粉」create 菜单(干净拆分,
+   *  避免两个菜单内容重叠)。由 App 注入,内部切 mainView='scenarioCreate'。 */
+  onSwitchToCreate?: (platform?: PlatformId) => void;
+  /** v6.x: create 模式(「一键涨粉」新建页)右上角「查看已有的涨粉任务」按钮 →
+   *  切到「我的涨粉任务」manage 菜单。由 App 注入,内部切 mainView='quickuse'。
+   *  可带 platform:视频卡片「已有任务」传 'video',让管理页直接定位到视频 tab。 */
+  onSwitchToManage?: (platform?: PlatformId) => void;
+  /** 进入/退出【任务详情 / 运行记录详情】时上报。create / runs 菜单下钻到任务详情时,
+   *  任务详情逻辑上属于「我的涨粉任务」→ App 据此把左侧菜单高亮切到「我的涨粉任务」,
+   *  使侧栏高亮 + 顶栏标题不再停在「新建涨粉任务 / 涨粉运行记录」。 */
+  onInDetailChange?: (inDetail: boolean) => void;
+  /** 侧栏每次点同一/任一涨粉菜单时 App 递增此值 → 本组件退回列表(修:在运行记录/任务详情里点
+   *  侧栏菜单,setMainView 同值是 no-op、退不出详情)。 */
+  navNonce?: number;
+  /** 矩阵号 edition:锁死抖音平台、隐藏平台 tab、标题改「矩阵涨粉」、新建/编辑走
+   *  MatrixView(matrixTaskNew)。数据经 scenarioService 的 MATRIX 适配层接矩阵后端。 */
+  matrixMode?: boolean;
+  /** 简洁版(2026-10-28):create = 弹窗下拉选平台 + 任务 → 直接打开该任务原有向导;
+   *  manage = 全部平台的任务放一个列表,下拉框筛选。 */
+  simple?: boolean;
+  /** 简洁版「创建任务」弹窗点取消 → 回到进来前的页面(由 App 决定) */
+  onSimpleCancel?: () => void;
+  /** 打开「新建窗口任务」弹窗(App 递增 nonce;带 platform 则跳过选平台)。 */
+  createReq?: { nonce: number; platform?: string };
+}
+
+// 已处理过的「新建窗口任务」请求(模块级:ScenarioView 重挂载后不会把旧请求再弹一次)
+let consumedCreateNonce = 0;
+const PRO_TASK_ST = ['all', 'running', 'scheduled', 'manual'] as const;
+const PRO_RUN_ST = ['all', 'running', 'done', 'partial', 'error', 'stopped'] as const;
+
+const PLATFORM_TABS: Array<{ id: PlatformId; labelKey: string; icon: string; enabled: boolean }> = [
+  // 第一行: 视频创作 + 海外/全球平台
+  { id: 'video', labelKey: 'scenarioPlatformVideo', icon: '🎬', enabled: true },
+  { id: 'binance', labelKey: 'scenarioPlatformBinance', icon: '🔶', enabled: true },
+  // 交易所广场三家 —— 各自独立平台,紧跟币安广场。
+  { id: 'okx', labelKey: 'scenarioPlatformOkx', icon: '⚫', enabled: true },
+  { id: 'bitget', labelKey: 'scenarioPlatformBitget', icon: '🔵', enabled: true },
+  { id: 'bybit', labelKey: 'scenarioPlatformBybit', icon: '🟠', enabled: true },
+  { id: 'gate', labelKey: 'scenarioPlatformGate', icon: '🟦', enabled: true },
+  { id: 'x', labelKey: 'scenarioPlatformX', icon: '🐦', enabled: true },
+  { id: 'youtube', labelKey: 'scenarioPlatformYoutube', icon: '📺', enabled: true },
+  { id: 'tiktok', labelKey: 'scenarioPlatformTiktok', icon: '🎵', enabled: true },
+  { id: 'facebook', labelKey: 'scenarioPlatformFacebook', icon: '👥', enabled: true },
+  { id: 'reddit', labelKey: 'scenarioPlatformReddit', icon: '🟠', enabled: true },
+  { id: 'instagram', labelKey: 'scenarioPlatformInstagram', icon: '📷', enabled: true },
+  // 国内平台:接在后面同一行排,放不下由容器(flex-wrap)自然换行,不再写死断行。
+  { id: 'xhs', labelKey: 'scenarioPlatformXhs', icon: '📕', enabled: true },
+  { id: 'douyin', labelKey: 'scenarioPlatformDouyin', icon: '🎶', enabled: true },
+  { id: 'kuaishou', labelKey: 'scenarioPlatformKuaishou', icon: '⚡', enabled: true },
+  { id: 'shipinhao', labelKey: 'scenarioPlatformShipinhao', icon: '📱', enabled: true },
+  { id: 'bilibili', labelKey: 'scenarioPlatformBilibili', icon: '📺', enabled: true },
+  { id: 'toutiao', labelKey: 'scenarioPlatformToutiao', icon: '📰', enabled: true },
+];
+
+/** 平台 id → 用户可见的平台名(走 i18n,随界面语言变)。找不到就回落 id 本身。
+ *  用它替代散落各处写死的「币安广场」字样 —— 交易所广场三家(gate/bitget/bybit)复用同一套
+ *  发帖向导,写死平台名会让 Gate 的弹窗上出现「币安广场」。 */
+const platformDisplayName = (id: string): string => {
+  const tab = PLATFORM_TABS.find((t) => t.id === (id as PlatformId));
+  return tab ? i18nService.t(tab.labelKey) : String(id);
+};
+
+/** 走「自动发帖」向导的平台判定(币安广场 + 交易所广场三家)。它们共用 binancePostRunner:
+ *  后端剧本 id 一律是 `${platform}_post`,所以这里加平台不需要改 runner。 */
+/** 这个平台的新建页里有没有免费卡片(无水印下载;有效会员另含评论区点赞、文件夹定时发布)。批量拉黑 2026-10-29 起收费。 */
+const platformHasFreeCard = (p: PlatformId): boolean =>
+  MATRIX_VIDEO_DOWNLOAD_PLATFORMS.has(p) || p === 'youtube' || p === 'tiktok'
+  || ((MATRIX_COMMENT_LIKE_PLATFORMS.has(p) || (!FOLDER_POST_CARD_HIDDEN && MATRIX_FOLDER_POST_PLATFORMS.has(p))) && noobClawAuth.isActiveMember());
+
+const isSquarePostScenario = (scenarioId: string): boolean =>
+  /^(binance|gate|bitget|bybit|okx)_post$/.test(String(scenarioId || ''));
+
+// v6.x: 原 SECTION_TABS(我的涨粉任务 / 运行记录 两个 L1 段 tab)已移除 —
+// 两段拆成两个独立左侧菜单(manage / runs),头部改为静态段标题,不再内切。
+
+export const ScenarioView: React.FC<ScenarioViewProps> = ({
+  isSidebarCollapsed,
+  onToggleSidebar,
+  onNewChat,
+  updateBadge,
+  initialPlatform,
+  onShowInvite,
+  mode = 'manage',
+  onSwitchToCreate,
+  onSwitchToManage,
+  onInDetailChange,
+  navNonce,
+  matrixMode,
+  simple: simpleProp,
+  onSimpleCancel,
+  createReq,
+}) => {
+  const simple = !!(simpleProp && matrixMode);
+  const SL = (zh: string, tw: string, en: string) => (i18nService.currentLanguage === 'zh' ? zh : i18nService.currentLanguage === 'zh-TW' ? tw : en);
+  // 简洁版 create:「创建任务」弹窗是否打开(进新建页即打开;关掉向导后可再点按钮打开)
+  const [simpleModalOpen, setSimpleModalOpen] = useState(true);
+  // 简洁版 manage:下拉筛选('all' | 'running' | 平台 id)
+  const [simpleFilter, setSimpleFilter] = useState<string>('all');
+  const isMac = window.electron.platform === 'darwin';
+  // v6.x: 菜单拆分后,本实例的「主页/落地段」由 mode 决定:
+  //   create 模式落在 'create'(新建页);manage 模式落在 'tasks'(我的涨粉任务)。
+  const baseSection: SectionId = mode === 'create' ? 'create' : mode === 'runs' ? 'history' : 'tasks';
+  // 默认平台 tab:2026-08-14 起落在 MATRIX_TAB_ORDER 的【第一个平台】(抖音),不再默认视频创作
+  //   —— 视频创作已移到 tab 最后一位,再默认选它会让页面一进来就停在最右端、且首屏看不到
+  //   各平台的精准获客/互动入口。非矩阵(旧视频版)不走 MATRIX_TAB_ORDER,保持 'video' 不变。
+  const defaultPlatform: PlatformId = matrixMode ? MATRIX_TAB_ORDER[0] : 'video';
+  const [view, setView] = useState<ViewState>({ kind: 'main', section: baseSection, platform: initialPlatform || defaultPlatform });
+
+  // Seed scenarios from the bundled snapshot so the "立即开始" buttons in
+  // every WorkflowsPage are clickable from first paint, not greyed out
+  // while we wait on the network. listScenarios() result REPLACES this
+  // once the API call comes back, so any backend-side scenario change
+  // still reaches the user within the normal refresh cycle.
+  const [scenarios, setScenarios] = useState<Scenario[]>(() => DEFAULT_SCENARIOS);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  // 矩阵平台标签上的「有任务在跑」绿点。sidecar 的 matrix:listTasks 顺带返回 runningPlatforms
+  //   (哪些平台正在跑),这里只取这一项;非矩阵模式不拉。
+  const [matrixRunningPlatforms, setMatrixRunningPlatforms] = useState<string[]>([]);
+  // 合规隐藏平台:服务端 /api/matrix/config 按当前用户算好(总开关关 / 命中白名单 → 空数组)。
+  //   拉不到就【不藏】(fail-open,网络抖动不误伤;存量任务本就在后台跑,隐藏只是新建入口)。
+  const [complianceHidden, setComplianceHidden] = useState<string[]>([]);
+  // 举报功能(白名单):服务端按当前 UID 判定 reportEnabled。拉不到 → 不显示(fail-closed,与合规隐藏相反)。
+  const [reportEnabled, setReportEnabled] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch(`${getBackendApiUrl()}/api/matrix/config`, { headers: noobClawAuth.getAuthHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (alive && Array.isArray(data?.complianceHiddenPlatforms)) setComplianceHidden(data.complianceHiddenPlatforms.map(String));
+        if (alive) setReportEnabled(data?.reportEnabled === true);
+      } catch { /* 拉不到 → 不藏 */ }
+    })();
+    return () => { alive = false; };
+  }, []);
+  // 「只看运行中」:管理页标题旁的开关(默认关)。开 → 隐藏平台 tab,所有平台运行中的任务卡
+  //   聚到一个列表方便追踪;视频创作任务体系独立(videoTaskStore),不混排,以顶部横幅入口代替。
+  //   只作用于 manage 菜单的任务列表态;下钻详情/运行记录不受影响。
+  const [showRunningOnly, setShowRunningOnly] = useState(false);
+  // ── 专业版「窗口任务 / 运行记录」顶部一行筛选:平台 / 状态(记住上次选择)+ 搜索 ──
+  const proActive = !!matrixMode && !simple && (mode === 'manage' || mode === 'runs');
+  const proKey: 'tasks' | 'runs' = mode === 'runs' ? 'runs' : 'tasks';
+  const [proFilters, setProFilters] = useState<Record<'tasks' | 'runs', { plat: string; st: string; q: string }>>(() => {
+    const rd = (k: string) => { try { return localStorage.getItem(k) || ''; } catch { return ''; } };
+    const ts = rd('nc.winTasks.st'); const rs = rd('nc.winRuns.st');
+    return {
+      tasks: { plat: rd('nc.winTasks.plat') || 'all', st: (PRO_TASK_ST as readonly string[]).includes(ts) ? ts : 'all', q: '' },
+      runs: { plat: rd('nc.winRuns.plat') || 'all', st: (PRO_RUN_ST as readonly string[]).includes(rs) ? rs : 'all', q: '' },
+    };
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem('nc.winTasks.plat', proFilters.tasks.plat); localStorage.setItem('nc.winTasks.st', proFilters.tasks.st);
+      localStorage.setItem('nc.winRuns.plat', proFilters.runs.plat); localStorage.setItem('nc.winRuns.st', proFilters.runs.st);
+    } catch { /* 本机偏好,写不进就算了 */ }
+  }, [proFilters.tasks.plat, proFilters.tasks.st, proFilters.runs.plat, proFilters.runs.st]);
+  const pf = proFilters[proKey];
+  const setPf = (patch: Partial<{ plat: string; st: string; q: string }>) => setProFilters((prev) => ({ ...prev, [proKey]: { ...prev[proKey], ...patch } }));
+  const [proMenu, setProMenu] = useState<'plat' | 'st' | null>(null);
+  // 「新建窗口任务」弹窗:①选平台 → ②任务类型(原新建页卡片,点选高亮)→ 下一步打开该卡片原有向导
+  const [nc, setNc] = useState<{ open: boolean; step: 1 | 2; plat: string; fixed: boolean; pick: number }>({ open: false, step: 1, plat: '', fixed: false, pick: -1 });
+  const ncRef = useRef<HTMLDivElement>(null);
+  const ncPass = useRef(false);
+  // 运行中的视频创作任务数(渲染端单例,随平台绿点同频轮询,横幅用)
+  const [videoRunningCount, setVideoRunningCount] = useState(0);
+  useEffect(() => {
+    if (!matrixMode) return;
+    let alive = true;
+    const pull = async () => {
+      try {
+        const r = await (window as any).electron?.matrix?.listTasks?.();
+        if (alive && r?.ok) {
+          setMatrixRunningPlatforms(Array.isArray(r.runningPlatforms) ? r.runningPlatforms : []);
+          if (Array.isArray(r.tasks)) setTasks(r.tasks.map(mxTaskToScenario));
+        }
+      } catch { /* 拉不到就不显示绿点,不影响其它功能 */ }
+      try {
+        if (alive) setVideoRunningCount(videoTaskStore.getTasks().filter((t) => t.lastStatus === 'running').length);
+      } catch { /* 同上:失败只影响横幅 */ }
+    };
+    void pull();
+    const t = setInterval(pull, 5000);
+    return () => { alive = false; clearInterval(t); };
+  }, [matrixMode]);
+  const [drafts, setDrafts] = useState<Draft[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [fatalError, setFatalError] = useState<string | null>(null);
+  // 视频是本地工具,任务/运行记录详情是 VideoWorkflowsPage 的内部状态(view 仍是
+  // 'main'),进详情时由它上报,这里据此隐藏顶部 L1/L2 tab,对齐 scenario 详情页全屏。
+  const [videoInDetail, setVideoInDetail] = useState(false);
+
+  // 下钻到【任务详情 / 运行记录详情】时上报给 App —— 任务详情逻辑上属于「我的涨粉任务」,
+  // 让 App 把左侧菜单高亮 + 顶栏标题切过去(create/runs 菜单下钻后不再停在原菜单)。
+  // ⚠️ 视频本地任务(AI自动成片)的详情是 VideoWorkflowsPage 内部状态、view.kind 仍是 'main',
+  //    必须把 videoInDetail 也算进来,否则点视频任务进详情时导航不切。
+  const inDetailView = view.kind === 'task_detail' || view.kind === 'record_detail' || videoInDetail;
+  useEffect(() => { onInDetailChange?.(inDetailView); }, [inDetailView, onInDetailChange]);
+  useEffect(() => () => { onInDetailChange?.(false); }, [onInDetailChange]);
+  // 侧栏点涨粉菜单(navNonce 递增)→ 退回本 mode 的列表页(不重挂、不重拉数据)。修:在运行记录详情里
+  //   点「涨粉运行记录」,App setMainView 同值是 no-op,原来退不出详情、且高亮乱跳。mount 时无害(等于初值)。
+  useEffect(() => {
+    setView({ kind: 'main', section: baseSection, platform: initialPlatform || defaultPlatform });
+    setVideoInDetail(false);
+    // 简洁版:每次从首页 / 侧栏进「创建任务」都从第 1 步(选平台)开始
+    setSimpleModalOpen(true);
+    clearPresetAccounts();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navNonce]);
+
+  // Wizard state (keyword/track tasks)
+  const [wizardScenario, setWizardScenario] = useState<Scenario | null>(null);
+  const [wizardEditingTask, setWizardEditingTask] = useState<Task | null>(null);
+  // 矩阵号:互动涨粉向导(选账号 + 配额 + 频率;账号制,赛道/关键词/人设在账号上)。
+  const [matrixWizardPlatform, setMatrixWizardPlatform] = useState<string | null>(null);
+  const [matrixAccounts, setMatrixAccounts] = useState<WizardAccount[]>([]);
+  const [matrixAccountsLoading, setMatrixAccountsLoading] = useState(false); // 账号异步加载中(弹窗先开,账号后填)
+  const [matrixWizardTask, setMatrixWizardTask] = useState<any | null>(null); // 编辑时的初始任务(回填账号/配额/频率);新建为 null
+  // 「自动回复粉丝」向导(独立于互动向导:账号取【创作者中心】scope、无配额、带引流尾巴)。
+  const [matrixReplyPlatform, setMatrixReplyPlatform] = useState<string | null>(null);
+  const [matrixReplyAccounts, setMatrixReplyAccounts] = useState<WizardAccount[]>([]);
+  const [matrixReplyAccountsLoading, setMatrixReplyAccountsLoading] = useState(false);
+  const [matrixReplyTask, setMatrixReplyTask] = useState<any | null>(null); // 编辑时回填(账号/引流/频率);新建 null
+  // 定向获客(lead_engage)向导 state —— 独立于互动/回复,字段不共用。
+  const [matrixLeadPlatform, setMatrixLeadPlatform] = useState<string | null>(null);
+  const [matrixLeadAccounts, setMatrixLeadAccounts] = useState<WizardAccount[]>([]);
+  const [matrixLeadAccountsLoading, setMatrixLeadAccountsLoading] = useState(false);
+  const [matrixLeadTask, setMatrixLeadTask] = useState<any | null>(null);
+  // 「视频无水印下载」向导(单账号工具任务:选 1 个号 + 粘贴链接)。
+  const [matrixDownloadPlatform, setMatrixDownloadPlatform] = useState<string | null>(null);
+  const [matrixDownloadAccounts, setMatrixDownloadAccounts] = useState<WizardAccount[]>([]);
+  const [matrixDownloadAccountsLoading, setMatrixDownloadAccountsLoading] = useState(false);
+  const [matrixDownloadTask, setMatrixDownloadTask] = useState<any | null>(null);
+  // 「评论区点赞评论」向导(comment_like,目前仅 TikTok:作品链接 + 每号点赞上限 + 多账号)。
+  const [matrixCommentLikePlatform, setMatrixCommentLikePlatform] = useState<string | null>(null);
+  const [matrixCommentLikeAccounts, setMatrixCommentLikeAccounts] = useState<WizardAccount[]>([]);
+  const [matrixCommentLikeAccountsLoading, setMatrixCommentLikeAccountsLoading] = useState(false);
+  const [matrixCommentLikeTask, setMatrixCommentLikeTask] = useState<any | null>(null);
+  // 「批量拉黑」向导(block,目前仅抖音:名单/关键词 + 多账号)。
+  const [matrixBlockPlatform, setMatrixBlockPlatform] = useState<string | null>(null);
+  const [matrixBlockAccounts, setMatrixBlockAccounts] = useState<WizardAccount[]>([]);
+  const [matrixBlockAccountsLoading, setMatrixBlockAccountsLoading] = useState(false);
+  const [matrixBlockTask, setMatrixBlockTask] = useState<any | null>(null);
+  // 「文件夹定时发布」向导(folder_post,目前仅抖音)。
+  const [matrixFolderPlatform, setMatrixFolderPlatform] = useState<string | null>(null);
+  const [matrixFolderAccounts, setMatrixFolderAccounts] = useState<WizardAccount[]>([]);
+  const [matrixFolderAccountsLoading, setMatrixFolderAccountsLoading] = useState(false);
+  const [matrixFolderTask, setMatrixFolderTask] = useState<any | null>(null);
+  // 「举报」向导(白名单功能;可多账号、1-4 条、只能手动触发)
+  const [matrixReportPlatform, setMatrixReportPlatform] = useState<string | null>(null);
+  const [matrixReportAccounts, setMatrixReportAccounts] = useState<WizardAccount[]>([]);
+  const [matrixReportAccountsLoading, setMatrixReportAccountsLoading] = useState(false);
+  const [matrixReportTask, setMatrixReportTask] = useState<any | null>(null);
+  // 「图文创作」向导(多账号:勾选 N 个号 + 全局配图/篇数 + 可选参考文案)。
+  const [matrixImageTextPlatform, setMatrixImageTextPlatform] = useState<string | null>(null);
+  const [matrixImageTextAccounts, setMatrixImageTextAccounts] = useState<WizardAccount[]>([]);
+  const [matrixImageTextAccountsLoading, setMatrixImageTextAccountsLoading] = useState(false);
+  // 视频号/头条网络图用的「抖音下图号」候选(已登录抖音的主站号),传给 MatrixImageTextWizard。
+  const [matrixImageTextDownloadAccounts, setMatrixImageTextDownloadAccounts] = useState<WizardAccount[]>([]);
+  const [matrixImageTextTask, setMatrixImageTextTask] = useState<any | null>(null);
+  const [matrixTweetPlatform, setMatrixTweetPlatform] = useState<string | null>(null);
+  const [matrixTweetAccounts, setMatrixTweetAccounts] = useState<WizardAccount[]>([]);
+  const [matrixTweetAccountsLoading, setMatrixTweetAccountsLoading] = useState(false);
+  const [matrixTweetTask, setMatrixTweetTask] = useState<any | null>(null);
+  const [matrixBinancePlatform, setMatrixBinancePlatform] = useState<string | null>(null);
+  const [matrixBinanceAccounts, setMatrixBinanceAccounts] = useState<WizardAccount[]>([]);
+  const [matrixBinanceAccountsLoading, setMatrixBinanceAccountsLoading] = useState(false);
+  const [matrixBinanceTask, setMatrixBinanceTask] = useState<any | null>(null);
+  // ── Facebook 自动发帖(facebook_post)向导状态 ──
+  const [matrixFacebookPlatform, setMatrixFacebookPlatform] = useState<string | null>(null);
+  const [matrixFacebookAccounts, setMatrixFacebookAccounts] = useState<WizardAccount[]>([]);
+  const [matrixFacebookAccountsLoading, setMatrixFacebookAccountsLoading] = useState(false);
+  const [matrixFacebookTask, setMatrixFacebookTask] = useState<any | null>(null);
+  // ── Reddit 自动发帖(reddit_post)向导状态 ──
+  const [matrixRedditPlatform, setMatrixRedditPlatform] = useState<string | null>(null);
+  const [matrixRedditAccounts, setMatrixRedditAccounts] = useState<WizardAccount[]>([]);
+  const [matrixRedditAccountsLoading, setMatrixRedditAccountsLoading] = useState(false);
+  const [matrixRedditTask, setMatrixRedditTask] = useState<any | null>(null);
+  // ── Instagram 自动发帖(instagram_post)向导状态 ──
+  const [matrixInstagramPlatform, setMatrixInstagramPlatform] = useState<string | null>(null);
+  const [matrixInstagramAccounts, setMatrixInstagramAccounts] = useState<WizardAccount[]>([]);
+  const [matrixInstagramAccountsLoading, setMatrixInstagramAccountsLoading] = useState(false);
+  const [matrixInstagramTask, setMatrixInstagramTask] = useState<any | null>(null);
+  // ── 币安广场批量搬运(binance_repost)向导状态 ──
+  const [matrixRepostPlatform, setMatrixRepostPlatform] = useState<string | null>(null);
+  const [matrixRepostAccounts, setMatrixRepostAccounts] = useState<WizardAccount[]>([]);        // 币安发布号
+  const [matrixRepostSourceAccounts, setMatrixRepostSourceAccounts] = useState<WizardAccount[]>([]); // 全部号(挑采集号)
+  const [matrixRepostAccountsLoading, setMatrixRepostAccountsLoading] = useState(false);
+  const [matrixRepostTask, setMatrixRepostTask] = useState<any | null>(null);
+  // 「爆款批量仿写」向导(多账号:勾选 N 个号 + 篇数/AI风格/发布)。
+  const [matrixViralPlatform, setMatrixViralPlatform] = useState<string | null>(null);
+  const [matrixViralAccounts, setMatrixViralAccounts] = useState<WizardAccount[]>([]);
+  const [matrixViralAccountsLoading, setMatrixViralAccountsLoading] = useState(false);
+  const [matrixViralTask, setMatrixViralTask] = useState<any | null>(null);
+  // 指纹浏览器内核守卫:没装内核时弹「去下载」,后续流程不走(创建/运行矩阵任务都先过这关)。
+  const [matrixKernelMissing, setMatrixKernelMissing] = useState(false);
+  const [matrixKernelBusy, setMatrixKernelBusy] = useState(false);
+  // 下载进度(用户 2026-09-12:任务页这个弹窗以前只有「下载中…」没有进度条)。走与「我的矩阵账号」页同一条
+  //   matrix:kernel SSE(安装器每 300ms 推一次 pct/msg,done=true 收尾);轮询 kernelStatus 仍保留作兜底。
+  const [matrixKernelPct, setMatrixKernelPct] = useState(0);
+  const [matrixKernelMsg, setMatrixKernelMsg] = useState('');
+  useEffect(() => {
+    const off = (window as any).electron?.matrix?.onKernel?.((p: any) => {
+      if (typeof p?.pct === 'number') setMatrixKernelPct(p.pct);
+      if (typeof p?.msg === 'string') setMatrixKernelMsg(p.msg);
+      if (p?.done) { setMatrixKernelBusy(false); if (p?.path) setMatrixKernelMissing(false); }
+    });
+    return () => { if (typeof off === 'function') off(); };
+  }, []);
+  // 重复任务提示:某平台已有同类型任务时,关掉向导并弹此提示,给「去查看 / 编辑」入口跳对应管理 tab。
+  const [dupNotice, setDupNotice] = useState<{ platform: string; label: string } | null>(null);
+  // 一个平台每种任务只允许 1 个(taskStore duplicate_type)。点「创建」时先查重:已有同类型任务
+  // 直接弹「去查看编辑」,不让用户填完整个向导才在保存时报错。listTasks 慢(sidecar 忙)时 1.5s
+  // 超时放行 —— 查重失败/超时都不拦创建,保存时的 duplicate_type 仍是最终兜底。
+  const hasDupTask = async (platform: string, type: string, label: string): Promise<boolean> => {
+    try {
+      const r: any = await Promise.race([
+        (window as any).electron?.matrix?.listTasks?.(),
+        new Promise((res) => setTimeout(() => res(null), 1500)),
+      ]);
+      const tasks: any[] = r?.ok && Array.isArray(r.tasks) ? r.tasks : [];
+      if (tasks.some((t) => t?.platform === platform && t?.type === type)) {
+        setDupNotice({ platform, label });
+        return true;
+      }
+    } catch { /* 查不出来就放行 */ }
+    return false;
+  };
+  const ensureMatrixKernel = async (): Promise<boolean> => {
+    try {
+      const r = await (window as any).electron?.matrix?.kernelStatus?.();
+      if (r?.installed) return true;
+    } catch { /* 视为未安装 */ }
+    setMatrixKernelMissing(true);
+    return false;
+  };
+  const downloadMatrixKernel = async () => {
+    setMatrixKernelBusy(true); setMatrixKernelPct(0); setMatrixKernelMsg('');
+    try {
+      await (window as any).electron?.matrix?.ensureKernel?.();
+      // 下载在后台,ensureKernel 可能先返回 → 轮询到装好为止(最多 ~4min)。
+      for (let i = 0; i < 120; i++) {
+        const r = await (window as any).electron?.matrix?.kernelStatus?.();
+        if (r?.installed) { setMatrixKernelMissing(false); break; }
+        await new Promise((res) => setTimeout(res, 2000));
+      }
+    } finally { setMatrixKernelBusy(false); }
+  };
+  const openMatrixWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; } // 未登录 → 弹登录窗
+    if (await hasDupTask(platform, 'engage', '互动')) return;
+    // 先秒开弹窗:内核检查 + 账号加载都后台异步(sidecar 忙时 IPC 排队,await 在开弹窗前会卡几秒)。
+    setMatrixAccounts([]);
+    setMatrixAccountsLoading(true);
+    setMatrixWizardTask(null);          // 新建:清掉编辑态(否则会被上次编辑的任务回填)
+    setMatrixWizardPlatform(platform);
+    void ensureMatrixKernel();          // 缺内核 → 后台弹下载提示(z-60 覆盖在向导上),不阻塞弹窗
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      // 互动涨粉走【主站】(浏览首页/搜索做赞关评),只能选主站账号;快手「创作者中心」(loginScope='creator')
+      // 是发布端登录态,不能拿来互动 → 过滤掉。非快手账号无 loginScope(默认主站)不受影响。
+      setMatrixAccounts(accs.filter((a) => a.platform === platform && (a.loginScope || 'main') === 'main').map((a) => ({ id: a.id, displayName: a.displayName, status: a.status, keywords: a.keywords, derivedKeywords: Array.isArray(a.derivedKeywords) ? a.derivedKeywords : [], group: a.group, platform: a.platform, nickname: a.nickname, displayId: a.displayId, avatar: a.avatar })));
+    } catch { setMatrixAccounts([]); }
+    finally { setMatrixAccountsLoading(false); }
+  };
+  // 编辑现有矩阵互动任务:加载该平台账号 + 把任务映成 wizard 的 initialTask(回填账号/配额/频率)。
+  const openMatrixWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    const plat = (task?.platform as string) || currentPlatform || 'douyin';
+    // 编辑只是改配置,不需要内核;也不等 listAccounts 完成 —— 先把弹窗开起来(秒开),账号异步填。
+    // (运行中 sidecar 忙,kernelStatus/listAccounts 都可能慢;之前都 await 在 setMatrixWizardTask 前 → 弹窗卡几秒。)
+    setMatrixAccounts([]);
+    setMatrixAccountsLoading(true);
+    setMatrixWizardTask({
+      id: task.id,
+      name: task.name,
+      accountIds: task.account_ids || [],
+      quota: {
+        daily_like_min: task.daily_like_min, daily_like_max: task.daily_like_max,
+        daily_follow_min: task.daily_follow_min, daily_follow_max: task.daily_follow_max,
+        daily_comment_min: task.daily_comment_min, daily_comment_max: task.daily_comment_max,
+        // 评论语言回填:漏了会在编辑时显示 auto、保存后把已存语言洗掉(mxTaskToScenario 已透传该字段)。
+        comment_lang: (task as any).comment_lang,
+        // 刷剧模式回填:同 comment_lang 一样必须带上,否则编辑时向导读 initialTask.quota.engage_mode
+        //   永远 undefined → 回到「关键词筛选」模式(mxTaskToScenario 已把 engage_mode 拍平到 task 顶层)。
+        engage_mode: (task as any).engage_mode,
+        // 收藏配额 + 精准模式配置回填:漏带的话,编辑任务时向导读不到已存的值 →
+        //   保存回去就把它们洗成默认(与 comment_lang / engage_mode 完全同类的坑)。
+        daily_favorite_min: (task as any).daily_favorite_min, daily_favorite_max: (task as any).daily_favorite_max,
+        max_comment_per_work: (task as any).max_comment_per_work,
+        precise_urls: (task as any).precise_urls, precise_like: (task as any).precise_like,
+        precise_favorite: (task as any).precise_favorite, precise_follow: (task as any).precise_follow,
+        precise_comment: (task as any).precise_comment,
+      },
+      // 评论引流回填(老任务无此字段 → 空 → 向导显示未填)。
+      funnel: { funnel_phrase: (task as any).funnel_phrase || '', funnel_probability: (task as any).funnel_probability ?? 0, ...((task as any).funnel_rewrite === false ? { funnel_rewrite: false } : {}) },
+      // AI自主评论回填(缺省 = 开;mxTaskToScenario 只在关时带 false)。
+      ai_comment: (task as any).ai_comment === false ? false : undefined,
+      // 各账号独立引流语回填(mxTaskToScenario 拍平为 funnel_by_account;漏带会让编辑永远显示共用模式 —— 用户实测 bug)。
+      funnelByAccount: (task as any).funnel_by_account || undefined,
+      frequency: task.run_interval,
+    });
+    setMatrixWizardPlatform(plat);
+    // 账号异步加载(只选主站账号,排除快手创作者中心 loginScope='creator')
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixAccounts(accs.filter((a) => a.platform === plat && (a.loginScope || 'main') === 'main').map((a) => ({ id: a.id, displayName: a.displayName, status: a.status, keywords: a.keywords, derivedKeywords: Array.isArray(a.derivedKeywords) ? a.derivedKeywords : [], group: a.group, platform: a.platform, nickname: a.nickname, displayId: a.displayId, avatar: a.avatar })));
+    } catch { setMatrixAccounts([]); }
+    finally { setMatrixAccountsLoading(false); }
+  };
+  const saveMatrixTask = async (input: { name: string; accountIds: string[]; concurrency: number; frequency: string; quota: any; funnel?: { funnel_phrase: string; funnel_probability: number } }) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    // 带 id = 更新现有任务(saveTask 是整体 upsert);无 id = 新建。
+    // funnel:互动评论引流(选填),留空 → funnel_probability=0 → 评论纯 AI(向后兼容)。
+    const r = await m?.saveTask?.({ id: matrixWizardTask?.id, platform: matrixWizardPlatform, type: 'engage', name: input.name, accountIds: input.accountIds, quota: input.quota, funnel: input.funnel, funnelByAccount: (input as any).funnelByAccount, ai_comment: (input as any).aiComment !== false, concurrency: input.concurrency, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixWizardPlatform; setMatrixWizardPlatform(null); setMatrixWizardTask(null); setDupNotice({ platform: dp as string, label: '互动' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixWizardTask?.id;
+    const plat = matrixWizardPlatform;
+    setMatrixWizardPlatform(null);
+    setMatrixWizardTask(null);
+    await refreshAll();
+    // 编辑(从详情页进的)→ refreshAll 已就地刷新当前详情数据,不跳走(否则被踢回列表还要重新点进去);
+    // 新建 → 切到管理页看新任务。
+    // 新建成功 → 直接进新任务详情(而不是回平台 tab 的任务列表),用户要求;拿不到新 id 才回退到管理页。
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+
+  // ── 自动回复粉丝向导 ────────────────────────────────────────────────
+  // 账号 scope:回复粉丝在创作者中心评论管理操作 —— 快手只能选【创作者中心】(loginScope='creator')
+  // 账号(主站号是涨粉互动用的,登录态不通用)。其它平台无 loginScope → 取主站默认。
+  const replyAccountFilter = (a: any, platform: string): boolean =>
+    a.platform === platform && (platform === 'kuaishou' ? a.loginScope === 'creator' : (a.loginScope || 'main') === 'main');
+  // 视频下载在【主站】操作(douyin/kuaishou/bilibili/tiktok 都打开 www.* 主站拿无水印源),所以
+  // 一律取主站号 —— 快手也取主站(loginScope!='creator'),不同于回复粉丝那条用 creator scope。
+  const downloadAccountFilter = (a: any, platform: string): boolean =>
+    a.platform === platform && (a.loginScope || 'main') === 'main';
+  const mapWizardAccount = (a: any): WizardAccount => ({ id: a.id, displayName: a.displayName, status: a.status, keywords: a.keywords, derivedKeywords: Array.isArray(a.derivedKeywords) ? a.derivedKeywords : [], group: a.group, platform: a.platform, nickname: a.nickname, displayId: a.displayId, avatar: a.avatar });
+  const openMatrixReplyWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (await hasDupTask(platform, 'reply_fan', '回复粉丝')) return;
+    // 先秒开弹窗,内核检查 + 账号加载后台异步(对齐编辑流程,避免 sidecar 忙时卡几秒)。
+    setMatrixReplyAccounts([]);
+    setMatrixReplyAccountsLoading(true);
+    setMatrixReplyTask(null);
+    setMatrixReplyPlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixReplyAccounts(accs.filter((a) => replyAccountFilter(a, platform)).map(mapWizardAccount));
+    } catch { setMatrixReplyAccounts([]); }
+    finally { setMatrixReplyAccountsLoading(false); }
+  };
+  // 编辑现有回复粉丝任务:回填账号/引流/频率 + 加载创作者中心账号(异步,弹窗先开)。
+  const openMatrixReplyWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    const plat = (task?.platform as string) || currentPlatform || 'kuaishou';
+    setMatrixReplyAccounts([]);
+    setMatrixReplyAccountsLoading(true);
+    setMatrixReplyTask({
+      id: task.id,
+      name: task.name,
+      accountIds: task.account_ids || [],
+      funnel: { funnel_phrase: (task as any).funnel_phrase || '', funnel_probability: (task as any).funnel_probability ?? 0, ...((task as any).funnel_rewrite === false ? { funnel_rewrite: false } : {}) },
+      // AI自主评论回填(缺省 = 开;mxTaskToScenario 只在关时带 false)。
+      ai_comment: (task as any).ai_comment === false ? false : undefined,
+      funnelByAccount: (task as any).funnel_by_account || undefined,
+      // 回填：漏了编辑时永远显示默认 1，保存回去就把用户设的值洗掉了。
+      maxReplyPerComment: (task as any).max_reply_per_comment,
+      maxRepliesPerRun: (task as any).max_replies_per_run,
+      frequency: task.run_interval,
+    });
+    setMatrixReplyPlatform(plat);
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixReplyAccounts(accs.filter((a) => replyAccountFilter(a, plat)).map(mapWizardAccount));
+    } catch { setMatrixReplyAccounts([]); }
+    finally { setMatrixReplyAccountsLoading(false); }
+  };
+  const saveMatrixReplyFanTask = async (input: { name: string; accountIds: string[]; concurrency: number; frequency: string; funnel: { funnel_phrase: string; funnel_probability: number }; maxReplyPerComment?: number; maxRepliesPerRun?: number }) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    // type='reply_fan' + funnel(无配额)。与同平台互动任务是不同 type,可并存。
+    const r = await m?.saveTask?.({ id: matrixReplyTask?.id, platform: matrixReplyPlatform, type: 'reply_fan', name: input.name, accountIds: input.accountIds, funnel: input.funnel, funnelByAccount: (input as any).funnelByAccount, ai_comment: (input as any).aiComment !== false,
+      // 单个用户评论最大回复数（仅抖音）。❗ 本向导有三个挂载点，MatrixView 两个、这里一个；
+      //   漏了这一处的话，从场景页进去的编辑弹窗选什么都存不下（用户 2026-08-26 实测）。
+      maxReplyPerComment: input.maxReplyPerComment, maxRepliesPerRun: input.maxRepliesPerRun, quota: {}, concurrency: input.concurrency, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixReplyPlatform; setMatrixReplyPlatform(null); setMatrixReplyTask(null); setDupNotice({ platform: dp as string, label: '回复粉丝' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixReplyTask?.id;
+    const plat = matrixReplyPlatform;
+    setMatrixReplyPlatform(null);
+    setMatrixReplyTask(null);
+    await refreshAll();
+    // 新建成功 → 直接进新任务详情(而不是回平台 tab 的任务列表),用户要求;拿不到新 id 才回退到管理页。
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // 定向获客向导:执行账号取【主站】号(与互动一致,排除快手创作者中心那种发布端登录态)。
+  const leadAccountFilter = (a: any, plat: string) => a.platform === plat && (a.loginScope || 'main') === 'main';
+  const openMatrixLeadWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (await hasDupTask(platform, 'lead_engage', '定向获客')) return;
+    setMatrixLeadAccounts([]);
+    setMatrixLeadAccountsLoading(true);
+    setMatrixLeadTask(null);
+    setMatrixLeadPlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixLeadAccounts(accs.filter((a) => leadAccountFilter(a, platform)).map((a) => ({ ...mapWizardAccount(a), derivedKeywords: a.derivedKeywords })));
+    } catch { setMatrixLeadAccounts([]); }
+    finally { setMatrixLeadAccountsLoading(false); }
+  };
+  const openMatrixLeadWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    const plat = (task?.platform as string) || currentPlatform || 'tiktok';
+    setMatrixLeadAccounts([]);
+    setMatrixLeadAccountsLoading(true);
+    // leadEngage 配置整体透传给向导回填(mxTaskToScenario 已把它拍平到 task.lead_engage)。
+    setMatrixLeadTask({
+      id: task.id,
+      name: task.name,
+      accountIds: task.account_ids || [],
+      leadEngage: (task as any).lead_engage || undefined,
+      // 引流语回填(共用 + 各账号);漏带会让编辑时显示成未配置,保存后把已配的洗掉。
+      funnel: { funnel_phrase: (task as any).funnel_phrase || '', funnel_probability: (task as any).funnel_probability ?? 0, ...((task as any).funnel_rewrite === false ? { funnel_rewrite: false } : {}) },
+      // AI自主评论回填(缺省 = 开;mxTaskToScenario 只在关时带 false)。
+      ai_comment: (task as any).ai_comment === false ? false : undefined,
+      funnelByAccount: (task as any).funnel_by_account || undefined,
+      frequency: task.run_interval,
+    });
+    setMatrixLeadPlatform(plat);
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixLeadAccounts(accs.filter((a) => leadAccountFilter(a, plat)).map((a) => ({ ...mapWizardAccount(a), derivedKeywords: a.derivedKeywords })));
+    } catch { setMatrixLeadAccounts([]); }
+    finally { setMatrixLeadAccountsLoading(false); }
+  };
+  const saveMatrixLeadTask = async (input: { name: string; accountIds: string[]; concurrency: number; frequency: string; leadEngage: any; funnel?: any; funnelByAccount?: any }) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    // 引流语走既有的 funnel / funnelByAccount 通道 —— engageRunner 把它下发给剧本,
+    //   由后端剧本按概率接在评论尾巴(与互动涨粉同一条链路)。
+    const r = await m?.saveTask?.({ id: matrixLeadTask?.id, platform: matrixLeadPlatform, type: 'lead_engage', name: input.name, accountIds: input.accountIds, leadEngage: input.leadEngage, funnel: input.funnel, funnelByAccount: input.funnelByAccount, ai_comment: (input as any).aiComment !== false, quota: {}, concurrency: input.concurrency, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixLeadPlatform; setMatrixLeadPlatform(null); setMatrixLeadTask(null); setDupNotice({ platform: dp as string, label: '定向获客' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixLeadTask?.id;
+    const plat = matrixLeadPlatform;
+    setMatrixLeadPlatform(null);
+    setMatrixLeadTask(null);
+    await refreshAll();
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // 「视频无水印下载」向导(单账号):账号取主站 scope(同 replyAccountFilter,douyin 走主站登录态)。
+  const openMatrixDownloadWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (await hasDupTask(platform, 'video_download', '视频下载')) return;
+    // 先秒开弹窗,内核检查 + 账号加载后台异步(对齐编辑流程,避免 sidecar 忙时卡几秒)。
+    setMatrixDownloadAccounts([]);
+    setMatrixDownloadAccountsLoading(true);
+    setMatrixDownloadTask(null);
+    setMatrixDownloadPlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixDownloadAccounts(accs.filter((a) => downloadAccountFilter(a, platform)).map(mapWizardAccount));
+    } catch { setMatrixDownloadAccounts([]); }
+    finally { setMatrixDownloadAccountsLoading(false); }
+  };
+  const openMatrixDownloadWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    const plat = (task?.platform as string) || currentPlatform || 'douyin';
+    setMatrixDownloadAccounts([]);
+    setMatrixDownloadAccountsLoading(true);
+    setMatrixDownloadTask({
+      id: task.id,
+      name: task.name,
+      accountIds: task.account_ids || [],
+      urls: Array.isArray((task as any).urls) ? (task as any).urls : [],
+      frequency: task.run_interval,
+    });
+    setMatrixDownloadPlatform(plat);
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixDownloadAccounts(accs.filter((a) => downloadAccountFilter(a, plat)).map(mapWizardAccount));
+    } catch { setMatrixDownloadAccounts([]); }
+    finally { setMatrixDownloadAccountsLoading(false); }
+  };
+  const saveMatrixDownloadTask = async (input: { name: string; accountIds: string[]; concurrency: number; frequency: string; urls: string[] }) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    // type='video_download' + urls(单账号、无配额)。与同平台互动/回复是不同 type,可并存。
+    const r = await m?.saveTask?.({ id: matrixDownloadTask?.id, platform: matrixDownloadPlatform, type: 'video_download', name: input.name, accountIds: input.accountIds, urls: input.urls, quota: {}, concurrency: 1, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixDownloadPlatform; setMatrixDownloadPlatform(null); setMatrixDownloadTask(null); setDupNotice({ platform: dp as string, label: '视频下载' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixDownloadTask?.id;
+    const plat = matrixDownloadPlatform;
+    setMatrixDownloadPlatform(null);
+    setMatrixDownloadTask(null);
+    await refreshAll();
+    // 新建成功 → 直接进新任务详情(而不是回平台 tab 的任务列表),用户要求;拿不到新 id 才回退到管理页。
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // 「评论区点赞评论」向导:执行账号取主站号(同定向获客)。
+  const openMatrixCommentLikeWizard = async (platform: string, editTask?: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    setMatrixCommentLikeAccounts([]);
+    setMatrixCommentLikeAccountsLoading(true);
+    setMatrixCommentLikeTask(editTask ? {
+      id: editTask.id,
+      name: editTask.name,
+      accountIds: editTask.account_ids || [],
+      urls: Array.isArray(editTask.urls) ? editTask.urls : [],
+      commentLikeMax: editTask.comment_like_max,
+      commentMode: editTask.comment_mode || 'precise',
+      commentPosts: editTask.comment_posts,
+      customCommentPolicy: editTask.custom_comment_policy,
+      commentDoLike: editTask.comment_do_like !== false,
+      commentDoReply: editTask.comment_do_reply !== false,
+      commentVideoLimit: editTask.comment_video_limit,
+      commentRepliesPerVideo: editTask.comment_replies_per_video,
+      concurrency: editTask.concurrency,
+      frequency: editTask.run_interval,
+    } : null);
+    setMatrixCommentLikePlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixCommentLikeAccounts(accs.filter((a) => leadAccountFilter(a, platform)).map(mapWizardAccount));
+    } catch { setMatrixCommentLikeAccounts([]); }
+    finally { setMatrixCommentLikeAccountsLoading(false); }
+  };
+  const openMatrixCommentLikeWizardEdit = (task: any) => openMatrixCommentLikeWizard((task?.platform as string) || 'tiktok', task);
+  const openMatrixBlockWizard = async (platform: string, editTask?: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (!editTask && await hasDupTask(platform, 'block', '批量拉黑')) return;
+    setMatrixBlockAccounts([]);
+    setMatrixBlockAccountsLoading(true);
+    setMatrixBlockTask(editTask ? {
+      id: editTask.id,
+      name: editTask.name,
+      accountIds: editTask.account_ids || [],
+      blockTargets: Array.isArray(editTask.block_targets) ? editTask.block_targets : [],
+      blockKeywords: Array.isArray(editTask.block_keywords) ? editTask.block_keywords : [],
+      blockMode: editTask.block_mode,
+      blockTargetsByAccount: editTask.block_targets_by_account,
+      concurrency: editTask.concurrency,
+      frequency: editTask.run_interval,
+    } : null);
+    setMatrixBlockPlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      // 关键词模式要显示【跑的时候真正用的】词 = 原始词 + AI 衍生词(effectiveKeywords),带上 derivedKeywords。
+      setMatrixBlockAccounts(accs.filter((a) => leadAccountFilter(a, platform)).map((a) => ({ ...mapWizardAccount(a), derivedKeywords: Array.isArray(a.derivedKeywords) ? a.derivedKeywords : [] })));
+    } catch { setMatrixBlockAccounts([]); }
+    finally { setMatrixBlockAccountsLoading(false); }
+  };
+  const openMatrixBlockWizardEdit = (task: any) => openMatrixBlockWizard((task?.platform as string) || 'douyin', task);
+  const saveMatrixBlockTask = async (input: { name: string; accountIds: string[]; concurrency: number; frequency: string; blockMode: 'precise' | 'keyword'; blockTargetsByAccount: Record<string, string[]> }) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    const r = await m?.saveTask?.({ id: matrixBlockTask?.id, platform: matrixBlockPlatform, type: 'block', name: input.name, accountIds: input.accountIds, blockMode: input.blockMode, blockTargetsByAccount: input.blockMode === 'precise' ? input.blockTargetsByAccount : undefined, blockTargets: [], blockKeywords: [], quota: {}, concurrency: input.concurrency, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixBlockPlatform; setMatrixBlockPlatform(null); setMatrixBlockTask(null); setDupNotice({ platform: dp as string, label: '批量拉黑' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限', block_no_targets: '请至少给一个账号填要拉黑的名单', block_no_account: '请至少选 1 个执行账号', block_platform_unsupported: '目前仅支持抖音' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixBlockTask?.id;
+    const plat = matrixBlockPlatform;
+    setMatrixBlockPlatform(null);
+    setMatrixBlockTask(null);
+    await refreshAll();
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  const openMatrixFolderWizard = async (platform: string, editTask?: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (!editTask && await hasDupTask(platform, 'folder_post', '文件夹定时发布')) return;
+    setMatrixFolderAccounts([]);
+    setMatrixFolderAccountsLoading(true);
+    setMatrixFolderTask(editTask ? { id: editTask.id, name: editTask.name, accountIds: editTask.account_ids || [], folderPost: editTask.folder_post } : null);
+    setMatrixFolderPlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixFolderAccounts(accs.filter((a) => replyAccountFilter(a, platform)).map(mapWizardAccount));
+    } catch { setMatrixFolderAccounts([]); }
+    finally { setMatrixFolderAccountsLoading(false); }
+  };
+  const openMatrixFolderWizardEdit = (task: any) => openMatrixFolderWizard((task?.platform as string) || 'douyin', task);
+  const saveMatrixFolderTask = async (input: { name: string; accountIds: string[]; folderPost: { slotsByAccount: Record<string, Array<{ time: string; on: boolean }>>; jitterMin: number } }) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    const r = await m?.saveTask?.({ id: matrixFolderTask?.id, platform: matrixFolderPlatform, type: 'folder_post', name: input.name, accountIds: input.accountIds, folderPost: input.folderPost, quota: {}, concurrency: input.accountIds.length, frequency: 'daily_random', enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixFolderPlatform; setMatrixFolderPlatform(null); setMatrixFolderTask(null); setDupNotice({ platform: dp as string, label: '文件夹定时发布' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限', folder_post_no_account: '请至少选 1 个账号', folder_post_no_slot: '至少给一个账号开一个时段', folder_post_platform_unsupported: '目前仅支持抖音' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixFolderTask?.id;
+    const plat = matrixFolderPlatform;
+    setMatrixFolderPlatform(null);
+    setMatrixFolderTask(null);
+    await refreshAll();
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  const previewMatrixCommentAssignments = async (input: CommentAssignmentPreviewInput) => {
+    const r = await (window as any).electron?.matrix?.previewCustomCommentAssignments?.({ ...input, id: matrixCommentLikeTask?.id });
+    if (!r?.ok || !r.preview) throw new Error(r?.error || '无法生成评论分工预览');
+    return r.preview;
+  };
+  const saveMatrixCommentLikeTask = async (input: CommentLikeWizardInput) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    const r = await m?.saveTask?.({ id: matrixCommentLikeTask?.id, platform: matrixCommentLikePlatform, type: 'comment_like', ...input, quota: {}, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') throw new Error(input.commentMode === 'custom' ? '已有表格自定义评论任务，请在我的任务中编辑' : '已有评论区点赞评论任务，请在我的任务中编辑');
+      if (r?.error === 'comment_like_invalid_posts') throw new Error('请导入包含有效视频链接和评论文案的工作簿');
+      if (r?.error === 'another_task_running') throw new Error('任务正在运行，请结束后再保存修改');
+      if (r?.error === 'comment_assignment_no_available_account') throw new Error('还有未分配的评论，请选择可用账号后更新预览');
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限', comment_like_link_count: '作品链接需 1-20 条有效的 TikTok 链接', comment_like_no_account: '请至少选 1 个执行账号', comment_like_no_action: '点赞和评论至少选一个', comment_like_invalid_limits: '视频数须为 1–1000 的整数,每个视频回复数须为 1–300 的整数', comment_like_platform_unsupported: '目前仅支持 TikTok' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixCommentLikeTask?.id;
+    const plat = matrixCommentLikePlatform;
+    setMatrixCommentLikePlatform(null);
+    setMatrixCommentLikeTask(null);
+    await refreshAll();
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // 「举报」向导(白名单功能):账号取主站 scope(同视频下载)。每张举报单是独立一次性单据,不做「同类型已存在」拦截。
+  const loadReportAccounts = async (platform: string) => {
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixReportAccounts(accs.filter((a) => downloadAccountFilter(a, platform)).map(mapWizardAccount));
+    } catch { setMatrixReportAccounts([]); }
+    finally { setMatrixReportAccountsLoading(false); }
+  };
+  const openMatrixReportWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (!reportEnabled) return;
+    setMatrixReportAccounts([]);
+    setMatrixReportAccountsLoading(true);
+    setMatrixReportTask(null);
+    setMatrixReportPlatform(platform);
+    void ensureMatrixKernel();
+    await loadReportAccounts(platform);
+  };
+  const openMatrixReportWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (!reportEnabled) { window.alert(i18nService.t('rpErr_report_not_whitelisted')); return; }
+    const plat = (task?.platform as string) || 'douyin';
+    setMatrixReportAccounts([]);
+    setMatrixReportAccountsLoading(true);
+    setMatrixReportTask({ id: task.id, name: task.name, accountIds: task.account_ids || [], reportItems: (task as any).report_items || [] });
+    setMatrixReportPlatform(plat);
+    await loadReportAccounts(plat);
+  };
+  const saveMatrixReportTask = async (input: { name: string; accountIds: string[]; reportItems: Array<{ url: string; targetType: string; reason: string; subReason?: string; description: string }> }) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    // type='report':频率恒 once、enabled 恒 false(sidecar taskStore 也会强制),只能在任务详情页手动点「运行」一次。
+    const r = await m?.saveTask?.({ id: matrixReportTask?.id, platform: matrixReportPlatform, type: 'report', name: input.name, accountIds: input.accountIds, reportItems: input.reportItems, quota: {}, concurrency: 1, frequency: 'once', enabled: false });
+    if (!r?.ok) {
+      const k = `rpErr_${r?.error || ''}`;
+      const msg = i18nService.t(k);
+      throw new Error(msg !== k ? msg : (r?.error || i18nService.t('rpErrSaveFailed')));
+    }
+    const wasEdit = !!matrixReportTask?.id;
+    const plat = matrixReportPlatform;
+    setMatrixReportPlatform(null);
+    setMatrixReportTask(null);
+    await refreshAll();
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // 「图文创作」向导(多账号):账号取主站 scope(同 replyAccountFilter,douyin 主站登录态即覆盖创作者中心)。
+  const openMatrixImageTextWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (await hasDupTask(platform, 'image_text', '图文创作')) return;
+    // 先秒开弹窗,内核检查 + 账号加载后台异步(对齐编辑流程,避免 sidecar 忙时卡几秒)。
+    setMatrixImageTextAccounts([]);
+    setMatrixImageTextAccountsLoading(true);
+    setMatrixImageTextTask(null);
+    setMatrixImageTextPlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixImageTextAccounts(accs.filter((a) => replyAccountFilter(a, platform)).map(mapWizardAccount));
+      // 抖音下图号候选(视频号/头条网络图用):已登录抖音的主站号。
+      setMatrixImageTextDownloadAccounts(accs.filter((a) => a.platform === 'douyin' && (a.loginScope || 'main') === 'main').map(mapWizardAccount));
+    } catch { setMatrixImageTextAccounts([]); setMatrixImageTextDownloadAccounts([]); }
+    finally { setMatrixImageTextAccountsLoading(false); }
+  };
+  const openMatrixImageTextWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    const plat = (task?.platform as string) || currentPlatform || 'douyin';
+    setMatrixImageTextAccounts([]);
+    setMatrixImageTextAccountsLoading(true);
+    setMatrixImageTextTask({
+      id: task.id,
+      name: task.name,
+      accountIds: task.account_ids || [],
+      imageText: (task as any).imageText,
+      frequency: task.run_interval,
+    });
+    setMatrixImageTextPlatform(plat);
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixImageTextAccounts(accs.filter((a) => replyAccountFilter(a, plat)).map(mapWizardAccount));
+      setMatrixImageTextDownloadAccounts(accs.filter((a) => a.platform === 'douyin' && (a.loginScope || 'main') === 'main').map(mapWizardAccount));
+    } catch { setMatrixImageTextAccounts([]); setMatrixImageTextDownloadAccounts([]); }
+    finally { setMatrixImageTextAccountsLoading(false); }
+  };
+  const saveMatrixImageTextTask = async (input: ImageTextWizardSave) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    // 各号各自参考文案(wizard 已过滤空值,只含填了的号)。
+    // dailyCount 原来在这里写死 1(9a49558 删滑杆时一并写死),导致向导选了也没用 —— 现在透传。
+    const imageText = {
+      useRealPhotos: input.useRealPhotos,
+      // 图源三选一('ai'/'real'/'local');local 带本地图绝对路径(≤6,runner 读盘转 base64)。
+      imageSource: input.imageSource,
+      localImages: input.localImages,
+      imageCount: input.imageCount,
+      dailyCount: input.dailyCount,
+      aiImageStyle: input.aiImageStyle,
+      autoPublish: input.autoPublish,
+      references: input.references,
+      // 内容来源:'reference'(参考文案,老行为)/ 'sources'(数据源选题,多选源每轮随机挑一条)。
+      contentSource: input.contentSource,
+      sources: input.sources,
+      sourceTrackMatch: input.sourceTrackMatch,   // 仅账号赛道相关(默认开)
+      // 视频号/头条网络图:抖音下图号(runner 据此启抖音内核串行搜图);其它平台/AI生图为 undefined。
+      imageDownloadAccountId: input.imageDownloadAccountId,
+    };
+    const r = await m?.saveTask?.({ id: matrixImageTextTask?.id, platform: matrixImageTextPlatform, type: 'image_text', name: input.name, accountIds: input.accountIds, imageText, quota: {}, concurrency: input.concurrency, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixImageTextPlatform; setMatrixImageTextPlatform(null); setMatrixImageTextTask(null); setDupNotice({ platform: dp as string, label: '图文创作' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixImageTextTask?.id;
+    const plat = matrixImageTextPlatform;
+    setMatrixImageTextPlatform(null);
+    setMatrixImageTextTask(null);
+    await refreshAll();
+    // 新建成功 → 直接进新任务详情(而不是回平台 tab 的任务列表),用户要求;拿不到新 id 才回退到管理页。
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // 「自动发推」向导(多账号):账号取主站 scope(推特主站登录态,发推在 x.com 主站)。
+  const openMatrixTweetWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (await hasDupTask(platform, 'x_post', '自动发推')) return;
+    // 先秒开弹窗,内核检查 + 账号加载后台异步(对齐编辑流程,避免 sidecar 忙时卡几秒)。
+    setMatrixTweetAccounts([]);
+    setMatrixTweetAccountsLoading(true);
+    setMatrixTweetTask(null);
+    setMatrixTweetPlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixTweetAccounts(accs.filter((a) => replyAccountFilter(a, platform)).map(mapWizardAccount));
+    } catch { setMatrixTweetAccounts([]); }
+    finally { setMatrixTweetAccountsLoading(false); }
+  };
+  const openMatrixTweetWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    const plat = (task?.platform as string) || currentPlatform || 'x';
+    setMatrixTweetAccounts([]);
+    setMatrixTweetAccountsLoading(true);
+    setMatrixTweetTask({
+      id: task.id,
+      name: task.name,
+      accountIds: task.account_ids || [],
+      tweetPost: (task as any).tweetPost,
+      frequency: task.run_interval,
+    });
+    setMatrixTweetPlatform(plat);
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixTweetAccounts(accs.filter((a) => replyAccountFilter(a, plat)).map(mapWizardAccount));
+    } catch { setMatrixTweetAccounts([]); }
+    finally { setMatrixTweetAccountsLoading(false); }
+  };
+  const saveMatrixTweetTask = async (input: TweetPostWizardSave) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    const tweetPost = {
+      mode: input.mode,
+      sources: input.sources,   // 数据源模式的多选源(每轮随机挑 1 个取题)
+      sourceTrackMatch: input.sourceTrackMatch,   // 仅账号赛道相关(默认开)
+      withImage: input.withImage,
+      imageMode: input.imageMode,
+      localImages: input.localImages,
+      language: input.language,
+      isBlueV: input.isBlueV,
+      autoPublish: input.autoPublish,
+      references: input.references,
+      dailyCount: input.dailyCount,   // 每号每轮发几条(runner 循环,每条隔 10-60s)
+    };
+    const r = await m?.saveTask?.({ id: matrixTweetTask?.id, platform: matrixTweetPlatform, type: 'x_post', name: input.name, accountIds: input.accountIds, tweetPost, quota: {}, concurrency: input.concurrency, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixTweetPlatform; setMatrixTweetPlatform(null); setMatrixTweetTask(null); setDupNotice({ platform: dp as string, label: '自动发推' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixTweetTask?.id;
+    const plat = matrixTweetPlatform;
+    setMatrixTweetPlatform(null);
+    setMatrixTweetTask(null);
+    await refreshAll();
+    // 新建成功 → 直接进新任务详情(而不是回平台 tab 的任务列表),用户要求;拿不到新 id 才回退到管理页。
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // 「币安广场自动发帖」向导(多账号):账号取主站 scope(币安主站登录态即覆盖币安广场)。
+  const openMatrixBinanceWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    // 剧本 id 按平台推:binance_post / gate_post / bitget_post / bybit_post。
+    if (await hasDupTask(platform, `${platform}_post`, `${platformDisplayName(platform)}${i18nService.t('svDupPostSuffix')}`)) return;
+    // 先秒开弹窗,内核检查 + 账号加载后台异步(对齐编辑流程,避免 sidecar 忙时卡几秒)。
+    setMatrixBinanceAccounts([]);
+    setMatrixBinanceAccountsLoading(true);
+    setMatrixBinanceTask(null);
+    setMatrixBinancePlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixBinanceAccounts(accs.filter((a) => replyAccountFilter(a, platform)).map(mapWizardAccount));
+    } catch { setMatrixBinanceAccounts([]); }
+    finally { setMatrixBinanceAccountsLoading(false); }
+  };
+  const openMatrixBinanceWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    const plat = (task?.platform as string) || currentPlatform || 'binance';
+    setMatrixBinanceAccounts([]);
+    setMatrixBinanceAccountsLoading(true);
+    setMatrixBinanceTask({
+      id: task.id,
+      name: task.name,
+      accountIds: task.account_ids || [],
+      binancePost: (task as any).binancePost,
+      frequency: task.run_interval,
+    });
+    setMatrixBinancePlatform(plat);
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixBinanceAccounts(accs.filter((a) => replyAccountFilter(a, plat)).map(mapWizardAccount));
+    } catch { setMatrixBinanceAccounts([]); }
+    finally { setMatrixBinanceAccountsLoading(false); }
+  };
+  const saveMatrixBinanceTask = async (input: BinancePostWizardSave) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    const binancePost = {
+      withImage: input.withImage,
+      imageMode: input.imageMode,
+      localImages: input.localImages,
+      language: input.language,
+      autoPublish: input.autoPublish,
+      dailyCount: input.dailyCount,   // 每号每轮发几条(runner 循环,每条隔 10-60s)
+    };
+    // 🚨 type 是【任务类型枚举】(MatrixTaskType),不是剧本 id —— 不能拼成 `${platform}_post`。
+    //    binance 只是碰巧拼出合法的 'binance_post';gate/okx/bitget/bybit 拼出 'gate_post' 这种
+    //    白名单里没有的值 → sidecar 的 runMatrixTaskById 直接 `unsupported_task_type`,发帖任务
+    //    建得出来但一跑就跳过(2026-08-03 用户实测)。剧本 id 由 runner 按 platform 推(`${platform}_post`)。
+    const r = await m?.saveTask?.({ id: matrixBinanceTask?.id, platform: matrixBinancePlatform, type: 'binance_post', name: input.name, accountIds: input.accountIds, binancePost, quota: {}, concurrency: input.concurrency, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixBinancePlatform; setMatrixBinancePlatform(null); setMatrixBinanceTask(null); setDupNotice({ platform: dp as string, label: `${platformDisplayName(String(dp))}${i18nService.t('svDupPostSuffix')}` }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixBinanceTask?.id;
+    const plat = matrixBinancePlatform;
+    setMatrixBinancePlatform(null);
+    setMatrixBinanceTask(null);
+    await refreshAll();
+    // 新建成功 → 直接进新任务详情(而不是回平台 tab 的任务列表),用户要求;拿不到新 id 才回退到管理页。
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // ── Facebook 自动发帖向导(复用 binancePostRunner + facebook_post 剧本) ──
+  const openMatrixFacebookWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (await hasDupTask(platform, 'facebook_post', 'Facebook 发帖')) return;
+    setMatrixFacebookAccounts([]);
+    setMatrixFacebookAccountsLoading(true);
+    setMatrixFacebookTask(null);
+    setMatrixFacebookPlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixFacebookAccounts(accs.filter((a) => replyAccountFilter(a, platform)).map(mapWizardAccount));
+    } catch { setMatrixFacebookAccounts([]); }
+    finally { setMatrixFacebookAccountsLoading(false); }
+  };
+  const openMatrixFacebookWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    const plat = (task?.platform as string) || currentPlatform || 'facebook';
+    setMatrixFacebookAccounts([]);
+    setMatrixFacebookAccountsLoading(true);
+    setMatrixFacebookTask({
+      id: task.id,
+      name: task.name,
+      accountIds: task.account_ids || [],
+      facebookPost: (task as any).facebookPost,
+      frequency: task.run_interval,
+    });
+    setMatrixFacebookPlatform(plat);
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixFacebookAccounts(accs.filter((a) => replyAccountFilter(a, plat)).map(mapWizardAccount));
+    } catch { setMatrixFacebookAccounts([]); }
+    finally { setMatrixFacebookAccountsLoading(false); }
+  };
+  const saveMatrixFacebookTask = async (input: FacebookPostWizardSave) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    const facebookPost = {
+      withImage: input.withImage,
+      imageMode: input.imageMode,
+      localImages: input.localImages,
+      language: input.language,
+      autoPublish: input.autoPublish,
+      contentSource: input.contentSource,   // 内容来源二选一:reference=参考文案 / sources=数据源
+      references: input.references,          // 仅 reference 模式:各号参考文案
+      sources: input.sources,   // 多选源(每轮随机挑 1 个);旧单选字段=第一个选中源,兼容旧 orchestrator
+      sourceTrackMatch: input.sourceTrackMatch,   // 仅账号赛道相关(默认开)
+      sourceKind: input.sourceKind,
+      source: input.source,
+      catKey: input.catKey,
+      dailyCount: input.dailyCount,   // 每号每轮发几条(runner 循环,每条隔 10-60s)
+    };
+    const r = await m?.saveTask?.({ id: matrixFacebookTask?.id, platform: matrixFacebookPlatform, type: 'facebook_post', name: input.name, accountIds: input.accountIds, facebookPost, quota: {}, concurrency: input.concurrency, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixFacebookPlatform; setMatrixFacebookPlatform(null); setMatrixFacebookTask(null); setDupNotice({ platform: dp as string, label: 'Facebook 发帖' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixFacebookTask?.id;
+    const plat = matrixFacebookPlatform;
+    setMatrixFacebookPlatform(null);
+    setMatrixFacebookTask(null);
+    await refreshAll();
+    // 新建成功 → 直接进新任务详情(而不是回平台 tab 的任务列表),用户要求;拿不到新 id 才回退到管理页。
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // ── Reddit 自动发帖向导(复用 binancePostRunner + reddit_post 剧本) ──
+  const openMatrixRedditWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (await hasDupTask(platform, 'reddit_post', 'Reddit 发帖')) return;
+    setMatrixRedditAccounts([]);
+    setMatrixRedditAccountsLoading(true);
+    setMatrixRedditTask(null);
+    setMatrixRedditPlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixRedditAccounts(accs.filter((a) => replyAccountFilter(a, platform)).map(mapWizardAccount));
+    } catch { setMatrixRedditAccounts([]); }
+    finally { setMatrixRedditAccountsLoading(false); }
+  };
+  const openMatrixRedditWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    const plat = (task?.platform as string) || currentPlatform || 'reddit';
+    setMatrixRedditAccounts([]);
+    setMatrixRedditAccountsLoading(true);
+    setMatrixRedditTask({
+      id: task.id,
+      name: task.name,
+      accountIds: task.account_ids || [],
+      redditPost: (task as any).redditPost,
+      frequency: task.run_interval,
+    });
+    setMatrixRedditPlatform(plat);
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixRedditAccounts(accs.filter((a) => replyAccountFilter(a, plat)).map(mapWizardAccount));
+    } catch { setMatrixRedditAccounts([]); }
+    finally { setMatrixRedditAccountsLoading(false); }
+  };
+  const saveMatrixRedditTask = async (input: RedditPostWizardSave) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    const redditPost = {
+      language: input.language,
+      autoPublish: input.autoPublish,
+      contentSource: input.contentSource,   // 内容来源二选一:reference=参考文案 / sources=数据源
+      references: input.references,          // 仅 reference 模式:各号参考文案
+      sources: input.sources,   // 多选源(每轮随机挑 1 个);旧单选字段=第一个选中源,兼容旧 orchestrator
+      sourceTrackMatch: input.sourceTrackMatch,   // 仅账号赛道相关(默认开)
+      sourceKind: input.sourceKind,
+      source: input.source,
+      catKey: input.catKey,
+      subreddit: input.subreddit,
+      dailyCount: input.dailyCount,   // 每号每轮发几条(runner 循环,每条隔 10-60s)
+    };
+    const r = await m?.saveTask?.({ id: matrixRedditTask?.id, platform: matrixRedditPlatform, type: 'reddit_post', name: input.name, accountIds: input.accountIds, redditPost, quota: {}, concurrency: input.concurrency, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixRedditPlatform; setMatrixRedditPlatform(null); setMatrixRedditTask(null); setDupNotice({ platform: dp as string, label: 'Reddit 发帖' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixRedditTask?.id;
+    const plat = matrixRedditPlatform;
+    setMatrixRedditPlatform(null);
+    setMatrixRedditTask(null);
+    await refreshAll();
+    // 新建成功 → 直接进新任务详情(而不是回平台 tab 的任务列表),用户要求;拿不到新 id 才回退到管理页。
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // ── Instagram 自动发帖向导(复用 binancePostRunner + instagram_post 剧本) ──
+  const openMatrixInstagramWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (await hasDupTask(platform, 'instagram_post', 'Instagram 发帖')) return;
+    setMatrixInstagramAccounts([]);
+    setMatrixInstagramAccountsLoading(true);
+    setMatrixInstagramTask(null);
+    setMatrixInstagramPlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixInstagramAccounts(accs.filter((a) => replyAccountFilter(a, platform)).map(mapWizardAccount));
+    } catch { setMatrixInstagramAccounts([]); }
+    finally { setMatrixInstagramAccountsLoading(false); }
+  };
+  const openMatrixInstagramWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    const plat = (task?.platform as string) || currentPlatform || 'instagram';
+    setMatrixInstagramAccounts([]);
+    setMatrixInstagramAccountsLoading(true);
+    setMatrixInstagramTask({
+      id: task.id,
+      name: task.name,
+      accountIds: task.account_ids || [],
+      instagramPost: (task as any).instagramPost,
+      frequency: task.run_interval,
+    });
+    setMatrixInstagramPlatform(plat);
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixInstagramAccounts(accs.filter((a) => replyAccountFilter(a, plat)).map(mapWizardAccount));
+    } catch { setMatrixInstagramAccounts([]); }
+    finally { setMatrixInstagramAccountsLoading(false); }
+  };
+  const saveMatrixInstagramTask = async (input: InstagramPostWizardSave) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    const instagramPost = {
+      withImage: true,
+      imageMode: input.imageMode,
+      localImages: input.localImages,
+      language: input.language,
+      autoPublish: input.autoPublish,
+      contentSource: input.contentSource,   // 内容来源二选一:reference=参考文案 / sources=数据源
+      references: input.references,          // 仅 reference 模式:各号参考文案
+      sources: input.sources,   // 多选源(每轮随机挑 1 个);旧单选字段=第一个选中源,兼容旧 orchestrator
+      sourceTrackMatch: input.sourceTrackMatch,   // 仅账号赛道相关(默认开)
+      sourceKind: input.sourceKind,
+      source: input.source,
+      catKey: input.catKey,
+      dailyCount: input.dailyCount,   // 每号每轮发几条(runner 循环,每条隔 10-60s)
+    };
+    const r = await m?.saveTask?.({ id: matrixInstagramTask?.id, platform: matrixInstagramPlatform, type: 'instagram_post', name: input.name, accountIds: input.accountIds, instagramPost, quota: {}, concurrency: input.concurrency, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixInstagramPlatform; setMatrixInstagramPlatform(null); setMatrixInstagramTask(null); setDupNotice({ platform: dp as string, label: 'Instagram 发帖' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixInstagramTask?.id;
+    const plat = matrixInstagramPlatform;
+    setMatrixInstagramPlatform(null);
+    setMatrixInstagramTask(null);
+    await refreshAll();
+    // 新建成功 → 直接进新任务详情(而不是回平台 tab 的任务列表),用户要求;拿不到新 id 才回退到管理页。
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // ── 币安广场批量搬运向导:发布号取币安(replyAccountFilter),采集号取【全部账号】(按所选源平台过滤在 wizard 内做)。 ──
+  const loadRepostAccounts = async (plat: string) => {
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixRepostAccounts(accs.filter((a) => replyAccountFilter(a, plat)).map(mapWizardAccount));
+      setMatrixRepostSourceAccounts(accs.map(mapWizardAccount));
+    } catch { setMatrixRepostAccounts([]); setMatrixRepostSourceAccounts([]); }
+    finally { setMatrixRepostAccountsLoading(false); }
+  };
+  const openMatrixRepostWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    // 剧本 id 按平台推:binance_repost / gate_repost / bitget_repost / bybit_repost / okx_repost。
+    if (await hasDupTask(platform, `${platform}_repost`, `${platformDisplayName(platform)}${i18nService.t('svDupRepostSuffix')}`)) return;
+    setMatrixRepostAccounts([]); setMatrixRepostSourceAccounts([]);
+    setMatrixRepostAccountsLoading(true);
+    setMatrixRepostTask(null);
+    setMatrixRepostPlatform(platform);
+    await loadRepostAccounts(platform);
+  };
+  const openMatrixRepostWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    const plat = (task?.platform as string) || currentPlatform || 'binance';
+    setMatrixRepostAccounts([]); setMatrixRepostSourceAccounts([]);
+    setMatrixRepostAccountsLoading(true);
+    setMatrixRepostTask({ id: task.id, name: task.name, accountIds: task.account_ids || [], binanceRepost: (task as any).binanceRepost, frequency: task.run_interval });
+    setMatrixRepostPlatform(plat);
+    await loadRepostAccounts(plat);
+  };
+  const saveMatrixRepostTask = async (input: BinanceRepostWizardSave) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    const binanceRepost = {
+      sourcePlatform: input.sourcePlatform,
+      sourceAccountId: input.sourceAccountId,
+      material: input.material,
+      withImage: input.withImage,
+      language: input.language,
+      autoPublish: input.autoPublish,
+      perAccountCount: input.perAccountCount,   // 每号每轮搬几条(采集量 = 号数 × 本值)
+      // keyword(搜索词覆盖)没有向导 UI;taskStore 是整对象替换,不带上编辑一次就丢(审计发现)。
+      ...(matrixRepostTask?.binanceRepost?.keyword ? { keyword: matrixRepostTask.binanceRepost.keyword } : {}),
+    };
+    // 同上:type 用枚举 'binance_repost',剧本 id 走 `${platform}_repost` 由 runner 推。
+    const r = await m?.saveTask?.({ id: matrixRepostTask?.id, platform: matrixRepostPlatform, type: 'binance_repost', name: input.name, accountIds: input.accountIds, binanceRepost, quota: {}, concurrency: input.concurrency, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixRepostPlatform; setMatrixRepostPlatform(null); setMatrixRepostTask(null); setDupNotice({ platform: dp as string, label: '币安广场搬运' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixRepostTask?.id;
+    const plat = matrixRepostPlatform;
+    setMatrixRepostPlatform(null);
+    setMatrixRepostTask(null);
+    await refreshAll();
+    // 新建成功 → 直接进新任务详情(而不是回平台 tab 的任务列表),用户要求;拿不到新 id 才回退到管理页。
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // 「爆款批量仿写」向导(多账号):账号取主站 scope(同 replyAccountFilter,小红书主站登录态)。
+  const openMatrixViralWizard = async (platform: string) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    if (await hasDupTask(platform, 'viral_rewrite', '爆款仿写')) return;
+    // 先秒开弹窗,内核检查 + 账号加载后台异步(对齐编辑流程,避免 sidecar 忙时卡几秒)。
+    setMatrixViralAccounts([]);
+    setMatrixViralAccountsLoading(true);
+    setMatrixViralTask(null);
+    setMatrixViralPlatform(platform);
+    void ensureMatrixKernel();
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixViralAccounts(accs.filter((a) => replyAccountFilter(a, platform)).map(mapWizardAccount));
+    } catch { setMatrixViralAccounts([]); }
+    finally { setMatrixViralAccountsLoading(false); }
+  };
+  const openMatrixViralWizardEdit = async (task: any) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); return; }
+    const plat = (task?.platform as string) || currentPlatform || 'xhs';
+    setMatrixViralAccounts([]);
+    setMatrixViralAccountsLoading(true);
+    setMatrixViralTask({ id: task.id, name: task.name, accountIds: task.account_ids || [], viralRewrite: (task as any).viralRewrite, frequency: task.run_interval });
+    setMatrixViralPlatform(plat);
+    try {
+      const r = await (window as any).electron?.matrix?.listAccounts?.();
+      const accs: any[] = r?.ok && Array.isArray(r.accounts) ? r.accounts : [];
+      setMatrixViralAccounts(accs.filter((a) => replyAccountFilter(a, plat)).map(mapWizardAccount));
+    } catch { setMatrixViralAccounts([]); }
+    finally { setMatrixViralAccountsLoading(false); }
+  };
+  const saveMatrixViralTask = async (input: ViralRewriteWizardSave) => {
+    if (!noobClawAuth.getState().isAuthenticated) { noobClawAuth.requireLoginUI(); throw new Error('请先登录 NoobClaw 账号'); }
+    const m = (window as any).electron?.matrix;
+    const viralRewrite = { dailyCount: input.dailyCount, aiImageStyle: input.aiImageStyle, autoPublish: input.autoPublish, imageMode: input.imageMode, localImages: input.localImages };
+    const r = await m?.saveTask?.({ id: matrixViralTask?.id, platform: matrixViralPlatform, type: 'viral_rewrite', name: input.name, accountIds: input.accountIds, viralRewrite, quota: {}, concurrency: input.concurrency, frequency: input.frequency, enabled: true });
+    if (!r?.ok) {
+      if (r?.error === 'duplicate_type') { const dp = matrixViralPlatform; setMatrixViralPlatform(null); setMatrixViralTask(null); setDupNotice({ platform: dp as string, label: '爆款仿写' }); return; }
+      throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限' } as any)[r?.error] || r?.error || '保存失败');
+    }
+    const wasEdit = !!matrixViralTask?.id;
+    const plat = matrixViralPlatform;
+    setMatrixViralPlatform(null);
+    setMatrixViralTask(null);
+    await refreshAll();
+    // 新建成功 → 直接进新任务详情(而不是回平台 tab 的任务列表),用户要求;拿不到新 id 才回退到管理页。
+    if (!wasEdit) { if (r?.task?.id) openTask(r.task.id); else onSwitchToManage?.(plat as any); }
+  };
+  // Link-mode edit modal (separate from the keyword wizard — they capture
+  // completely different inputs and users were confusing them)
+  const [linkEditTask, setLinkEditTask] = useState<Task | null>(null);
+
+  const refreshAll = useCallback(async () => {
+    setLoading(true);
+    try {
+      // Load tasks and drafts first (local, fast)
+      const [t, d] = await Promise.all([
+        scenarioService.listTasks().catch(() => []),
+        scenarioService.listDrafts().catch(() => []),
+      ]);
+      setTasks(Array.isArray(t) ? t : []);
+      setDrafts(Array.isArray(d) ? d : []);
+      setLoading(false);
+
+      // Load scenarios in background (network, slow) — don't block UI.
+      // Only REPLACE the bundled DEFAULT_SCENARIOS snapshot when the API
+      // returns a non-empty array. If the API call fails or returns []
+      // (e.g. user is offline / backend down) we keep the bundled
+      // snapshot so the UI stays usable.
+      scenarioService.listScenarios().then(s => {
+        if (Array.isArray(s) && s.length > 0) setScenarios(s);
+      }).catch(() => {});
+    } catch (err) {
+      console.error('[ScenarioView] refreshAll failed:', err);
+      setFatalError(String(err instanceof Error ? err.message : err));
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshAll();
+    // Sidecar might not be ready on first mount — retry once after 2s
+    const t1 = setTimeout(() => void refreshAll(), 2000);
+    return () => { clearTimeout(t1); };
+  }, [refreshAll]);
+
+  // Live window title showing running tasks. Polls running task ids + each
+  // task's current step every 3s. Shows e.g.:
+  //   "推特任务-步骤2 · 小红书任务-步骤1 — NoobClaw"
+  // when 2 tasks are running, or just "NoobClaw" when idle. The user can
+  // glance at the OS window list / dock and see status without bringing
+  // the app to foreground.
+  useEffect(() => {
+    let cancelled = false;
+    const baseTitle = 'NoobClaw';
+    const tick = async () => {
+      try {
+        const ids = await scenarioService.getRunningTaskIds();
+        if (cancelled) return;
+        if (ids.length === 0) {
+          document.title = baseTitle;
+          return;
+        }
+        const scenarioById = new Map(scenarios.map(s => [s.id, s]));
+        const parts: string[] = [];
+        for (const id of ids) {
+          const t = tasks.find(t => t.id === id);
+          if (!t) continue;
+          const s = scenarioById.get(t.scenario_id);
+          const platform = s?.platform === 'x' ? '推特'
+            : s?.platform === 'xhs' ? '小红书'
+            : s?.platform === 'binance' ? '币安广场'
+            : s?.platform === 'tiktok' ? 'TikTok'
+            : s?.platform === 'youtube' ? 'YouTube'
+            : s?.platform === 'douyin' ? '抖音'
+            : s?.platform === 'shipinhao' ? '视频号'
+            : s?.platform === 'toutiao' ? '头条号'
+            : (s?.platform as string) === 'facebook' ? 'Facebook'
+            : (s?.platform as string) === 'reddit' ? 'Reddit'
+            : (s?.platform as string) === 'instagram' ? 'Instagram'
+            : (s?.platform || '');
+          // Get this task's progress to know which step it's in
+          const prog = await scenarioService.getRunProgress(id).catch(() => null);
+          if (prog && prog.status === 'running' && prog.currentStep > 0) {
+            parts.push(`${platform}任务-步骤${prog.currentStep}`);
+          } else if (prog && prog.status === 'done') {
+            parts.push(`${platform}任务-已结束`);
+          } else if (prog && prog.status === 'error') {
+            parts.push(`${platform}任务-异常`);
+          } else {
+            parts.push(`${platform}任务-启动中`);
+          }
+        }
+        document.title = parts.length > 0 ? `${parts.join(' · ')} — ${baseTitle}` : baseTitle;
+      } catch {
+        if (!cancelled) document.title = baseTitle;
+      }
+    };
+    void tick();
+    const h = setInterval(tick, 3000);
+    return () => { cancelled = true; clearInterval(h); document.title = baseTitle; };
+  }, [tasks, scenarios]);
+
+  // Derive the platform tab to highlight + return to:
+  //   - workflows view  → use view.platform directly
+  //   - task_detail     → look up task → its scenario → scenario.platform
+  //                       (so Twitter tasks keep the 🐦 tab active)
+  //   - sensitive_check → XHS-only feature, fall back to 'xhs'
+  const currentPlatform: PlatformId = (() => {
+    if (view.kind === 'main') return view.platform;
+    if (view.kind === 'task_detail') {
+      const t = tasks.find(t => t.id === view.task_id);
+      const s = t ? scenarios.find(s => s.id === t.scenario_id) : null;
+      // 优先用任务自带 platform:发帖类 scenario(facebook_post/reddit_post/instagram_post 等)
+      //   常不在 scenarios 快照里 → s=null → 原来落到下面 'xhs' 兜底,FB 任务返回错跳小红书 tab。
+      const p = (t as any)?.platform || s?.platform;
+      // v2.4.61: 漏了 'binance' — 进币安任务详情然后返回会跳回小红书 tab
+      // v6.x:  漏了 'video' — 翻译二创(scenario.platform='video')详情返回也会掉小红书 tab
+      if (p === 'xhs' || p === 'x' || p === 'binance' || p === 'gate' || p === 'bitget' || p === 'bybit' || p === 'okx' || p === 'douyin' || p === 'shipinhao' || p === 'toutiao' || p === 'kuaishou' || p === 'bilibili' || p === 'tiktok' || p === 'youtube' || (p as string) === 'facebook' || (p as string) === 'reddit' || (p as string) === 'instagram' || p === 'video') return p as PlatformId;
+      return 'xhs';
+    }
+    return 'xhs';
+  })();
+
+  // The currently-active top-level section (create / tasks / history). Used
+  // to highlight the right L1 tab AND to remember which section to go back
+  // to after viewing a task detail.
+  const currentSection: SectionId = (() => {
+    if (view.kind === 'main') return view.section;
+    if (view.kind === 'task_detail') return view.from || 'tasks';
+    return 'create';
+  })();
+  // 运行中绿点【只在「我的矩阵涨粉任务」和「运行记录」两处显示】。新建任务页(create)选的是
+  //   「要给哪个平台建任务」,那儿标出别的平台在跑属于噪音,用户 2026-08-06 明确不要。
+  const showRunningDot = matrixMode && (currentSection === 'tasks' || currentSection === 'history');
+  // 「只看运行中」聚合视图是否生效:仅 manage 菜单的任务列表态(main+tasks)。开关本身在
+  //   下钻详情时保持开启,回列表后继续生效。
+  const runningOnlyActive = !!matrixMode && mode === 'manage' && showRunningOnly
+    && view.kind === 'main' && currentSection === 'tasks';
+  // 专业版列表页(窗口任务 / 运行记录)用顶部一行筛选,替代原段标题 + 两行平台 tab
+  const proListView = proActive && view.kind === 'main'
+    && ((mode === 'manage' && currentSection === 'tasks') || (mode === 'runs' && currentSection === 'history'));
+  const proPlat: 'all' | PlatformId = (pf.plat !== 'all' && (MATRIX_TAB_ORDER as string[]).includes(pf.plat) && !complianceHidden.includes(pf.plat))
+    ? (pf.plat as PlatformId) : 'all';
+  // 选了具体平台 → 页面平台跟着它走(沿用原来按平台的列表);「全部平台」时走下面的全平台列表
+  useEffect(() => {
+    if (!proListView || proPlat === 'all' || view.kind !== 'main') return;
+    if (view.platform !== proPlat) setView({ ...view, platform: proPlat });
+  }, [proListView, proPlat, view]);
+  const platTab = (id: string) => PLATFORM_TABS.find((t) => t.id === id);
+  const platName = (id: string) => { const t = platTab(id); return t ? i18nService.t(t.labelKey) : id; };
+
+  const setSection = (section: SectionId) => {
+    // Clear any task filter when manually switching sections via the L1 tabs.
+    setView({ kind: 'main', section, platform: currentPlatform });
+  };
+
+  const setPlatform = (platform: PlatformId) => {
+    // 平台间互切一律沿用当前 section(tasks/history/create):
+    //   - 创建态点别的平台 tab → 停在该平台的创建页(跟用户在"新建涨粉任务"里切 tab 的预期一致);
+    //   - 任务页 / 运行记录页 切 tab → 看该平台对应的同一 section。
+    // 视频创作以前被特判过(强制掉到 'tasks'),但 VideoWorkflowsPage 已经完整支持
+    //   三种 section(含 history → VideoRunHistory),不需要再特判。
+    setView({ kind: 'main', section: currentSection, platform });
+  };
+
+  // 合规隐藏生效后,若当前正停在被隐藏的平台上 → 跳到第一个可见平台(否则停在没有 tab 的空平台)。
+  useEffect(() => {
+    if (!matrixMode || complianceHidden.length === 0) return;
+    if (complianceHidden.includes(currentPlatform)) {
+      const firstVisible = MATRIX_TAB_ORDER.find((id) => !complianceHidden.includes(id));
+      if (firstVisible && firstVisible !== currentPlatform) setPlatform(firstVisible);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [complianceHidden, currentPlatform, matrixMode]);
+
+  // 进入视频创建流。跟其他平台「新建」一致先过积分门槛(余额 < 10000 弹"积分
+  // 不足"提示框,点充值跳钱包页),通过才真正切到 create。两个入口(落地页占位框 /
+  // 右上 CTA)都走这里,保证门槛一致。
+  const goVideoCreate = () => {
+    // manage 模式不自带新建页 —— 切到「一键涨粉」create 菜单(视频 tab)。
+    if (mode !== 'create') { onSwitchToCreate?.('video'); return; }
+    if (!noobClawAuth.hasEnoughBalanceForTask()) return;
+    setView({ kind: 'main', section: 'create', platform: 'video' });
+  };
+
+  /** 进入某平台的新建流。create 模式留在本实例切 create 段;manage 模式切到
+   *  「一键涨粉」create 菜单(干净拆分)。两条路都先过积分门槛。 */
+  const goCreatePlatform = (platform: PlatformId) => {
+    // 有免费卡片的平台(无水印下载;会员另有评论区点赞 / 文件夹定时发布)不拦 —— 余额 0 也能进去建免费任务,
+    //   收费任务在「运行」时照样过积分门槛(TaskDetailPage)。
+    if (!(matrixMode && platformHasFreeCard(platform)) && !noobClawAuth.hasEnoughBalanceForTask()) return;
+    if (mode === 'create') { setView({ kind: 'main', section: 'create', platform }); return; }
+    onSwitchToCreate?.(platform);
+  };
+
+  // 「新建窗口任务」弹窗入口。platform 带了就跳过选平台;视频创作走原来的视频创建流。
+  const ncPlatforms = MATRIX_TAB_ORDER.filter((id) => !complianceHidden.includes(id) && (!simple || id !== 'video'));
+  const openNewTaskModal = (platform?: string) => {
+    if (platform === 'video') { goVideoCreate(); return; }
+    const p = platform && (ncPlatforms as string[]).includes(platform) ? platform : '';
+    if (p && !platformHasFreeCard(p as PlatformId) && !noobClawAuth.hasEnoughBalanceForTask()) return;
+    setNc({ open: true, step: p ? 2 : 1, plat: p, fixed: !!p, pick: -1 });
+  };
+  useEffect(() => {
+    if (!createReq || !createReq.nonce || createReq.nonce <= consumedCreateNonce) return;
+    consumedCreateNonce = createReq.nonce;
+    openNewTaskModal(createReq.platform);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [createReq?.nonce]);
+  const ncNext = () => {
+    if (nc.step === 1) {
+      if (!nc.plat) return;
+      if (nc.plat === 'video') { setNc((n) => ({ ...n, open: false })); goVideoCreate(); return; }
+      if (!platformHasFreeCard(nc.plat as PlatformId) && !noobClawAuth.hasEnoughBalanceForTask()) return;
+      setNc((n) => ({ ...n, step: 2, pick: -1 }));
+      return;
+    }
+    // 第 2 步:点选中卡片原有的「开始」按钮(按钮在弹窗里隐藏),走它原来的向导 / 查重 / 积分门槛
+    const grid = ncRef.current?.querySelector(':scope > div > .grid');
+    const card = grid && nc.pick >= 0 ? grid.children[nc.pick] : null;
+    const btn = card ? (card.querySelector('.mt-auto button') as HTMLButtonElement | null) : null;
+    if (!btn || btn.disabled) return;
+    ncPass.current = true;
+    try { btn.click(); } finally { ncPass.current = false; }
+    setNc((n) => ({ ...n, open: false }));
+  };
+  const ncPickCapture = (e: React.MouseEvent) => {
+    if (ncPass.current) return;
+    const grid = ncRef.current?.querySelector(':scope > div > .grid');
+    if (!grid) return;
+    let el = e.target as HTMLElement | null;
+    while (el && el.parentElement !== grid) el = el.parentElement;
+    if (!el) return;              // 点在卡片外(如底部标签)不处理
+    e.preventDefault();
+    e.stopPropagation();          // 卡片里原有的按钮 / 链接在弹窗里不触发,只做选中
+    const idx = Array.from(grid.children).indexOf(el);
+    setNc((n) => ({ ...n, pick: idx }));
+  };
+
+  const openTask = (task_id: string, fromOverride?: SectionId) => {
+    // `fromOverride` lets callers (e.g. link-mode quick-create flows in
+    // XhsWorkflowsPage / XWorkflowsPage) say "treat this as if user came
+    // from My Tasks" so the back button doesn't dump them back into the
+    // creation form they just submitted. Defaults to currentSection.
+    setView({ kind: 'task_detail', task_id, from: fromOverride || currentSection });
+  };
+
+  /** Jump from a task's detail page to Run History filtered by that task. */
+  const openHistoryForTask = (task_id: string) => {
+    // Resolve platform from the task so the right L2 sub-tab is active.
+    const t = tasks.find(t => t.id === task_id);
+    const s = t ? scenarios.find(s => s.id === t.scenario_id) : null;
+    const p = (s?.platform === 'x' || s?.platform === 'xhs' || s?.platform === 'binance') ? s.platform : currentPlatform;
+    setView({ kind: 'main', section: 'history', platform: p, filterTaskId: task_id });
+  };
+
+  const openSensitiveCheck = () => {
+    setView({ kind: 'sensitive_check' });
+  };
+
+  // Go back to the section the user was on before opening a detail page.
+  // task_detail remembers via `view.from`; record_detail returns to the
+  // history section it came from (optionally still filtered); sensitive_check
+  // just goes home.
+  const goBack = () => {
+    if (view.kind === 'task_detail' && view.from) {
+      setView({ kind: 'main', section: view.from, platform: currentPlatform });
+    } else if (view.kind === 'record_detail') {
+      setView({ kind: 'main', section: 'history', platform: view.from_platform, filterTaskId: view.filterTaskId });
+    } else {
+      setView({ kind: 'main', section: baseSection, platform: currentPlatform });
+    }
+  };
+
+  /** Open a run record's read-only detail page. Remembers where we came
+   *  from so the back button takes the user back to the right filtered
+   *  history view. */
+  const openRecord = (record_id: string) => {
+    const currentFilter = view.kind === 'main' ? view.filterTaskId || null : null;
+    setView({ kind: 'record_detail', record_id, from_platform: currentPlatform, filterTaskId: currentFilter });
+  };
+
+  const openWizardFor = (scenario: Scenario) => {
+    setWizardScenario(scenario);
+    setWizardEditingTask(null);
+  };
+
+  const openWizardEdit = (task: Task, scenario: Scenario) => {
+    // Link-mode tasks have a completely different input shape (URLs vs
+    // keywords) — open the dedicated link editor instead of the keyword
+    // wizard so users aren't asked to pick a track for links they already
+    // supplied.
+    const isLinkMode = task.track === 'link_mode'
+      || (Array.isArray((task as any).urls) && (task as any).urls.length > 0);
+    if (isLinkMode) {
+      setLinkEditTask(task);
+      return;
+    }
+    setWizardScenario(scenario);
+    setWizardEditingTask(task);
+  };
+
+  const closeWizard = () => {
+    setWizardScenario(null);
+    setWizardEditingTask(null);
+  };
+
+  const closeLinkEdit = () => setLinkEditTask(null);
+
+  const handleWizardSave = async (input: {
+    scenario_id: string;
+    track: string;
+    keywords: string[];
+    persona: string;
+    daily_count: number;
+    variants_per_post: number;
+    daily_time: string;
+    /** Twitter v1: extra optional fields. Spread through unchanged. */
+    language?: 'zh' | 'en' | 'mixed';
+    user_context?: string;
+    urls?: string[];
+    /** douyin_image_text: 3 段灵感来源,跟 keywords 互斥 */
+    source_segments?: string[];
+    /** douyin_image_text / xhs viral_production: 自动上传草稿 vs 仅生成 */
+    auto_upload?: boolean;
+    /** douyin_image_text: true=直接发布,false=存草稿(仅 auto_upload=true 时生效) */
+    auto_publish?: boolean;
+  }) => {
+    let landingTaskId: string | null = null;
+    let createdLinkRewrite = false;
+    if (wizardEditingTask) {
+      // Edit → always activate as scheduled task
+      await scenarioService.updateTask(wizardEditingTask.id, { ...input, active: true, enabled: true });
+      landingTaskId = wizardEditingTask.id;
+    } else {
+      // Create → land on the new task's detail page (v2.4.30+) so the
+      // user immediately sees the task they just configured instead of
+      // staring at the empty Create page wondering "did it work?".
+      // createTask returns the persisted Task with its assigned id.
+      const created = await scenarioService.createTask({ ...input, enabled: true, active: true });
+      landingTaskId = created?.id || null;
+      // v4.28.x: 链接仿写场景(x_link_rewrite / binance_from_x_link)创建后立刻 runTaskNow,
+      // 跟 X / XHS workflows 页面里的"快速 link 模式"行为对齐 —— 用户粘了 URL 列表
+      // 就是想立刻看结果,不应该等下一次 scheduler tick 或者手动点"立即运行"。
+      // 普通调度型场景(post_creator / repost / auto_engage)保持原行为(等 scheduler)。
+      if (created?.id && (input.scenario_id === 'x_link_rewrite' || input.scenario_id === 'binance_from_x_link')) {
+        createdLinkRewrite = true;
+      }
+    }
+    closeWizard();
+    // Refresh BEFORE navigating so TaskDetailPage can find the new task
+    // in the freshly-loaded tasks[] (otherwise it would render the
+    // "task deleted" empty state for a split second).
+    await refreshAll();
+    if (landingTaskId) {
+      setView({ kind: 'task_detail', task_id: landingTaskId, from: baseSection });
+      if (createdLinkRewrite) {
+        // 异步触发,不阻塞跳转
+        scenarioService.runTaskNow(landingTaskId).catch(e => {
+          console.error('[ScenarioView] link-rewrite auto-run failed:', e);
+        });
+      }
+    }
+  };
+
+  const tasksForPlatform = useMemo(() => {
+    if (!Array.isArray(tasks)) return [];
+    // 矩阵任务优先按 t.platform 过滤(mxTaskToScenario 已透传)—— 不能只走 scenario 注册表 byId 映射:
+    //   FB/Reddit/Instagram 等新平台的剧本不在客户端 scenarios 注册表里 → byId 映射不到 → 任务【看不见】,
+    //   而 hasDupTask 按 t.platform 又能查到 → 报「已有任务却看不见、也创建不了」(用户实测)。
+    //   同时保留 byId 兜底:platform 字段缺失的旧任务行仍按 scenario_id 归位,不能全部隐身(用户实测回归)。
+    if (matrixMode) {
+      const byId = new Map((Array.isArray(scenarios) ? scenarios : []).map(s => [s.id, s]));
+      return tasks.filter((t) => ((t as any).platform || byId.get(t.scenario_id)?.platform) === currentPlatform);
+    }
+    if (!Array.isArray(scenarios)) return [];
+    const byId = new Map(scenarios.map(s => [s.id, s]));
+    return tasks.filter(t => byId.get(t.scenario_id)?.platform === currentPlatform);
+  }, [tasks, scenarios, currentPlatform, matrixMode]);
+
+  const draftsByTask = useMemo(() => {
+    const map = new Map<string, Draft[]>();
+    if (!Array.isArray(drafts)) return map;
+    for (const d of drafts) {
+      const arr = map.get(d.task_id) || [];
+      arr.push(d);
+      map.set(d.task_id, arr);
+    }
+    return map;
+  }, [drafts]);
+
+  // ── Render ──
+
+  // 简洁版可选平台:与新建页平台 tab 同口径(去掉「视频创作」),顺序同 MATRIX_TAB_ORDER
+  const simplePlatforms = MATRIX_TAB_ORDER
+    .filter((id) => id !== 'video' && !complianceHidden.includes(id))
+    .map((id) => PLATFORM_TABS.find((t) => t.id === id))
+    .filter(Boolean)
+    .map((t) => ({ id: t!.id, label: i18nService.t(t!.labelKey), icon: t!.icon }));
+  // 简洁版「创建任务」弹窗:每个平台能建的任务 = 新建页上该平台的卡片(同一个向导入口、同一套防重复类型)
+  const simpleTypesFor = useCallback((p: string): SimpleTaskType[] => {
+    const P = p as PlatformId;
+    const out: SimpleTaskType[] = [];
+    const add = (key: string, zh: string, tw: string, en: string, dupType?: string) => out.push({ key, label: SL(zh, tw, en), dupType });
+    if (MATRIX_ENGAGE_PLATFORMS.has(P)) add('engage', '互动涨粉', '互動漲粉', 'Engagement growth', 'engage');
+    if (MATRIX_LEAD_PLATFORMS.has(P)) add('lead', '精准定向获客', '精準定向獲客', 'Targeted leads', 'lead_engage');
+    if (MATRIX_REPLY_FAN_PLATFORMS.has(P)) add('reply', '自动回复粉丝评论', '自動回覆粉絲留言', 'Auto-reply to fans', 'reply_fan');
+    if (MATRIX_IMAGE_TEXT_PLATFORMS.has(P)) add('image_text', '图文创作', '圖文創作', 'Image-text posts', 'image_text');
+    if (!FOLDER_POST_CARD_HIDDEN && MATRIX_FOLDER_POST_PLATFORMS.has(P)) add('folder', '文件夹定时发布', '資料夾定時發布', 'Folder scheduled posts', 'folder_post');
+    if (MATRIX_VIRAL_PLATFORMS.has(P)) add('viral', '爆款仿写', '爆款仿寫', 'Viral rewrite', 'viral_rewrite');
+    if (MATRIX_TWEET_POST_PLATFORMS.has(P)) add('tweet', '自动发推', '自動發推', 'Auto tweet', 'x_post');
+    if (MATRIX_BINANCE_POST_PLATFORMS.has(P) || MATRIX_EXCHANGE_POST_PLATFORMS.has(P)) add('square_post', '自动发帖', '自動發帖', 'Auto post', `${P}_post`);
+    if (MATRIX_FB_POST_PLATFORMS.has(P)) add('fb_post', '自动发帖', '自動發帖', 'Auto post', 'facebook_post');
+    if (MATRIX_REDDIT_POST_PLATFORMS.has(P)) add('reddit_post', '自动发帖', '自動發帖', 'Auto post', 'reddit_post');
+    if (MATRIX_IG_POST_PLATFORMS.has(P)) add('ig_post', '自动发帖', '自動發帖', 'Auto post', 'instagram_post');
+    if (MATRIX_BINANCE_REPOST_PLATFORMS.has(P) || MATRIX_EXCHANGE_REPOST_PLATFORMS.has(P)) add('repost', '批量搬运', '批量搬運', 'Repost', `${P}_repost`);
+    if (MATRIX_COMMENT_LIKE_PLATFORMS.has(P)) add('comment_like', '评论区点赞评论', '留言區按讚留言', 'Comment like & reply', 'comment_like');
+    if (MATRIX_BLOCK_PLATFORMS.has(P)) add('block', '批量拉黑', '批量封鎖', 'Batch block', 'block');
+    if (MATRIX_VIDEO_DOWNLOAD_PLATFORMS.has(P) || P === 'youtube') add('download', '无水印下载', '無浮水印下載', 'Watermark-free download', 'video_download');
+    if (reportEnabled && !!MATRIX_REPORT_SCENARIO_ID[P]) add('report', '举报', '檢舉', 'Report');
+    if (P === 'xhs') add('sensitive', '敏感词检查', '敏感詞檢查', 'Sensitive-word check');   // 与专业版小红书卡片一致(账号无关的工具)
+    return out;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reportEnabled, i18nService.currentLanguage]);
+  const runSimpleType = (p: string, key: string) => {
+    setSimpleModalOpen(false);
+    if (key === 'sensitive') { openSensitiveCheck(); return; }
+    setView({ kind: 'main', section: 'create', platform: p as PlatformId });
+    const open: Record<string, (pl: string) => unknown> = {
+      engage: openMatrixWizard, lead: openMatrixLeadWizard, reply: openMatrixReplyWizard, image_text: openMatrixImageTextWizard,
+      folder: openMatrixFolderWizard, viral: openMatrixViralWizard, tweet: openMatrixTweetWizard, square_post: openMatrixBinanceWizard,
+      fb_post: openMatrixFacebookWizard, reddit_post: openMatrixRedditWizard, ig_post: openMatrixInstagramWizard, repost: openMatrixRepostWizard,
+      comment_like: openMatrixCommentLikeWizard, block: openMatrixBlockWizard, download: openMatrixDownloadWizard, report: openMatrixReportWizard,
+    };
+    void open[key]?.(p);
+  };
+
+  // 简洁版 create:从这里打开过向导 / 任务详情 / 敏感词检查 / 「已有任务」提示,之后又回到了空的新建页
+  //   (向导取消、详情页点返回…)→ 直接回到进来之前的页面(通常是首页),不停在只有一个按钮的空页上。
+  const anyMatrixWizardOpen = !!(matrixWizardPlatform || matrixReplyPlatform || matrixLeadPlatform || matrixCommentLikePlatform
+    || matrixFolderPlatform || matrixBlockPlatform || matrixDownloadPlatform || matrixReportPlatform || matrixImageTextPlatform
+    || matrixTweetPlatform || matrixBinancePlatform || matrixFacebookPlatform || matrixRedditPlatform || matrixInstagramPlatform
+    || matrixRepostPlatform || matrixViralPlatform);
+  const simpleLeftCreate = useRef(false);
+  useEffect(() => {
+    if (!(simple && mode === 'create')) return;
+    if (anyMatrixWizardOpen || matrixKernelMissing || dupNotice || view.kind !== 'main') { simpleLeftCreate.current = true; return; }
+    if (!simpleModalOpen && simpleLeftCreate.current) { simpleLeftCreate.current = false; onSimpleCancel?.(); }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [simple, mode, anyMatrixWizardOpen, matrixKernelMissing, dupNotice, view.kind, simpleModalOpen]);
+
+  // 简洁版「我的任务」下拉:只列有任务的平台
+  const simpleTaskPlatforms = (() => {
+    if (!simple) return [] as Array<{ id: string; label: string; icon: string; n: number }>;
+    const byId = new Map((Array.isArray(scenarios) ? scenarios : []).map(s => [s.id, s]));
+    const cnt: Record<string, number> = {};
+    for (const t of (Array.isArray(tasks) ? tasks : []) as any[]) { const p = String(t.platform || byId.get(t.scenario_id)?.platform || ''); if (p && p !== 'video') cnt[p] = (cnt[p] || 0) + 1; }
+    return MATRIX_TAB_ORDER.filter((id) => cnt[id]).map((id) => { const tab = PLATFORM_TABS.find((x) => x.id === id); return { id, label: tab ? i18nService.t(tab.labelKey) : id, icon: tab?.icon || '', n: cnt[id] }; });
+  })();
+
+  // 矩阵新建卡片(原新建页的那组卡片)。抽成函数:新建页照旧渲染;「新建窗口任务」弹窗第 2 步复用同一组卡片。
+  //   内容与原来逐字相同,只是 currentPlatform / platformLabel 改由参数传入。
+  const renderMatrixCreateCards = (currentPlatform: PlatformId, platformLabel: string) => {
+    const platLabel = platformLabel;
+    const imageTextCard = MATRIX_IMAGE_TEXT_PLATFORMS.has(currentPlatform) && (
+      <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/5 dark:bg-emerald-500/10 p-6 flex flex-col">
+        <div className="flex items-center gap-2 text-xs font-semibold text-emerald-600 dark:text-emerald-400 mb-2">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {i18nService.t('svSectionImageText')}
+        </div>
+        <div className="text-xl font-bold dark:text-white mb-1">📝 {platLabel} · {i18nService.t('svCardImageTextTitle')}</div>
+        <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+          {i18nService.t('svCardImageTextDesc1')}<strong>{i18nService.t('svCardImageTextStrong')}</strong>{i18nService.t('svCardImageTextDesc2')}
+        </div>
+        <div className="mt-auto flex items-center flex-wrap pt-1">
+        <button
+          type="button"
+          onClick={() => openMatrixImageTextWizard(currentPlatform)}
+          className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-500 text-black text-sm font-bold hover:bg-emerald-600 shadow-sm shadow-emerald-500/25 transition-all active:scale-95"
+        >
+          📝 {i18nService.t('svStartCreate')}
+        </button>
+        <button
+          type="button"
+          onClick={() => onSwitchToManage?.(currentPlatform as any)}
+          className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+        >
+          {i18nService.t('svHasTasks')}
+        </button>
+        </div>
+      </div>
+    );
+    // 视频号/头条暂无 engage 剧本 → tab 在(与账号页一致),但「开始创作」改为「即将上线」不放行。
+    const engageReady = MATRIX_ENGAGE_PLATFORMS.has(currentPlatform);
+    return (
+      <div className="p-6 max-w-5xl mx-auto">
+        {/* 新建任务卡片:每行 2 个(互动涨粉 + 自动回复粉丝),与其它新建 tab 的卡片网格一致 */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-stretch">
+        {/* 互动涨粉卡:仅在该平台有 engage 剧本(MATRIX_ENGAGE_PLATFORMS)时显示。
+            视频号/头条号无 engage → 不显示这张卡(它们仍有自动回复粉丝卡,tab 不会空),
+            而不是显示一张「即将上线」占位卡。 */}
+        {engageReady && (
+        <div className="rounded-2xl border border-violet-500/30 bg-violet-500/5 dark:bg-violet-500/10 p-6 flex flex-col">
+          <div className="flex items-center gap-2 text-xs font-semibold text-violet-600 dark:text-violet-400 mb-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-violet-500" /> {i18nService.t('svSectionEngage')}
+          </div>
+          <div className="text-xl font-bold dark:text-white mb-1">🎯 {platLabel} · {i18nService.t('svCardEngageTitle')}</div>
+          <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+            {i18nService.t('svCardEngageDesc1')}<strong>{i18nService.t('svCardEngageDescStrong')}</strong>{i18nService.t('svCardEngageDesc2')}
+            {/* 抖音 / 小红书 / TikTok 精准模式支持博主主页链接(2026-10-29) */}
+            {['douyin', 'xhs', 'tiktok'].includes(String(currentPlatform)) && i18nService.t('svCardEngageDescProfile')}
+          </div>
+          <div className="mt-auto flex items-center flex-wrap pt-1">
+            <button
+              type="button"
+              onClick={() => openMatrixWizard(currentPlatform)}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-violet-500 text-white text-sm font-bold hover:bg-violet-600 shadow-sm shadow-violet-500/25 transition-all active:scale-95"
+            >
+              🎯 {i18nService.t('svStartEngage')}
+            </button>
+            <button
+              type="button"
+              onClick={() => onSwitchToManage?.(currentPlatform as any)}
+              className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+            >
+              {i18nService.t('svHasTasks')}
+            </button>
+          </div>
+        </div>
+        )}
+        {/* 定向获客 —— 采集同行评论区里的人当潜客名单 → 逐个触达点赞/评论/关注。每平台独立卡片。 */}
+        {MATRIX_LEAD_PLATFORMS.has(currentPlatform) && (
+          <div className="relative overflow-hidden rounded-2xl border border-cyan-500/30 bg-cyan-500/5 dark:bg-cyan-500/10 p-6 flex flex-col">
+            {/* 推荐丝带:定向获客是当前主推能力。斜条 rotate-45 横跨右上角,
+                靠父级的 overflow-hidden 裁成一块实心三角区域(纯展示,pointer-events-none
+                保证不挡下面任何可点元素)。原来那颗小胶囊太不显眼(用户 2026-08-23)。 */}
+            <span className="pointer-events-none absolute -right-12 top-6 w-44 rotate-45 bg-red-500 py-1.5 text-center text-[13px] font-extrabold tracking-wide text-white shadow-lg shadow-red-500/40">
+              🔥 {i18nService.currentLanguage === 'zh' ? '推荐' : 'Top pick'}
+            </span>
+            <div className="flex items-center gap-2 text-xs font-semibold text-cyan-600 dark:text-cyan-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-cyan-500" /> {i18nService.currentLanguage === 'zh' ? '精准获客' : 'Lead Finder'}
+            </div>
+            <div className="mb-1 pr-16">
+              <div className="text-xl font-bold dark:text-white">🎯 {platLabel} · {i18nService.currentLanguage === 'zh' ? '精准定向获客' : 'Lead Finder'}</div>
+            </div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.currentLanguage === 'zh'
+                ? <>AI挖掘<strong>同行作品评论区</strong>里的潜在客户,去重存成本地名单,AI辅助您去他们主页点赞 / 评论 / {LEAD_FOLLOW_WORD(currentPlatform)[0]},把人引回来看你。</>
+                : <>AI surfaces potential customers from <strong>competitors' comment sections</strong>, dedupes them into a local roster, then assists you to like / comment / {LEAD_FOLLOW_WORD(currentPlatform)[1]} each to bring them back to you.</>}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+              <button
+                type="button"
+                onClick={() => openMatrixLeadWizard(currentPlatform)}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-cyan-500 text-white text-sm font-bold hover:bg-cyan-600 shadow-sm shadow-cyan-500/25 transition-all active:scale-95"
+              >
+                🎯 {i18nService.currentLanguage === 'zh' ? '开始获客' : 'Start'}
+              </button>
+              <button
+                type="button"
+                onClick={() => onSwitchToManage?.(currentPlatform as any)}
+                className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+              >
+                {i18nService.t('svHasTasks')}
+              </button>
+            </div>
+          </div>
+        )}
+        {/* 文件夹定时发布(目前仅抖音)—— 每个号 3 个时段文件夹,到点按顺序取素材 + 文案 + 话题发出去。 */}
+        {matrixMode && !FOLDER_POST_CARD_HIDDEN && MATRIX_FOLDER_POST_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-teal-500/30 bg-teal-500/5 dark:bg-teal-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-teal-600 dark:text-teal-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-teal-500" /> {i18nService.currentLanguage === 'zh' ? '定时发布' : i18nService.currentLanguage === 'zh-TW' ? '定時發布' : 'Scheduled posts'}
+              <span className="ml-auto text-[11px] font-bold px-2 py-0.5 rounded-full bg-amber-500 text-white">{i18nService.currentLanguage === 'zh' ? '👑 会员免费' : i18nService.currentLanguage === 'zh-TW' ? '👑 會員免費' : '👑 Free for members'}</span>
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">📅 {platLabel} · {i18nService.currentLanguage === 'zh' ? '文件夹定时发布' : i18nService.currentLanguage === 'zh-TW' ? '資料夾定時發布' : 'Folder Scheduled Posts'}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.currentLanguage === 'zh'
+                ? <>把准备好的视频 / 图片、文案、话题按顺序放进每个号的时段文件夹,<strong>到点自动按顺序发</strong>,一天最多 3 个时段。</>
+                : i18nService.currentLanguage === 'zh-TW'
+                  ? <>把準備好的影片 / 圖片、文案、話題按順序放進每個帳號的時段資料夾,<strong>到點自動按順序發</strong>,一天最多 3 個時段。</>
+                  : <>Drop your videos / images, captions and topics into each account's slot folders — <strong>posted in order at the times you set</strong>, up to 3 a day.</>}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+              <button
+                type="button"
+                onClick={() => openMatrixFolderWizard(currentPlatform)}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-teal-500 text-white text-sm font-bold hover:bg-teal-600 shadow-sm shadow-teal-500/25 transition-all active:scale-95"
+              >
+                📅 {i18nService.currentLanguage === 'zh' ? '设置定时发布' : i18nService.currentLanguage === 'zh-TW' ? '設定定時發布' : 'Set up'}
+              </button>
+              <button
+                type="button"
+                onClick={() => onSwitchToManage?.(currentPlatform as any)}
+                className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+              >
+                {i18nService.t('svHasTasks')}
+              </button>
+            </div>
+          </div>
+        )}
+        {/* 图文创作(矩阵多账号)—— 抖音:N 个号各自按身份+随机文风生成图文,配图+发到各自创作者中心。
+            2026-10-29 用户:抖音上跟「批量拉黑」换位置(放在原来拉黑的位置);其它平台位置不变。 */}
+        {currentPlatform === 'douyin' && imageTextCard}
+        {/* 评论区点赞评论(目前仅 TikTok)—— 粘贴作品链接,多账号逐条翻评论区给每位留言者点赞。 */}
+        {!simple && matrixMode && MATRIX_COMMENT_LIKE_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-pink-500/30 bg-pink-500/5 dark:bg-pink-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-pink-600 dark:text-pink-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-pink-500" /> {i18nService.currentLanguage === 'zh' ? '评论区互动' : i18nService.currentLanguage === 'zh-TW' ? '留言區互動' : 'Comment engagement'}
+              {/* 2026-10-29 用户:先去掉「会员点赞免费」角标(加了 AI 回复,回复照常扣积分) */}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">💗 {platLabel} · {i18nService.currentLanguage === 'zh' ? '评论区点赞评论' : i18nService.currentLanguage === 'zh-TW' ? '留言區按讚留言' : 'Comment Like & Reply'}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.currentLanguage === 'zh'
+                ? <>可按作品链接或关键词进行评论区点赞、AI 回复，也可<strong>导入表格发布自定义评论</strong>。</>
+                : i18nService.currentLanguage === 'zh-TW'
+                  ? <>可依作品連結或關鍵詞進行留言區按讚、AI 回覆，也可<strong>匯入表格發佈自訂留言</strong>。</>
+                  : <>Like or AI-reply to comments on linked or keyword-matched posts, or <strong>import a workbook to post your own comments</strong>.</>}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+              <button
+                type="button"
+                onClick={() => openMatrixCommentLikeWizard(currentPlatform)}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-pink-500 text-white text-sm font-bold hover:bg-pink-600 shadow-sm shadow-pink-500/25 transition-all active:scale-95"
+              >
+                💗 {i18nService.currentLanguage === 'zh' ? '开始互动' : i18nService.currentLanguage === 'zh-TW' ? '開始互動' : 'Start'}
+              </button>
+              <button
+                type="button"
+                onClick={() => onSwitchToManage?.(currentPlatform as any)}
+                className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+              >
+                {i18nService.t('svHasTasks')}
+              </button>
+            </div>
+          </div>
+        )}
+        {/* 自动回复粉丝(矩阵多账号)—— 小红书/快手/哔哩哔哩:在创作者中心评论管理里逐条回复自己作品下的粉丝评论。 */}
+        {MATRIX_REPLY_FAN_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-fuchsia-500/30 bg-fuchsia-500/5 dark:bg-fuchsia-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-fuchsia-600 dark:text-fuchsia-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-fuchsia-500" /> {i18nService.t('svSectionReply')}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">💌 {platLabel} · {i18nService.t('svCardReplyTitle')}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.t('svCardReplyDesc1')}<strong>{i18nService.t('svCardReplyDescStrong')}</strong>{i18nService.t('svCardReplyDesc2')}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+            <button
+              type="button"
+              onClick={() => openMatrixReplyWizard(currentPlatform)}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-fuchsia-500 text-white text-sm font-bold hover:bg-fuchsia-600 shadow-sm shadow-fuchsia-500/25 transition-all active:scale-95"
+            >
+              💌 {i18nService.t('svStartReply')}
+            </button>
+            <button
+              type="button"
+              onClick={() => onSwitchToManage?.(currentPlatform as any)}
+              className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+            >
+              {i18nService.t('svHasTasks')}
+            </button>
+            </div>
+          </div>
+        )}
+        {/* 爆款批量仿写(矩阵多账号)—— 小红书:每号关键词搜本niche爆款→仿写→AI生图→发布。 */}
+        {!simple && MATRIX_VIRAL_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-rose-500/30 bg-rose-500/5 dark:bg-rose-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-rose-600 dark:text-rose-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> {i18nService.t('svSectionViral')}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">🔥 {platLabel} · {i18nService.t('svCardViralTitle')}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.t('svCardViralDesc1')}<strong>{i18nService.t('svCardViralDescStrong1')}</strong>{i18nService.t('svCardViralDesc2')}<strong>{i18nService.t('svCardViralDescStrong2')}</strong>{i18nService.t('svCardViralDesc3')}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+            <button
+              type="button"
+              onClick={() => openMatrixViralWizard(currentPlatform)}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-rose-500 text-white text-sm font-bold hover:bg-rose-600 shadow-sm shadow-rose-500/25 transition-all active:scale-95"
+            >
+              🔥 {i18nService.t('svStartViral')}
+            </button>
+            <button
+              type="button"
+              onClick={() => onSwitchToManage?.(currentPlatform as any)}
+              className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+            >
+              {i18nService.t('svHasTasks')}
+            </button>
+            </div>
+          </div>
+        )}
+        {currentPlatform !== 'douyin' && imageTextCard}
+        {/* 批量拉黑(目前仅抖音)—— 名单 / 关键词,多账号逐个拉黑。2026-10-29 用户:改收费(每拉黑 1 人 500~1000 积分),卡片挪到图文创作的位置。 */}
+        {!simple && matrixMode && MATRIX_BLOCK_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-red-500/30 bg-red-500/5 dark:bg-red-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-red-600 dark:text-red-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-500" /> {i18nService.currentLanguage === 'zh' ? '账号工具' : i18nService.currentLanguage === 'zh-TW' ? '帳號工具' : 'Account tools'}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">🚫 {platLabel} · {i18nService.currentLanguage === 'zh' ? '批量拉黑' : i18nService.currentLanguage === 'zh-TW' ? '批量封鎖' : 'Batch Block'}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.currentLanguage === 'zh'
+                ? <>精准模式给每个账号粘竞争对手名单;关键词模式用账号自己的关键词,把搜出来的同行作者<strong>逐个拉黑</strong>(跳过已关注的人)。</>
+                : i18nService.currentLanguage === 'zh-TW'
+                  ? <>精準模式給每個帳號貼競爭對手名單;關鍵詞模式用帳號自己的關鍵詞,把搜出來的同行作者<strong>逐個封鎖</strong>(跳過已關注的人)。</>
+                  : <>Targeted mode: paste a list per account. Keyword mode: use each account's own keywords to <strong>block the matching creators</strong> one by one (accounts you follow are skipped).</>}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+              <button
+                type="button"
+                onClick={() => openMatrixBlockWizard(currentPlatform)}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-red-500 text-white text-sm font-bold hover:bg-red-600 shadow-sm shadow-red-500/25 transition-all active:scale-95"
+              >
+                🚫 {i18nService.currentLanguage === 'zh' ? '开始拉黑' : i18nService.currentLanguage === 'zh-TW' ? '開始封鎖' : 'Start'}
+              </button>
+              <button
+                type="button"
+                onClick={() => onSwitchToManage?.(currentPlatform as any)}
+                className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+              >
+                {i18nService.t('svHasTasks')}
+              </button>
+            </div>
+          </div>
+        )}
+        {/* 自动发推(矩阵多账号)—— 推特:N 个号各自按身份 AI 原创一条推 + 可选配图 → 发到各自时间线。 */}
+        {MATRIX_TWEET_POST_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-sky-500/30 bg-sky-500/5 dark:bg-sky-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-sky-600 dark:text-sky-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-sky-500" /> {i18nService.t('svSectionTweet')}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">🐦 {platLabel} · {i18nService.t('svCardTweetTitle')}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.t('svCardTweetDesc1')}<strong>{i18nService.t('svUniqueEach')}</strong>{i18nService.t('svCardTweetDesc2')}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+            <button
+              type="button"
+              onClick={() => openMatrixTweetWizard(currentPlatform)}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-sky-500 text-white text-sm font-bold hover:bg-sky-600 shadow-sm shadow-sky-500/25 transition-all active:scale-95"
+            >
+              🐦 {i18nService.t('svStartTweet')}
+            </button>
+            <button
+              type="button"
+              onClick={() => onSwitchToManage?.(currentPlatform as any)}
+              className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+            >
+              {i18nService.t('svHasTasks')}
+            </button>
+            </div>
+          </div>
+        )}
+        {/* 币安广场自动发帖(矩阵多账号)—— 币安:N 个号各自抓 web3 资讯 AI 原创一条币安广场图文 + 可选配图 → 发币安广场。 */}
+        {MATRIX_BINANCE_POST_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/5 dark:bg-amber-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-amber-600 dark:text-amber-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-500" /> {i18nService.t('svSectionBinancePost')}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">📊 {platLabel} · {i18nService.t('svCardBinancePostTitle')}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.t('svCardBinancePostDesc1')}<strong>{i18nService.t('svUniqueEach')}</strong>{i18nService.t('svCardBinancePostDesc2')}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+            <button
+              type="button"
+              onClick={() => openMatrixBinanceWizard(currentPlatform)}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-amber-500 text-white text-sm font-bold hover:bg-amber-600 shadow-sm shadow-amber-500/25 transition-all active:scale-95"
+            >
+              📊 {i18nService.t('svStartBinancePost')}
+            </button>
+            <button
+              type="button"
+              onClick={() => onSwitchToManage?.(currentPlatform as any)}
+              className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+            >
+              {i18nService.t('svHasTasks')}
+            </button>
+            </div>
+          </div>
+        )}
+        {/* Facebook 自动发帖(矩阵多账号)—— N 个号各自按人设从所选数据源(web3/科技/各热榜)取材 AI 原创一条帖 + 可选配图 → 发 FB。 */}
+        {/* 交易所广场三家(Gate / Bitget / Bybit)的自动发帖。与币安广场那张卡【分开渲染】:
+            虽然共用同一套向导和 runner,但卡片文案必须只出现当前平台自己的名字
+            (platLabel 动态取,描述文案 svCardExchangePostDesc2 里不含任何平台名)。 */}
+        {MATRIX_EXCHANGE_POST_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-cyan-500/30 bg-cyan-500/5 dark:bg-cyan-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-cyan-600 dark:text-cyan-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-cyan-500" /> {i18nService.t('svSectionBinancePost')}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">📊 {platLabel} · {i18nService.t('svCardBinancePostTitle')}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.t('svCardBinancePostDesc1')}<strong>{i18nService.t('svUniqueEach')}</strong>{i18nService.t('svCardExchangePostDesc2')}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+            <button
+              type="button"
+              onClick={() => openMatrixBinanceWizard(currentPlatform)}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-cyan-500 text-white text-sm font-bold hover:bg-cyan-600 shadow-sm shadow-cyan-500/25 transition-all active:scale-95"
+            >
+              📊 {i18nService.t('svStartBinancePost')}
+            </button>
+            <button
+              type="button"
+              onClick={() => onSwitchToManage?.(currentPlatform as any)}
+              className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+            >
+              {i18nService.t('svHasTasks')}
+            </button>
+            </div>
+          </div>
+        )}
+        {MATRIX_FB_POST_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-blue-500/30 bg-blue-500/5 dark:bg-blue-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-blue-600 dark:text-blue-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-500" /> {i18nService.currentLanguage === 'zh' ? 'Facebook 发帖' : 'Facebook Post'}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">👥 {platLabel} · {i18nService.currentLanguage === 'zh' ? '自动发帖' : 'Auto Post'}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.currentLanguage === 'zh'
+                ? <>N 个号各自按人设,从你选的数据源(Web3 / 科技 / 微博·抖音等热榜)取材,AI 原创一条 Facebook 图文,<strong>每号内容互不相同</strong>,可选配图 → 发到各自 Facebook(须挂 VPN)。</>
+                : <>Each account posts one AI-original Facebook post from your chosen data source (Web3 / tech / trending boards), <strong>all different</strong>, optional image (VPN required).</>}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+            <button
+              type="button"
+              onClick={() => openMatrixFacebookWizard(currentPlatform)}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-blue-500 text-white text-sm font-bold hover:bg-blue-600 shadow-sm shadow-blue-500/25 transition-all active:scale-95"
+            >
+              👥 {i18nService.currentLanguage === 'zh' ? '开始发帖' : 'Start Posting'}
+            </button>
+            <button
+              type="button"
+              onClick={() => onSwitchToManage?.(currentPlatform as any)}
+              className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+            >
+              {i18nService.t('svHasTasks')}
+            </button>
+            </div>
+          </div>
+        )}
+        {/* Reddit 自动发帖(矩阵多账号)—— N 个号各自按人设从所选数据源取材 AI 原创一条帖 → API 发到指定 subreddit。 */}
+        {MATRIX_REDDIT_POST_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-orange-500/30 bg-orange-500/5 dark:bg-orange-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-orange-600 dark:text-orange-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-orange-500" /> {i18nService.currentLanguage === 'zh' ? 'Reddit 发帖' : 'Reddit Post'}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">🟠 {platLabel} · {i18nService.currentLanguage === 'zh' ? '自动发帖' : 'Auto Post'}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.currentLanguage === 'zh'
+                ? <>N 个号各自按人设,从你选的数据源取材,AI 原创一条帖(标题+正文),<strong>每号内容互不相同</strong> → 发到你指定的 subreddit(须挂 VPN)。</>
+                : <>Each account posts one AI-original post (title + body) from your chosen data source, <strong>all different</strong>, to your target subreddit (VPN required).</>}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+            <button
+              type="button"
+              onClick={() => openMatrixRedditWizard(currentPlatform)}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-orange-500 text-white text-sm font-bold hover:bg-orange-600 shadow-sm shadow-orange-500/25 transition-all active:scale-95"
+            >
+              🟠 {i18nService.currentLanguage === 'zh' ? '开始发帖' : 'Start Posting'}
+            </button>
+            <button
+              type="button"
+              onClick={() => onSwitchToManage?.(currentPlatform as any)}
+              className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+            >
+              {i18nService.t('svHasTasks')}
+            </button>
+            </div>
+          </div>
+        )}
+        {/* Instagram 自动发帖(矩阵多账号)—— N 个号各自按人设从所选数据源取材 AI 原创一条图文 + 配图 → 走「新建帖子」发到各自 IG(图必带)。 */}
+        {MATRIX_IG_POST_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-pink-500/30 bg-pink-500/5 dark:bg-pink-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-pink-600 dark:text-pink-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-pink-500" /> {i18nService.currentLanguage === 'zh' ? 'Instagram 发帖' : 'Instagram Post'}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">📷 {platLabel} · {i18nService.currentLanguage === 'zh' ? '自动发帖' : 'Auto Post'}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.currentLanguage === 'zh'
+                ? <>N 个号各自按人设,从你选的数据源(Web3 / 科技 / 微博·抖音等热榜)取材,AI 原创一条 Instagram 图文,<strong>每号内容互不相同</strong>,恒配图 → 发到各自 Instagram(须挂 VPN)。</>
+                : <>Each account posts one AI-original Instagram post from your chosen data source (Web3 / tech / trending boards), <strong>all different</strong>, always with an image (VPN required).</>}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+            <button
+              type="button"
+              onClick={() => openMatrixInstagramWizard(currentPlatform)}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-pink-500 text-white text-sm font-bold hover:bg-pink-600 shadow-sm shadow-pink-500/25 transition-all active:scale-95"
+            >
+              📷 {i18nService.currentLanguage === 'zh' ? '开始发帖' : 'Start Posting'}
+            </button>
+            <button
+              type="button"
+              onClick={() => onSwitchToManage?.(currentPlatform as any)}
+              className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+            >
+              {i18nService.t('svHasTasks')}
+            </button>
+            </div>
+          </div>
+        )}
+        {/* 币安广场批量搬运(矩阵多账号)—— 币安:1 个源平台采集号搜+下素材 → N 个币安号各领一条 AI 仿写 + 配源图 → 发币安广场。 */}
+        {/* 交易所广场四家的批量搬运。与币安那张卡分开:描述文案用 svCardExchangeRepostDesc1
+            (不含平台名),平台名只由 platLabel 动态给出。 */}
+        {!simple && MATRIX_EXCHANGE_REPOST_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-cyan-500/30 bg-cyan-500/5 dark:bg-cyan-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-cyan-600 dark:text-cyan-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-cyan-500" /> {i18nService.t('svSectionRepost')}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">♻️ {platLabel} · {i18nService.t('svCardRepostTitle')}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.t('svCardExchangeRepostDesc1')}<strong>{i18nService.t('svCardRepostDescStrong')}</strong>{i18nService.t('svCardRepostDesc2')}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+              <button type="button" onClick={() => openMatrixRepostWizard(currentPlatform)} className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-cyan-500 text-white text-sm font-bold hover:bg-cyan-600 shadow-sm shadow-cyan-500/25 transition-all active:scale-95">♻️ {i18nService.t('svStartRepost')}</button>
+              <button type="button" onClick={() => onSwitchToManage?.(currentPlatform as any)} className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white">{i18nService.t('svHasTasks')}</button>
+            </div>
+          </div>
+        )}
+        {!simple && MATRIX_BINANCE_REPOST_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/5 dark:bg-amber-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-amber-600 dark:text-amber-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-500" /> {i18nService.t('svSectionRepost')}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">♻️ {platLabel} · {i18nService.t('svCardRepostTitle')}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.t('svCardRepostDesc1')}<strong>{i18nService.t('svCardRepostDescStrong')}</strong>{i18nService.t('svCardRepostDesc2')}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+              <button type="button" onClick={() => openMatrixRepostWizard(currentPlatform)} className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-amber-500 text-white text-sm font-bold hover:bg-amber-600 shadow-sm shadow-amber-500/25 transition-all active:scale-95">♻️ {i18nService.t('svStartRepost')}</button>
+              <button type="button" onClick={() => onSwitchToManage?.(currentPlatform as any)} className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white">{i18nService.t('svHasTasks')}</button>
+            </div>
+          </div>
+        )}
+        {/* 视频无水印下载(单账号工具)—— 仅抖音:选 1 个号 + 粘贴链接逐个下载。 */}
+        {currentPlatform === 'youtube' && (
+          <div className="rounded-2xl border border-sky-500/30 bg-sky-500/5 dark:bg-sky-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-sky-600 dark:text-sky-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-sky-500" /> {i18nService.t('svSectionDownload')}
+              <span className="ml-auto text-[11px] font-bold px-2 py-0.5 rounded-full bg-emerald-500 text-black">🆓 {i18nService.currentLanguage === 'zh' ? '免费' : i18nService.currentLanguage === 'zh-TW' ? '免費' : 'Free'}</span>
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">⬇️ {i18nService.t('ytdlTaskName')}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">{i18nService.t('ytdlCardDesc')}</div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+              <button type="button" onClick={() => openMatrixDownloadWizard('youtube')}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-sky-500 text-white text-sm font-bold hover:bg-sky-600 shadow-sm shadow-sky-500/25 transition-colors">
+                ⬇️ {i18nService.t('svStartDownload')}
+              </button>
+              <button type="button" onClick={() => onSwitchToManage?.(currentPlatform as any)}
+                className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white">
+                {i18nService.t('svHasTasks')}
+              </button>
+            </div>
+          </div>
+        )}
+        {MATRIX_VIDEO_DOWNLOAD_PLATFORMS.has(currentPlatform) && (
+          <div className="rounded-2xl border border-sky-500/30 bg-sky-500/5 dark:bg-sky-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-sky-600 dark:text-sky-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-sky-500" /> {i18nService.t('svSectionDownload')}
+              <span className="ml-auto text-[11px] font-bold px-2 py-0.5 rounded-full bg-emerald-500 text-black">🆓 {i18nService.currentLanguage === 'zh' ? '免费' : i18nService.currentLanguage === 'zh-TW' ? '免費' : 'Free'}</span>
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">⬇️ {platLabel} · {i18nService.t('svCardDownloadTitle')}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.t('svCardDownloadDesc1')}<strong>{i18nService.t('svCardDownloadDescStrong')}</strong>{i18nService.t('svCardDownloadDesc2')}{currentPlatform === 'tiktok' ? i18nService.t('svCardDownloadTiktokVpn') : ''}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+            <button
+              type="button"
+              onClick={() => openMatrixDownloadWizard(currentPlatform)}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-sky-500 text-white text-sm font-bold hover:bg-sky-600 shadow-sm shadow-sky-500/25 transition-all active:scale-95"
+            >
+              ⬇️ {i18nService.t('svStartDownload')}
+            </button>
+            <button
+              type="button"
+              onClick={() => onSwitchToManage?.(currentPlatform as any)}
+              className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+            >
+              {i18nService.t('svHasTasks')}
+            </button>
+            </div>
+          </div>
+        )}
+        {/* 抖音Report(白名单功能)—— 仅白名单 UID 可见;可多账号、1-4 条、手动触发。 */}
+        {!simple && matrixMode && reportEnabled && !!MATRIX_REPORT_SCENARIO_ID[currentPlatform] && (
+          <div className="rounded-2xl border border-sky-500/30 bg-sky-500/5 dark:bg-sky-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-sky-600 dark:text-sky-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-sky-500" /> {i18nService.t('svSectionReport')}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">📋 {i18nService.t('svCardReportTitle')}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">{i18nService.t('svCardReportDesc')}</div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+              <button type="button" onClick={() => openMatrixReportWizard(currentPlatform)}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-sky-500 text-white text-sm font-bold hover:bg-sky-600 shadow-sm shadow-sky-500/25 transition-all active:scale-95">
+                📋 {i18nService.t('svStartReport')}
+              </button>
+              <button type="button" onClick={() => onSwitchToManage?.(currentPlatform as any)}
+                className="ml-3 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white">
+                {i18nService.t('svHasTasks')}
+              </button>
+            </div>
+          </div>
+        )}
+        {/* 敏感词检查(小红书工具,账号无关)—— 跟旧版一样,粘文案查违禁词/广告法/引流/限流风险,不选账号。 */}
+        {currentPlatform === 'xhs' && (
+          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/5 dark:bg-amber-500/10 p-6 flex flex-col">
+            <div className="flex items-center gap-2 text-xs font-semibold text-amber-600 dark:text-amber-400 mb-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-500" /> {i18nService.t('svSectionSensitive')}
+            </div>
+            <div className="text-xl font-bold dark:text-white mb-1">🛡️ {i18nService.t('svCardSensitiveTitle')}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
+              {i18nService.t('svCardSensitiveDesc1')}<strong>{i18nService.t('svCardSensitiveDescStrong')}</strong>{i18nService.t('svCardSensitiveDesc2')}
+            </div>
+            <div className="mt-auto flex items-center flex-wrap pt-1">
+            <button
+              type="button"
+              onClick={() => openSensitiveCheck()}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-amber-500 text-white text-sm font-bold hover:bg-amber-600 shadow-sm shadow-amber-500/25 transition-all active:scale-95"
+            >
+              🛡️ {i18nService.t('svStartSensitive')}
+            </button>
+            </div>
+          </div>
+        )}
+        </div>
+        {/* 优势标签(对齐旧版各平台 WorkflowsPage 底部):矩阵涨粉通用卖点。 */}
+        <div className="mt-6 flex flex-wrap gap-2 justify-center">
+          {[['🛡️', i18nService.t('svBannerNoBan')], ['🚀', i18nService.t('svBannerFastGrow')], ['💰', i18nService.t('svBannerLowCost')], ['🤖', i18nService.t('svBannerSmart')]].map(([icon, t]) => (
+            <span key={t} className="inline-flex items-center gap-1 text-[11px] px-3 py-1.5 rounded-full border border-violet-500/20 bg-violet-500/5 text-gray-700 dark:text-gray-300">{icon} {t}</span>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const platformTabContent = (() => {
+    if (view.kind === 'sensitive_check') {
+      return <SensitiveCheckPage onBack={goBack} />;
+    }
+    if (view.kind === 'record_detail') {
+      return (
+        <RunRecordDetailPage
+          recordId={view.record_id}
+          onBack={goBack}
+          onOpenTask={openTask}
+        />
+      );
+    }
+    if (view.kind === 'task_detail') {
+      const task = tasks.find(t => t.id === view.task_id);
+      if (!task) {
+        // Empty state for "task was deleted" — common path now that the
+        // History page deep-links by task id (the underlying task may
+        // have been deleted since the run finished). Pre-2.4.27 we just
+        // showed "暂无任务。从下面选一个场景开始。" which had no buttons,
+        // so the user was stuck and had to click L1 nav manually. Now
+        // we offer one-click jumps to the create page for either platform.
+        // 余额门槛 + create/manage 分流统一走 goCreatePlatform。
+        const goCreate = (platform: PlatformId) => goCreatePlatform(platform);
+        return (
+          <div className="p-10 max-w-xl mx-auto">
+            <div className="rounded-2xl border border-dashed border-gray-300 dark:border-gray-700 p-10 text-center">
+              <div className="text-5xl mb-3">🗑️</div>
+              <div className="text-base font-medium text-gray-700 dark:text-gray-200 mb-1">
+                {i18nService.t('svTaskDeleted')}
+              </div>
+              <div className="text-sm text-gray-500 dark:text-gray-400 mb-6">
+                {i18nService.t('svTaskDeletedHint')}
+              </div>
+              <div className="flex flex-col sm:flex-row gap-3 justify-center">
+                <button
+                  type="button"
+                  onClick={() => goCreate('xhs')}
+                  className="inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-green-500 text-black text-sm font-semibold hover:bg-green-600 shadow-sm shadow-green-500/25 transition-all active:scale-95"
+                >
+                  📕 {i18nService.t('svNewXhsTask')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => goCreate('x')}
+                  className="inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-sky-500 text-white text-sm font-semibold hover:bg-sky-600 shadow-sm shadow-sky-500/25 transition-all active:scale-95"
+                >
+                  🐦 {i18nService.t('svNewTwitterTask')}
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={goBack}
+                className="mt-5 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+              >
+                ← {i18nService.t('svBack')}
+              </button>
+            </div>
+          </div>
+        );
+      }
+      const scenario = scenarios.find(s => s.id === task.scenario_id);
+      return (
+        <TaskDetailPage
+          task={task}
+          scenario={scenario || null}
+          onBack={goBack}
+          /* 矩阵号:编辑打开账号多选向导(回填该任务的账号/配额/频率),不开原版 ConfigWizard */
+          onEdit={() => { if (matrixMode) { if (/_report$/.test(String(task.scenario_id || ''))) { void openMatrixReportWizardEdit(task); } else if (/_video_download$/.test(String(task.scenario_id || ''))) { void openMatrixDownloadWizardEdit(task); } else if (/_image_text$/.test(String(task.scenario_id || ''))) { void openMatrixImageTextWizardEdit(task); } else if (/_viral_production_career$/.test(String(task.scenario_id || ''))) { void openMatrixViralWizardEdit(task); } else if (String(task.scenario_id || '') === 'x_post') { void openMatrixTweetWizardEdit(task); } else if (isSquarePostScenario(String(task.scenario_id || ''))) { void openMatrixBinanceWizardEdit(task); } else if (String(task.scenario_id || '') === 'facebook_post') { void openMatrixFacebookWizardEdit(task); } else if (String(task.scenario_id || '') === 'reddit_post') { void openMatrixRedditWizardEdit(task); } else if (String(task.scenario_id || '') === 'instagram_post') { void openMatrixInstagramWizardEdit(task); } else if (isSquareRepostScenario(String(task.scenario_id || ''))) { void openMatrixRepostWizardEdit(task); } else if (/_reply_fans_comment$/.test(String(task.scenario_id || ''))) { void openMatrixReplyWizardEdit(task); } else if (/_lead_engage$/.test(String(task.scenario_id || ''))) { void openMatrixLeadWizardEdit(task); } else if (/_comment_like$/.test(String(task.scenario_id || ''))) { void openMatrixCommentLikeWizardEdit(task); } else if (/_block$/.test(String(task.scenario_id || ''))) { void openMatrixBlockWizardEdit(task); } else if (/_folder_post$/.test(String(task.scenario_id || ''))) { void openMatrixFolderWizardEdit(task); } else { void openMatrixWizardEdit(task); } return; } if (scenario) openWizardEdit(task, scenario); }}
+          onChanged={refreshAll}
+          onOpenHistory={() => openHistoryForTask(task.id)}
+        />
+      );
+    }
+
+    // 简洁版 create:页面本身只放一个「创建任务」按钮(选平台 / 任务都在弹窗里;关掉向导回到这里可再开)
+    if (simple && mode === 'create' && view.kind === 'main') {
+      return (
+        <div className="h-full min-h-[50vh] flex items-center justify-center">
+          <button type="button" onClick={() => setSimpleModalOpen(true)}
+            className="inline-flex items-center gap-2 px-10 py-4 rounded-2xl text-lg font-bold bg-claude-accent hover:bg-claude-accentHover text-[#04130B] transition-colors">
+            ＋ {SL('创建任务', '建立任務', 'Create a task')}
+          </button>
+        </div>
+      );
+    }
+    // 简洁版「我的任务」:全部平台放一起 + 下拉筛选(视频创作是另一套本地任务体系,不混排)
+    if (simple && mode === 'manage' && view.kind === 'main' && currentSection === 'tasks') {
+      const byId = new Map((Array.isArray(scenarios) ? scenarios : []).map(s => [s.id, s]));
+      const platOf = (t: any) => String(t.platform || byId.get(t.scenario_id)?.platform || '');
+      const all = (Array.isArray(tasks) ? tasks : []).filter((t) => platOf(t) !== 'video');
+      const shown = simpleFilter === 'all' || simpleFilter === 'running' ? all : all.filter((t) => platOf(t) === simpleFilter);
+      return (
+        <MyTasksPage
+          tasks={shown}
+          scenarios={scenarios}
+          loading={loading}
+          platformLabel=""
+          platformId="xhs"
+          onOpenTask={openTask}
+          onRefresh={refreshAll}
+          onGoCreate={() => { onSwitchToCreate?.(); }}
+          runningOnly={simpleFilter === 'running'}
+        />
+      );
+    }
+
+    // 「只看运行中」聚合视图:无视当前平台 tab,把全部矩阵任务交给 MyTasksPage,
+    // 由它按自己轮询到的 runningTaskIds 过滤出运行中的卡片(运行态在它手里,别搬出来)。
+    // 视频创作任务体系独立(videoTaskStore + 专属卡片),不混排 —— 有运行中的就在列表顶部
+    // 给一条横幅入口跳视频 tab。
+    // 专业版「全部平台」:所有平台的任务 / 运行记录放一个列表(视频创作是另一套本地任务,不混排)
+    if (proListView && proPlat === 'all') {
+      if (mode === 'runs') {
+        return (
+          <RunHistoryPage
+            tasks={Array.isArray(tasks) ? tasks : []}
+            scenarios={scenarios}
+            platformId=""
+            platformLabel=""
+            onOpenRecord={openRecord}
+            statusFilter={pf.st as any}
+            query={pf.q}
+            hideHeader
+          />
+        );
+      }
+      const byIdAll = new Map((Array.isArray(scenarios) ? scenarios : []).map(s => [s.id, s]));
+      const allTasks = (Array.isArray(tasks) ? tasks : []).filter((t) => String((t as any).platform || byIdAll.get(t.scenario_id)?.platform || '') !== 'video');
+      return (
+        <MyTasksPage
+          tasks={allTasks}
+          scenarios={scenarios}
+          loading={loading}
+          platformLabel=""
+          platformId="xhs"
+          onOpenTask={openTask}
+          onRefresh={refreshAll}
+          onGoCreate={() => openNewTaskModal()}
+          statusFilter={pf.st as any}
+          query={pf.q}
+          hideHeader
+        />
+      );
+    }
+
+    if (runningOnlyActive) {
+      return (
+        <MyTasksPage
+          tasks={Array.isArray(tasks) ? tasks : []}
+          scenarios={scenarios}
+          loading={loading}
+          platformLabel=""
+          platformId="xhs"
+          onOpenTask={openTask}
+          onRefresh={refreshAll}
+          runningOnly
+          videoRunningCount={videoRunningCount}
+          onGoVideoTasks={() => { setShowRunningOnly(false); setPlatform('video'); }}
+        />
+      );
+    }
+
+    // 多平台视频创作 —— 本地合成工具,不走 scenario 任务体系,但交互跟其他 tab
+    // 对齐:section='create' 走创建向导,否则(tasks)走落地页(占位框 + 卡片)。
+    // 返回 / 新建由 ScenarioView 顶部头部统一处理(见下方 header 区块)。
+    if (currentPlatform === 'video') {
+      return (
+        <VideoWorkflowsPage
+          matrixMode={matrixMode}
+          section={currentSection === 'create' ? 'create' : currentSection === 'history' ? 'history' : 'tasks'}
+          onGoCreate={goVideoCreate}
+          onBack={() => setView({ kind: 'main', section: 'tasks', platform: 'video' })}
+          /* create 模式(「新建涨粉任务」菜单)点「已有任务」→ 跳「我的涨粉任务」管理页并定位
+             视频 tab(切顶层 mainView,侧栏高亮 + 标题都对);manage/runs 模式不传 → 回退用 onBack
+             内部切到 tasks。 */
+          onGoTasks={mode === 'create' && onSwitchToManage ? () => onSwitchToManage('video') : undefined}
+          onDetailChange={setVideoInDetail}
+          onRefresh={refreshAll}
+        />
+      );
+    }
+
+    // Section + platform branching. Each L1 section has a per-platform
+    // view; the user picked the platform via the L2 sub-tabs above.
+    // Platform display label — locale-aware so the My Tasks / History
+    // page headers don't show Chinese names in EN mode.
+    const isZh = i18nService.currentLanguage === 'zh';
+    const platformLabel = currentPlatform === 'xhs' ? (isZh ? '小红书' : 'Xiaohongshu')
+      : currentPlatform === 'x' ? (isZh ? '推特' : 'Twitter')
+      : currentPlatform === 'binance' ? (isZh ? '币安广场' : 'Binance Square')
+      : currentPlatform === 'tiktok' ? 'TikTok'
+      : currentPlatform === 'youtube' ? 'YouTube'
+      : currentPlatform === 'douyin' ? (isZh ? '抖音' : 'Douyin')
+      : currentPlatform === 'shipinhao' ? (isZh ? '视频号' : 'WeChat Channels')
+      : currentPlatform === 'toutiao' ? (isZh ? '头条号' : 'Toutiao')
+      : currentPlatform === 'kuaishou' ? (isZh ? '快手' : 'Kuaishou')
+      : currentPlatform === 'bilibili' ? (isZh ? '哔哩哔哩' : 'Bilibili')
+      : currentPlatform === 'facebook' ? 'Facebook'
+      : currentPlatform === 'reddit' ? 'Reddit'
+      : currentPlatform === 'instagram' ? 'Instagram'
+      : currentPlatform;
+
+    if (currentSection === 'tasks') {
+      return (
+        <MyTasksPage
+          tasks={tasksForPlatform}
+          scenarios={scenarios}
+          loading={loading}
+          platformLabel={platformLabel}
+          platformId={currentPlatform === 'x' ? 'x' : currentPlatform === 'binance' ? 'binance' : 'xhs'}
+          onOpenTask={openTask}
+          onRefresh={refreshAll}
+          onGoCreate={() => (proListView ? openNewTaskModal(currentPlatform) : goCreatePlatform(currentPlatform))}
+          statusFilter={proListView ? (pf.st as any) : undefined}
+          query={proListView ? pf.q : undefined}
+          hideHeader={proListView}
+        />
+      );
+    }
+
+    if (currentSection === 'history') {
+      const filterTaskId = view.kind === 'main' ? view.filterTaskId || null : null;
+      return (
+        <RunHistoryPage
+          tasks={tasksForPlatform}
+          scenarios={scenarios}
+          platformId={currentPlatform}
+          platformLabel={platformLabel}
+          onOpenRecord={openRecord}
+          filterByTaskId={filterTaskId}
+          onClearFilter={() => setView({ kind: 'main', section: 'history', platform: currentPlatform })}
+          statusFilter={proListView ? (pf.st as any) : undefined}
+          query={proListView ? pf.q : undefined}
+          hideHeader={proListView}
+        />
+      );
+    }
+
+    // currentSection === 'create' — show the platform's scenario cards
+    // 矩阵号:每个平台只有「互动涨粉」一个卡片(账号制),点开 MatrixTaskWizard。
+    if (matrixMode) return renderMatrixCreateCards(currentPlatform, platformLabel);
+    if (currentPlatform === 'xhs') {
+      return (
+        <XhsWorkflowsPage
+          scenarios={scenarios.filter(s => s.platform === 'xhs')}
+          tasks={tasksForPlatform}
+          draftsByTask={draftsByTask}
+          loading={loading}
+          onOpenTask={openTask}
+          onConfigure={openWizardFor}
+          onChanged={refreshAll}
+          onOpenSensitiveCheck={openSensitiveCheck}
+          onGoToMyTasks={() => setView({ kind: 'main', section: 'tasks', platform: 'xhs' })}
+        />
+      );
+    }
+
+    if (currentPlatform === 'x') {
+      return (
+        <XWorkflowsPage
+          scenarios={scenarios.filter(s => s.platform === 'x')}
+          tasks={tasksForPlatform}
+          draftsByTask={draftsByTask}
+          loading={loading}
+          onOpenTask={openTask}
+          onConfigure={openWizardFor}
+          onChanged={refreshAll}
+          onGoToMyTasks={() => setView({ kind: 'main', section: 'tasks', platform: 'x' })}
+        />
+      );
+    }
+
+    if (currentPlatform === 'binance') {
+      return (
+        <BinanceWorkflowsPage
+          scenarios={scenarios.filter(s => (s.platform as any) === 'binance')}
+          tasks={tasksForPlatform}
+          draftsByTask={draftsByTask}
+          loading={loading}
+          onOpenTask={openTask}
+          onConfigure={openWizardFor}
+          onChanged={refreshAll}
+          onGoToMyTasks={() => setView({ kind: 'main', section: 'tasks', platform: 'binance' })}
+        />
+      );
+    }
+
+    if (currentPlatform === 'youtube') {
+      return (
+        <YoutubeWorkflowsPage
+          scenarios={scenarios.filter(s => (s.platform as any) === 'youtube')}
+          tasks={tasksForPlatform}
+          draftsByTask={draftsByTask}
+          loading={loading}
+          onOpenTask={openTask}
+          onConfigure={openWizardFor}
+          onChanged={refreshAll}
+          onGoToMyTasks={() => setView({ kind: 'main', section: 'tasks', platform: 'youtube' })}
+        />
+      );
+    }
+
+    if (currentPlatform === 'tiktok') {
+      return (
+        <TikTokWorkflowsPage
+          scenarios={scenarios.filter(s => (s.platform as any) === 'tiktok')}
+          tasks={tasksForPlatform}
+          draftsByTask={draftsByTask}
+          loading={loading}
+          onOpenTask={openTask}
+          onConfigure={openWizardFor}
+          onChanged={refreshAll}
+          onGoToMyTasks={() => setView({ kind: 'main', section: 'tasks', platform: 'tiktok' })}
+        />
+      );
+    }
+
+    if (currentPlatform === 'douyin') {
+      return (
+        <DouyinWorkflowsPage
+          scenarios={scenarios.filter(s => (s.platform as any) === 'douyin')}
+          tasks={tasksForPlatform}
+          draftsByTask={draftsByTask}
+          loading={loading}
+          onOpenTask={openTask}
+          onConfigure={openWizardFor}
+          onChanged={refreshAll}
+          onGoToMyTasks={() => setView({ kind: 'main', section: 'tasks', platform: 'douyin' })}
+        />
+      );
+    }
+
+    if (currentPlatform === 'shipinhao') {
+      return (
+        <ShipinhaoWorkflowsPage
+          scenarios={scenarios.filter(s => (s.platform as any) === 'shipinhao')}
+          tasks={tasksForPlatform}
+          draftsByTask={draftsByTask}
+          loading={loading}
+          onOpenTask={openTask}
+          onConfigure={openWizardFor}
+          onChanged={refreshAll}
+          onGoToMyTasks={() => setView({ kind: 'main', section: 'tasks', platform: 'shipinhao' })}
+        />
+      );
+    }
+
+    if (currentPlatform === 'toutiao') {
+      return (
+        <ToutiaoWorkflowsPage
+          scenarios={scenarios.filter(s => (s.platform as any) === 'toutiao')}
+          tasks={tasksForPlatform}
+          draftsByTask={draftsByTask}
+          loading={loading}
+          onOpenTask={openTask}
+          onConfigure={openWizardFor}
+          onChanged={refreshAll}
+          onGoToMyTasks={() => setView({ kind: 'main', section: 'tasks', platform: 'toutiao' })}
+        />
+      );
+    }
+
+    if (currentPlatform === 'kuaishou') {
+      return (
+        <KuaishouWorkflowsPage
+          scenarios={scenarios.filter(s => (s.platform as any) === 'kuaishou')}
+          tasks={tasksForPlatform}
+          draftsByTask={draftsByTask}
+          loading={loading}
+          onOpenTask={openTask}
+          onConfigure={openWizardFor}
+          onChanged={refreshAll}
+          onGoToMyTasks={() => setView({ kind: 'main', section: 'tasks', platform: 'kuaishou' })}
+        />
+      );
+    }
+
+    if (currentPlatform === 'bilibili') {
+      return (
+        <BilibiliWorkflowsPage
+          scenarios={scenarios.filter(s => (s.platform as any) === 'bilibili')}
+          tasks={tasksForPlatform}
+          draftsByTask={draftsByTask}
+          loading={loading}
+          onOpenTask={openTask}
+          onConfigure={openWizardFor}
+          onChanged={refreshAll}
+          onGoToMyTasks={() => setView({ kind: 'main', section: 'tasks', platform: 'bilibili' })}
+        />
+      );
+    }
+
+    // No remaining platforms — keep placeholder for future expansion.
+    return <PlatformPlaceholder platform={currentPlatform} />;
+  })();
+
+  return (
+    <div className="flex flex-col h-full dark:bg-claude-darkBg bg-claude-bg">
+      {/* NoobCoin 福袋红包空投 — self-positioned overlay,监听 backend SSE 触发。
+          逻辑跟 chat 对话框那个一致(同 LuckyBag 组件)。 */}
+      <ErrorBoundary name="LuckyBag">
+        <LuckyBag />
+      </ErrorBoundary>
+      {!simple && !GLOBAL_TOPBAR && (<>
+      {/* Header */}
+      <div className="draggable flex h-12 items-center justify-between px-4 border-b dark:border-claude-darkBorder border-claude-border shrink-0">
+        <div className="flex items-center space-x-3 h-8">
+          {isSidebarCollapsed && !GLOBAL_TOPBAR && (
+            <div className={`non-draggable flex items-center gap-1 ${isMac ? 'pl-[68px]' : ''}`}>
+              <button
+                type="button"
+                onClick={onToggleSidebar}
+                className="h-8 w-8 inline-flex items-center justify-center rounded-lg dark:text-claude-darkTextSecondary text-claude-textSecondary hover:bg-claude-surfaceHover dark:hover:bg-claude-darkSurfaceHover transition-colors"
+              >
+                <SidebarToggleIcon className="h-4 w-4" isCollapsed={true} />
+              </button>
+              <button
+                type="button"
+                onClick={onNewChat}
+                className="h-8 w-8 inline-flex items-center justify-center rounded-lg dark:text-claude-darkTextSecondary text-claude-textSecondary hover:bg-claude-surfaceHover dark:hover:bg-claude-darkSurfaceHover transition-colors"
+              >
+                <ComposeIcon className="h-4 w-4" />
+              </button>
+              {updateBadge}
+            </div>
+          )}
+          <h1 className="text-lg font-semibold dark:text-claude-darkText text-claude-text">
+            {/* 下钻到任务/运行记录详情时,标题归到「我的涨粉任务」(详情逻辑上属于该菜单),
+                不再停在「新建涨粉任务 / 涨粉运行记录」。 */}
+            {matrixMode
+              ? (inDetailView
+                  ? '🧬 ' + i18nService.t('matrixMyFanTasks')
+                  : mode === 'runs'
+                    ? '🧬 ' + i18nService.t('matrixRunHistory')
+                    : mode === 'create'
+                      ? '🧬 ' + i18nService.t('matrixNewFanTask')
+                      : '🧬 ' + i18nService.t('matrixMyFanTasks'))
+              : inDetailView
+                ? i18nService.t('myFanTasks')
+                : mode === 'create'
+                  ? i18nService.t('quickUse')
+                  : mode === 'runs'
+                    ? i18nService.t('svRunHistory')
+                    : i18nService.t('myFanTasks')}
+          </h1>
+          {/* v1.x: 钱包余额 + 充值入口紧跟标题,跟 CoworkView 顶栏一致 */}
+          <div className="non-draggable">
+            <WalletBadge />
+          </div>
+        </div>
+        {/* v1.x: 顶栏右上角"分享给好友"入口 — 一键使用页是用户日常驻留点之一,
+            把邀请入口顶到这儿让"邀请赚 BUSDT"在用户视线里。点击跳邀请返佣页。
+            包裹 div 不加 non-draggable(否则 macOS 拖窗口热区丢失),仅 button
+            本身 non-draggable 让点击事件不被 -webkit-app-region:drag 吃掉。 */}
+        <div className="flex items-center gap-2 h-8">
+          {onShowInvite && (
+            <button
+              type="button"
+              onClick={onShowInvite}
+              className="non-draggable inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all whitespace-nowrap bg-green-500/10 text-green-500 border border-green-500/40 hover:bg-green-500/20 hover:border-green-500/60 active:scale-95"
+              title={i18nService.t('svShareInviteTitle')}
+              aria-label={i18nService.t('svShareToFriends')}
+            >
+              <span aria-hidden>🎁</span>
+              <span>{i18nService.t('svShareToFriends')}</span>
+            </button>
+          )}
+          <WindowTitleBar inline />
+        </div>
+      </div>
+
+      </>)}
+      {/* L1 — section tabs (Create / My Tasks / History). Hidden when in
+          a sub-page (task_detail / sensitive_check) so the user gets a
+          full-bleed page without competing nav.
+          Matches the L2 platform-tabs treatment: every tab is a visible
+          card with a frame even when inactive, and the active one shifts
+          to a green tint + green border + slight glow. Inactive tabs were
+          previously borderless which made them look unclickable. */}
+      {/* Two header modes:
+          - "list" mode (section = tasks / history): L1 tabs on the left
+            + "+ 新建涨粉任务" CTA on the right
+          - "create" mode (section = create): a "← 返回" button replaces
+            the L1 tabs; CTA hides because we're already inside Create.
+            This makes Create feel like a pushed sub-page rather than
+            another tab equal to the others — matches user expectation
+            of "task vs view" actions. */}
+      {/* 专业版「窗口任务 / 运行记录」:一行筛选 —— 平台下拉 · 状态下拉 · 搜索 · 重置 ……(窗口任务)右侧新建按钮 */}
+      {proListView && !(proPlat === 'video' && videoInDetail) && (() => {
+        const isRunsPage = mode === 'runs';
+        const stOpts: Array<[string, string]> = isRunsPage
+          ? [['all', SL('全部状态', '全部狀態', 'All statuses')], ['running', SL('运行中', '運行中', 'Running')], ['done', SL('成功', '成功', 'Success')], ['partial', SL('部分成功', '部分成功', 'Partial')], ['error', SL('失败', '失敗', 'Failed')], ['stopped', SL('已停止', '已停止', 'Stopped')]]
+          : [['all', SL('全部状态', '全部狀態', 'All statuses')], ['running', SL('运行中', '運行中', 'Running')], ['scheduled', SL('定时等待', '定時等待', 'Scheduled')], ['manual', SL('手动运行', '手動運行', 'Manual')]];
+        const isVideo = proPlat === 'video';
+        const chev = <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M6 9l6 6 6-6" /></svg>;
+        const fbtn = 'inline-flex items-center gap-2 h-10 px-3.5 rounded-xl text-sm font-bold bg-gray-200 dark:bg-[#202640] dark:text-white';
+        const menuItem = (on: boolean) => `w-full text-left text-sm px-2.5 py-2 rounded-lg whitespace-nowrap ${on ? 'text-claude-accent font-semibold' : 'dark:text-claude-darkText text-claude-text hover:bg-black/5 dark:hover:bg-white/5'}`;
+        const newLabel = proPlat === 'all'
+          ? SL('新建窗口任务', '新建窗口任務', 'New window task')
+          : SL('新建{p}窗口任务', '新建{p}窗口任務', 'New {p} window task').replace('{p}', platName(proPlat));
+        return (
+          <div className="px-6 pt-5 shrink-0">
+            <div className="max-w-6xl mx-auto flex items-center gap-2.5 flex-wrap">
+              {proMenu && <div className="fixed inset-0 z-30" onClick={() => setProMenu(null)} />}
+              <div className="relative">
+                <button type="button" className={fbtn} aria-expanded={proMenu === 'plat'} onClick={() => setProMenu((m) => (m === 'plat' ? null : 'plat'))}>
+                  {proPlat === 'all' ? SL('全部平台', '全部平台', 'All platforms') : platName(proPlat)}{chev}
+                </button>
+                {proMenu === 'plat' && (
+                  <div className="absolute left-0 top-[calc(100%+6px)] z-40 w-[440px] max-w-[90vw] grid grid-cols-3 gap-1 p-2 rounded-xl shadow-xl dark:bg-claude-darkSurface bg-white border dark:border-white/10 border-black/10">
+                    {['all', ...ncPlatforms].map((id) => {
+                      const on = proPlat === id;
+                      return (
+                        <button key={id} type="button" className={`${menuItem(on)} ${id === 'all' ? 'col-span-3' : ''}`}
+                          style={on ? { background: 'rgba(0,255,136,0.10)' } : undefined}
+                          onClick={() => { setPf({ plat: id }); setProMenu(null); setVideoInDetail(false); if (id !== 'all') setPlatform(id as PlatformId); }}>
+                          {id === 'all' ? SL('全部平台', '全部平台', 'All platforms') : platName(id)}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              {!isVideo && (
+                <div className="relative">
+                  <button type="button" className={fbtn} aria-expanded={proMenu === 'st'} onClick={() => setProMenu((m) => (m === 'st' ? null : 'st'))}>
+                    {(stOpts.find(([k]) => k === pf.st) || stOpts[0])[1]}{chev}
+                  </button>
+                  {proMenu === 'st' && (
+                    <div className="absolute left-0 top-[calc(100%+6px)] z-40 min-w-[160px] p-1.5 rounded-xl shadow-xl dark:bg-claude-darkSurface bg-white border dark:border-white/10 border-black/10">
+                      {stOpts.map(([k, label]) => (
+                        <button key={k} type="button" className={menuItem(pf.st === k)} style={pf.st === k ? { background: 'rgba(0,255,136,0.10)' } : undefined}
+                          onClick={() => { setPf({ st: k }); setProMenu(null); }}>{label}</button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {!isVideo && (
+                <input value={pf.q} onChange={(e) => setPf({ q: e.target.value })}
+                  placeholder={isRunsPage ? SL('搜索任务名 / 任务编号 / 记录编号', '搜尋任務名 / 任務編號 / 記錄編號', 'Search task / task ID / run ID') : SL('搜索任务名 / 任务编号', '搜尋任務名 / 任務編號', 'Search task name / ID')}
+                  className="h-10 w-64 text-sm px-3 rounded-xl border dark:border-white/10 border-black/10 bg-transparent dark:text-claude-darkText text-claude-text" />
+              )}
+              <button type="button" onClick={() => { setPf({ plat: 'all', st: 'all', q: '' }); setProMenu(null); setVideoInDetail(false); }}
+                className="h-10 px-3.5 rounded-xl text-sm dark:text-claude-darkTextSecondary text-claude-textSecondary hover:text-claude-text dark:hover:text-white">{SL('重置', '重置', 'Reset')}</button>
+              <div className="flex-1" />
+              {!isRunsPage && (
+                <button type="button" onClick={() => openNewTaskModal(proPlat === 'all' ? undefined : proPlat)}
+                  className="h-10 px-4 rounded-xl text-sm font-bold text-[#04130B]" style={{ background: '#00FF88' }}>{newLabel}</button>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+      {!proListView && view.kind === 'main' && currentSection !== 'create' && (runningOnlyActive || !(currentPlatform === 'video' && videoInDetail)) && (() => {
+        const isVideo = currentPlatform === 'video';
+        const isHistory = currentSection === 'history';
+        // v6.x: 原「我的涨粉任务 / 运行记录」两个 L1 段 tab 已拆成两个独立左侧菜单,
+        // 这里改成只展示【当前菜单】的段标题(样式对齐「✨ 新建涨粉任务」头部)。
+        //   manage 菜单 → 📋 我的涨粉任务(视频实例叫「我的视频任务」)
+        //   runs   菜单 → 📊 涨粉运行记录
+        // 仅当从【我的涨粉任务】里某任务详情下钻到该任务的运行记录(manage 内部
+        // section 临时切到 history)时,补一个「← 返回」回到任务列表,避免没了 L1
+        // tab 之后无路可退。
+        // 「只看运行中」时不分平台,标题固定用通用的「我的涨粉任务」(哪怕开关前停在视频 tab)。
+        const sectionTitle = (simple && !isHistory)
+          ? SL('📋 我的任务', '📋 我的任務', '📋 My tasks')
+          : isHistory
+          ? i18nService.t('svRunHistoryTitle')
+          : (isVideo && !runningOnlyActive) ? i18nService.t('svMyVideosTitle')
+                    : i18nService.t('svMyTasksTitle');
+        return (
+        <div className="flex items-center justify-between gap-2 px-4 pt-4 pb-2 border-b dark:border-claude-darkBorder border-claude-border shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            {mode === 'manage' && isHistory && (
+              <button
+                type="button"
+                onClick={() => setSection('tasks')}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-semibold text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-gray-800/60 hover:bg-gray-200 dark:hover:bg-gray-700/80 border border-gray-400 dark:border-gray-500 transition-colors whitespace-nowrap"
+                title={i18nService.t('svBackToMyTasks')}
+              >
+                <span>←</span>
+                <span>{i18nService.t('svBack')}</span>
+              </button>
+            )}
+            <h2 className="text-base font-bold dark:text-white text-gray-900 whitespace-nowrap">
+              {sectionTitle}
+            </h2>
+            {/* 「只看运行中」左右开关(默认关)。开 → 隐藏下方平台 tab,全平台运行中的任务卡
+                聚成一个列表,方便逐个追踪进度。仅矩阵 manage 菜单的任务列表显示。 */}
+            {simple && mode === 'manage' && !isHistory && (
+              <SimpleSelect
+                className="non-draggable ml-2 shrink-0 w-44"
+                value={simpleFilter}
+                onChange={setSimpleFilter}
+                ariaLabel={SL('筛选任务', '篩選任務', 'Filter tasks')}
+                options={[
+                  { value: 'all', label: SL('全部任务', '全部任務', 'All tasks') },
+                  { value: 'running', label: '🟢 ' + SL('运行中', '執行中', 'Running') },
+                  ...simpleTaskPlatforms.map((p) => ({ value: p.id, label: `${p.icon} ${p.label}(${p.n})` })),
+                ]}
+              />
+            )}
+            {matrixMode && mode === 'manage' && !isHistory && !simple && (
+              <button
+                type="button"
+                role="switch"
+                aria-checked={showRunningOnly}
+                onClick={() => {
+                  setShowRunningOnly(v => !v);
+                  // 从视频 tab 的详情态切进聚合视图时 VideoWorkflowsPage 会被卸载,
+                  // videoInDetail 不会再由它上报复位 —— 这里手动清掉,防头部/平台 tab 显隐错乱。
+                  setVideoInDetail(false);
+                }}
+                className="non-draggable inline-flex items-center gap-2 ml-2 shrink-0"
+                title={i18nService.t('mtxOnlyRunning')}
+              >
+                <span className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${showRunningOnly ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'}`}>
+                  <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform ${showRunningOnly ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+                </span>
+                <span className={`text-xs font-medium whitespace-nowrap ${showRunningOnly ? 'text-green-600 dark:text-green-400' : 'text-gray-500 dark:text-gray-400'}`}>
+                  {i18nService.t('mtxOnlyRunning')}
+                </span>
+              </button>
+            )}
+          </div>
+          {/* Right-aligned CTA — 只在「我的涨粉任务」(tasks)展示;运行记录页无需新建入口。
+              Always clickable; per-platform task-cap (>= 5) check happens inside the
+              create page's scenario cards. Video tab is local-only (rose tint). */}
+          {currentSection === 'tasks' && ((runningOnlyActive || simple) ? (
+          /* 「只看运行中」聚合态没有"当前平台"语境 —— 按钮退化为通用「新建任务」,
+             跳「新建矩阵涨粉任务」选择页(与侧栏入口一致),由用户在那儿挑平台和类型。 */
+          <button
+            type="button"
+            onClick={() => {
+              // 简洁版:进的是「选平台」页,可能去建免费任务 → 不在入口拦(收费任务运行时再过门槛)
+              if (!simple && !matrixMode && !noobClawAuth.hasEnoughBalanceForTask()) return;
+              onSwitchToCreate?.();
+            }}
+            className="shrink-0 inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-all whitespace-nowrap active:scale-95 text-black shadow-md shadow-green-500/30 bg-green-500 hover:bg-green-600 border border-green-500"
+          >
+            <span>✨</span>
+            <span>{i18nService.t('svNewTaskGeneric')}</span>
+          </button>
+          ) : (
+          <button
+            type="button"
+            onClick={() => {
+              if (isVideo) { goVideoCreate(); return; }
+              goCreatePlatform(currentPlatform);
+            }}
+            className={`shrink-0 inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-all whitespace-nowrap active:scale-95 text-white ${
+              isVideo
+                ? 'shadow-md shadow-rose-500/30 bg-rose-500 hover:bg-rose-600 border border-rose-500'
+                : 'shadow-md shadow-green-500/30 bg-green-500 hover:bg-green-600 border border-green-500'
+            }`}
+          >
+            <span>✨</span>
+            <span>{isVideo ? i18nService.t('svNewVideoTask') : i18nService.t('svNewFanTask')}</span>
+          </button>
+          ))}
+        </div>
+        );
+      })()}
+
+      {/* Create-mode header. v6.x: 'create' 模式是顶级菜单(「一键涨粉」),没有
+          上一页可回 —— 隐藏返回按钮,只留段标题。仅 manage 模式(已不会进 create
+          段)才保留返回按钮,但实际上 manage 不再渲染本块。 */}
+      {view.kind === 'main' && currentSection === 'create' && (
+        <div className="flex items-center justify-between gap-2 px-4 pt-4 pb-2 border-b dark:border-claude-darkBorder border-claude-border shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            {mode !== 'create' && (
+            <button
+              type="button"
+              onClick={() => setSection('tasks')}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-semibold text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-gray-800/60 hover:bg-gray-200 dark:hover:bg-gray-700/80 border border-gray-400 dark:border-gray-500 transition-colors whitespace-nowrap"
+              title={currentPlatform === 'video' ? i18nService.t('svBackToVideoCreate') : i18nService.t('svBackToMyTasks')}
+            >
+              <span>←</span>
+              <span>{i18nService.t('svBack')}</span>
+            </button>
+            )}
+            <h2 className="text-base font-bold dark:text-white text-gray-900 ml-2 whitespace-nowrap">
+              ✨ {simple ? SL('创建任务', '建立任務', 'Create a task') : currentPlatform === 'video' ? i18nService.t('svNewVideoTask') : i18nService.t('svNewFanTask')}
+            </h2>
+          </div>
+          {/* v6.x: 「涨粉教程」入口 → 外部浏览器打开文档站。样式与「我的涨粉任务」
+              页一致(琥珀渐变胶囊按钮),靠 justify-between 顶到头部右侧。 */}
+          {mode === 'create' && !simple && (() => {
+            // tab=「多平台视频创作」(currentPlatform==='video')→ 文字「视频教程」+ 视频文档链接(中文/英文分开);
+            //   其它 tab 保持原样:「涨粉教程」+ 文档首页(用户要求)。
+            const isVideoTab = currentPlatform === 'video';
+            const isZhDoc = i18nService.currentLanguage === 'zh';
+            const tutorialUrl = isVideoTab
+              ? (isZhDoc ? 'https://docs.noobclaw.com/zhong-wen-ban/kua-ping-tai-shi-pin-chuang-zuo' : 'https://docs.noobclaw.com/english/video-maker')
+              : (isZhDoc ? 'https://docs.noobclaw.com/zhong-wen-ban' : 'https://docs.noobclaw.com/english');
+            const tutorialLabel = isVideoTab
+              ? i18nService.t('svVideoTutorial')
+              : i18nService.t('svGrowthTutorial');
+            return (
+            <button
+              type="button"
+              onClick={() => { try { window.electron?.shell?.openExternal(tutorialUrl); } catch { /* sandbox/无 xdg-open 时静默 */ } }}
+              className="group relative shrink-0 inline-flex items-center gap-1.5 text-xs font-medium
+                         px-3.5 py-1.5 rounded-full
+                         bg-gradient-to-r from-amber-500/15 via-orange-500/15 to-rose-500/15
+                         hover:from-amber-500/25 hover:via-orange-500/25 hover:to-rose-500/25
+                         text-amber-700 dark:text-amber-300
+                         border border-amber-500/30 hover:border-amber-500/60
+                         shadow-sm hover:shadow-md hover:shadow-amber-500/20
+                         transition-all duration-200 hover:-translate-y-0.5"
+              title={tutorialLabel}
+            >
+              <span className="text-sm leading-none">📖</span>
+              <span>{tutorialLabel}</span>
+              <span className="opacity-60 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all duration-200">→</span>
+            </button>
+            );
+          })()}
+        </div>
+      )}
+
+      {/* L2 — platform sub-tabs (XHS / Twitter / YouTube / TikTok / Douyin /
+          Binance). Inactive border was bumped from gray-300/gray-600 to
+          gray-400/gray-500 because the prior tone was nearly invisible
+          against the page background — user couldn't tell at a glance which
+          buttons were tappable vs decorative. Now every tab carries a
+          visible frame; the active one differentiates only by green tint
+          + green border + slight glow shadow, matching the L1 section tabs'
+          active treatment. */}
+      {view.kind === 'main' && !(currentPlatform === 'video' && videoInDetail) && !runningOnlyActive && !simple && !proListView && (
+        <div className="flex flex-wrap items-center gap-2 px-4 pt-3 pb-2 border-b dark:border-claude-darkBorder border-claude-border shrink-0">
+          {/* 矩阵号:显示「视频创作」(热搜成片)+ 支持「互动涨粉」的平台(其余无 engage 剧本)。 */}
+          {(matrixMode ? MATRIX_TAB_ORDER.map((id) => PLATFORM_TABS.find((t) => t.id === id)!).filter(Boolean).filter((t) => !complianceHidden.includes(t.id)) : PLATFORM_TABS).map((tab) => {
+            const active = currentPlatform === tab.id;
+            // 矩阵号:对齐「我的矩阵账号」的简洁 pill 切换(纯文字 + violet 选中,rounded-full),
+            // 顺序同账号页(MATRIX_TAB_ORDER 已与 PLATFORMS 一致)。非矩阵(旧视频版)保持原绿卡样式。
+            if (matrixMode) {
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setPlatform(tab.id)}
+                  // 有任务在跑的平台:未选中时整颗标签染绿(边框+文字+淡背景),不用盯着小圆点也能一眼扫到;
+                  //   选中态仍用紫色(那是"你当前在看哪个"),不被绿色顶掉,两种含义不打架。
+                  className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-sm border transition-colors whitespace-nowrap ${
+                    active
+                      ? 'border-violet-500 bg-violet-500/10 text-violet-500 font-medium'
+                      : showRunningDot && matrixRunningPlatforms.includes(tab.id)
+                        ? 'border-green-500/60 bg-green-500/10 text-green-500 font-medium'
+                        : 'border-gray-300 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-violet-500/50'
+                  }`}
+                >
+                  {/* 矩阵页不显示平台 emoji(用户 2026-08-06:一排彩色 emoji 噪音大、辨识度反而低)。
+                      文字前只在【该平台有任务正在跑】时亮一个闪烁绿点,让"哪个平台在忙"一眼可见。 */}
+                  {showRunningDot && matrixRunningPlatforms.includes(tab.id) && (
+                    <span className="relative flex w-2.5 h-2.5 shrink-0" aria-hidden="true"><span className="absolute inline-flex w-full h-full rounded-full bg-green-400 opacity-75 animate-ping" /><span className="relative inline-flex w-2.5 h-2.5 rounded-full bg-green-400 shadow-[0_0_10px_3px_rgba(74,222,128,0.9)]" /></span>
+                  )}
+                  <span>{i18nService.t(tab.labelKey)}</span>
+                </button>
+              );
+            }
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setPlatform(tab.id)}
+                className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors whitespace-nowrap ${
+                  active
+                    ? 'bg-green-500/15 text-green-500 border border-green-500/50 shadow-sm shadow-green-500/20'
+                    : 'text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-gray-800/60 hover:bg-gray-200 dark:hover:bg-gray-700/80 border border-gray-400 dark:border-gray-500'
+                }`}
+              >
+                <span className="text-base">{tab.icon}</span>
+                <span>{i18nService.t(tab.labelKey)}</span>
+                {!tab.enabled && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-200 dark:bg-gray-700 text-gray-500">
+                    {i18nService.t('scenarioPlatformSoon')}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Main content */}
+      {/* Main content — guarded with a fallback so a render crash doesn't black-screen the app */}
+      <div className="flex-1 overflow-y-auto">
+        {fatalError ? (
+          <div className="p-8 text-center">
+            <div className="text-4xl mb-4">⚠️</div>
+            <div className="text-sm text-red-500 mb-4">{fatalError}</div>
+            <button
+              type="button"
+              onClick={() => { setFatalError(null); void refreshAll(); }}
+              className="px-4 py-2 text-sm rounded-lg bg-gray-900 dark:bg-white text-white dark:text-gray-900"
+            >
+              {i18nService.t('svRetry')}
+            </button>
+          </div>
+        ) : (
+          platformTabContent
+        )}
+      </div>
+
+      {/* Config wizard modal */}
+      {wizardScenario && (
+        <ConfigWizard
+          // 按场景换实例:ConfigWizard 对 YouTube/TikTok 等在 hook 之前提前 return,同一实例换场景会 hook 数量不一致
+          key={wizardScenario.id}
+          scenario={wizardScenario}
+          initialTask={wizardEditingTask}
+          onCancel={closeWizard}
+          onSave={handleWizardSave}
+        />
+      )}
+
+      {/* 指纹浏览器未安装 → 去下载弹窗(没内核不创建/不运行矩阵任务) */}
+      {matrixKernelMissing && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4">
+          <div className="w-[28rem] max-w-full rounded-2xl p-6 dark:bg-claude-darkBg bg-white border dark:border-white/10 border-black/10 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="text-base font-semibold mb-2 dark:text-white">🧬 {i18nService.t('svKernelTitle')}</div>
+            <div className="text-sm text-gray-600 dark:text-gray-300 mb-5 leading-relaxed">{i18nService.t('svKernelBody')}</div>
+            {/* Windows:杀毒软件 / 360 常把内核文件当可疑程序删掉或拦截 → 安装失败(2026-10-19 用户要求提示) */}
+            {window.electron.platform === 'win32' && <div className="text-xs leading-relaxed rounded-lg px-3 py-2 mb-3 border border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400">⚠️ {i18nService.t('kernelWinAvTip')}</div>}
+            {(matrixKernelBusy || matrixKernelPct > 0 || matrixKernelMsg) && (
+              <div className="mb-4">
+                <div className="h-2 rounded-full bg-black/10 dark:bg-white/10 overflow-hidden"><div className="h-full bg-violet-500 transition-all duration-200" style={{ width: `${Math.max(2, matrixKernelPct)}%` }} /></div>
+                <div className={`text-xs mt-1 ${!matrixKernelBusy && matrixKernelPct === 0 && matrixKernelMsg ? 'text-red-500' : 'opacity-60'}`}>{matrixKernelMsg || i18nService.t('svDownloading')}{matrixKernelBusy ? ` · ${matrixKernelPct}%` : ''}</div>
+              </div>
+            )}
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setMatrixKernelMissing(false)} disabled={matrixKernelBusy} className="px-3.5 py-1.5 text-sm rounded-lg border dark:border-white/15 border-black/15 disabled:opacity-50">{i18nService.t('svCancel')}</button>
+              <button onClick={downloadMatrixKernel} disabled={matrixKernelBusy} className="px-3.5 py-1.5 text-sm rounded-lg bg-violet-500 hover:bg-violet-600 text-white disabled:opacity-50">{matrixKernelBusy ? i18nService.t('svDownloading') : i18nService.t('svDownloadKernel')}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 重复任务提示:某平台已有同类型任务 → 关掉向导并弹此提示,给「去查看 / 编辑」入口跳对应管理 tab */}
+      {simple && mode === 'create' && simpleModalOpen && view.kind === 'main' && (
+        <SimpleCreateModal
+          platforms={simplePlatforms.filter((pl) => simpleTypesFor(pl.id).length > 0)}
+          typesFor={simpleTypesFor}
+          initialPlatform={initialPlatform}
+          onNext={runSimpleType}
+          onViewExisting={(pl) => { setSimpleModalOpen(false); onSwitchToManage?.(pl as any); }}
+          onCancel={() => { setSimpleModalOpen(false); onSimpleCancel?.(); }}
+        />
+      )}
+      {/* 「新建窗口任务」弹窗:① 选择平台 → ② 任务类型(原新建页卡片原样复用,去掉按钮、点选高亮)→ 下一步 = 该卡片原有的「开始」 */}
+      {nc.open && (() => {
+        const plat = nc.plat;
+        const title = plat ? SL('新建{p}窗口任务', '新建{p}窗口任務', 'New {p} window task').replace('{p}', platName(plat)) : SL('新建窗口任务', '新建窗口任務', 'New window task');
+        const steps: Array<[string, boolean, boolean]> = [
+          [nc.step > 1 && plat ? platName(plat) : SL('选择平台', '選擇平台', 'Platform'), nc.step > 1, nc.step === 1],
+          [SL('任务类型', '任務類型', 'Task type'), false, nc.step === 2],
+          [SL('任务设置', '任務設置', 'Settings'), false, false],
+        ];
+        const nextLabel = nc.step === 1
+          ? (plat && plat !== 'video' ? SL('下一步:选择{p}任务类型', '下一步:選擇{p}任務類型', 'Next: {p} task type').replace('{p}', platName(plat)) : SL('下一步', '下一步', 'Next'))
+          : SL('下一步:任务设置', '下一步:任務設置', 'Next: settings');
+        const nextOff = nc.step === 1 ? !plat : nc.pick < 0;
+        return (
+          <div className="fixed inset-0 z-[55] flex items-center justify-center bg-black/50 p-4">
+            <div className={`w-full ${nc.step === 2 ? 'max-w-4xl' : 'max-w-2xl'} max-h-[90vh] flex flex-col rounded-2xl bg-white dark:bg-[#10131e] border border-gray-200 dark:border-white/10 shadow-2xl`} role="dialog" aria-label={title}>
+              <div className="flex items-center px-6 pt-5 pb-3">
+                <div className="text-lg font-bold dark:text-white text-gray-900">{title}</div>
+                <button type="button" onClick={() => setNc((n) => ({ ...n, open: false }))} aria-label={SL('关闭', '關閉', 'Close')}
+                  className="ml-auto text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 text-lg">✕</button>
+              </div>
+              <div className="flex items-center gap-2 px-6 pb-4 border-b border-gray-200 dark:border-white/10">
+                {steps.map(([label, done, on], i) => (
+                  <React.Fragment key={i}>
+                    {i > 0 && <span className="flex-1 max-w-[60px] h-px bg-gray-300 dark:bg-white/15" />}
+                    <span className={`inline-flex items-center gap-1.5 text-xs whitespace-nowrap ${on ? 'font-bold dark:text-white text-gray-900' : 'text-gray-500 dark:text-gray-400'}`}>
+                      <span className="w-5 h-5 rounded-full inline-flex items-center justify-center text-[11px] border"
+                        style={on ? { background: '#00FF88', borderColor: '#00FF88', color: '#04130B' } : done ? { background: 'rgba(0,255,136,0.12)', borderColor: 'rgba(0,255,136,0.5)', color: '#00CC6E' } : undefined}>{done ? '✓' : i + 1}</span>
+                      {label}
+                    </span>
+                  </React.Fragment>
+                ))}
+              </div>
+              <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5">
+                {nc.step === 1 ? (
+                  <>
+                    <div className="text-sm font-semibold dark:text-gray-200 mb-3">{SL('选择要建任务的平台', '選擇要建任務的平台', 'Pick a platform')}</div>
+                    <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                      {ncPlatforms.map((id) => {
+                        const on = plat === id;
+                        return (
+                          <button key={id} type="button" onClick={() => setNc((n) => ({ ...n, plat: id, pick: -1 }))}
+                            className={`px-2 py-2.5 rounded-xl border text-sm text-center ${on ? 'font-bold text-claude-accent' : 'border-gray-200 dark:border-white/10 dark:text-gray-200 text-gray-800 hover:border-gray-400 dark:hover:border-white/25'}`}
+                            style={on ? { background: 'rgba(0,255,136,0.08)', borderColor: 'rgba(0,255,136,0.6)' } : undefined}>
+                            {platName(id)}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : (
+                  <div ref={ncRef} className="nc-pick" onClickCapture={ncPickCapture}>
+                    <style>{`.nc-pick > div { padding: 0 !important; max-width: none !important; }
+.nc-pick > div > .grid > div { cursor: pointer; transition: border-color .15s, box-shadow .15s; }
+.nc-pick > div > .grid > div .mt-auto { display: none !important; }
+.nc-pick > div > .grid > div:hover { border-color: rgba(0,255,136,0.45) !important; }
+${nc.pick >= 0 ? `.nc-pick > div > .grid > div:nth-child(${nc.pick + 1}) { border-color: #00ff88 !important; box-shadow: 0 0 0 2px #00ff88, 0 0 0 6px rgba(0,255,136,0.12); }` : ''}`}</style>
+                    {renderMatrixCreateCards(plat as PlatformId, platName(plat))}
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-2 px-6 py-4 border-t border-gray-200 dark:border-white/10">
+                <span className="text-xs text-gray-500 dark:text-gray-400">{SL('第 {n} / 3 步', '第 {n} / 3 步', 'Step {n} of 3').replace('{n}', String(nc.step))}</span>
+                <span className="flex-1" />
+                <button type="button"
+                  onClick={() => { if (nc.step === 2 && !nc.fixed) setNc((n) => ({ ...n, step: 1, pick: -1 })); else setNc((n) => ({ ...n, open: false })); }}
+                  className="px-4 py-2 rounded-xl text-sm font-semibold bg-gray-100 dark:bg-[#262c40] dark:text-white text-gray-800">
+                  {nc.step === 2 && !nc.fixed ? SL('上一步', '上一步', 'Back') : SL('取消', '取消', 'Cancel')}
+                </button>
+                <button type="button" disabled={nextOff} onClick={ncNext}
+                  className="px-4 py-2 rounded-xl text-sm font-bold text-[#04130B] disabled:opacity-40 disabled:cursor-not-allowed" style={{ background: '#00FF88' }}>
+                  {nextLabel}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+      {dupNotice && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4">
+          <div className="w-full max-w-sm rounded-2xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 shadow-2xl p-5" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-start gap-3">
+              <span className="text-xl leading-none">⚠️</span>
+              <div className="text-sm text-gray-700 dark:text-gray-200 leading-relaxed">
+                {i18nService.t('svDupNotice').replace('{label}', dupNotice.label)}
+              </div>
+            </div>
+            <div className="mt-5 flex gap-2 justify-end">
+              <button type="button" onClick={() => setDupNotice(null)} className="px-4 py-2 rounded-lg text-sm border border-gray-300 dark:border-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800">{i18nService.t('svClose')}</button>
+              <button type="button" onClick={() => {
+                const p = dupNotice.platform; setDupNotice(null);
+                // 专业版窗口任务页:筛到这个平台、清掉状态 / 搜索,直接在当前页看到那条任务
+                if (proActive && mode === 'manage') { setProFilters((prev) => ({ ...prev, tasks: { plat: p, st: 'all', q: '' } })); setView({ kind: 'main', section: 'tasks', platform: p as PlatformId }); return; }
+                onSwitchToManage?.(p as any);
+              }} className="px-4 py-2 rounded-lg text-sm font-semibold bg-violet-500 text-white hover:bg-violet-600">{proActive ? SL('去看一看', '去看一看', 'Take a look') : i18nService.t('svGoViewEdit')}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 矩阵号互动涨粉向导(选账号 + 配额 + 频率) */}
+      {matrixWizardPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixTaskWizard
+              platformLabel={(() => {
+                const p = matrixWizardPlatform;
+                return p === 'douyin' ? '抖音' : p === 'kuaishou' ? '快手' : p === 'bilibili' ? '哔哩哔哩'
+                  : p === 'xhs' ? '小红书' : p === 'x' ? '推特' : p === 'binance' ? '币安广场'
+                  : p === 'youtube' ? 'YouTube' : p === 'tiktok' ? 'TikTok' : String(p);
+              })()}
+              platform={matrixWizardPlatform}
+              accounts={matrixAccounts}
+              accountsLoading={matrixAccountsLoading}
+              initialTask={matrixWizardTask}
+              onCancel={() => { setMatrixWizardPlatform(null); setMatrixWizardTask(null); }}
+              onSave={saveMatrixTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* 矩阵号自动回复粉丝向导(选创作者中心账号 + 引流尾巴 + 频率) */}
+      {matrixReplyPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixReplyFansWizard
+              platformLabel={(() => {
+                const p = matrixReplyPlatform;
+                return p === 'douyin' ? '抖音' : p === 'kuaishou' ? '快手' : p === 'bilibili' ? '哔哩哔哩'
+                  : p === 'xhs' ? '小红书' : p === 'shipinhao' ? '视频号' : p === 'toutiao' ? '头条号' : String(p);
+              })()}
+              platform={matrixReplyPlatform}
+              accounts={matrixReplyAccounts}
+              accountsLoading={matrixReplyAccountsLoading}
+              initialTask={matrixReplyTask}
+              onCancel={() => { setMatrixReplyPlatform(null); setMatrixReplyTask(null); }}
+              onSave={saveMatrixReplyFanTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* 矩阵号定向获客向导(选执行账号 + 获客模式/来源 + 触达配置 + 频率) */}
+      {matrixLeadPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixLeadEngageWizard
+              platformLabel={(() => {
+                const p = matrixLeadPlatform;
+                return p === 'tiktok' ? 'TikTok' : p === 'douyin' ? '抖音' : p === 'xhs' ? '小红书'
+                  : p === 'kuaishou' ? '快手' : p === 'bilibili' ? '哔哩哔哩' : p === 'youtube' ? 'YouTube' : p === 'x' ? '推特' : p === 'instagram' ? 'Instagram' : String(p);
+              })()}
+              platform={matrixLeadPlatform}
+              accounts={matrixLeadAccounts}
+              accountsLoading={matrixLeadAccountsLoading}
+              initialTask={matrixLeadTask}
+              onCancel={() => { setMatrixLeadPlatform(null); setMatrixLeadTask(null); }}
+              onSave={saveMatrixLeadTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* 矩阵号评论区点赞评论向导(作品链接 + 每号上限 → 多账号 → 频率) */}
+      {matrixCommentLikePlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixCommentLikeWizard
+              platformLabel={matrixCommentLikePlatform === 'tiktok' ? 'TikTok' : String(matrixCommentLikePlatform)}
+              platform={matrixCommentLikePlatform}
+              accounts={matrixCommentLikeAccounts}
+              accountsLoading={matrixCommentLikeAccountsLoading}
+              initialTask={matrixCommentLikeTask}
+              onCancel={() => { setMatrixCommentLikePlatform(null); setMatrixCommentLikeTask(null); }}
+              onPreview={previewMatrixCommentAssignments}
+              onSave={saveMatrixCommentLikeTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* 矩阵号文件夹定时发布向导(账号 → 各号时段 → 浮动/摘要) */}
+      {matrixFolderPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixFolderPostWizard
+              platformLabel={matrixFolderPlatform === 'douyin' ? '抖音' : String(matrixFolderPlatform)}
+              platform={matrixFolderPlatform}
+              accounts={matrixFolderAccounts}
+              accountsLoading={matrixFolderAccountsLoading}
+              initialTask={matrixFolderTask}
+              onCancel={() => { setMatrixFolderPlatform(null); setMatrixFolderTask(null); }}
+              onSave={saveMatrixFolderTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* 矩阵号批量拉黑向导(名单/关键词 → 多账号 → 频率) */}
+      {matrixBlockPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixBlockWizard
+              platformLabel={matrixBlockPlatform === 'douyin' ? '抖音' : String(matrixBlockPlatform)}
+              platform={matrixBlockPlatform}
+              accounts={matrixBlockAccounts}
+              accountsLoading={matrixBlockAccountsLoading}
+              initialTask={matrixBlockTask}
+              onCancel={() => { setMatrixBlockPlatform(null); setMatrixBlockTask(null); }}
+              onSave={saveMatrixBlockTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* 矩阵号视频无水印下载向导(单账号 + 粘贴链接 + 频率) */}
+      {matrixDownloadPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixVideoDownloadWizard
+              platformLabel={(() => { const p = matrixDownloadPlatform; return p === 'douyin' ? '抖音' : p === 'kuaishou' ? '快手' : p === 'bilibili' ? '哔哩哔哩' : p === 'tiktok' ? 'TikTok' : p === 'xhs' ? '小红书' : String(p); })()}
+              platform={matrixDownloadPlatform}
+              accounts={matrixDownloadAccounts}
+              accountsLoading={matrixDownloadAccountsLoading}
+              initialTask={matrixDownloadTask}
+              onCancel={() => { setMatrixDownloadPlatform(null); setMatrixDownloadTask(null); }}
+              onSave={saveMatrixDownloadTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* 矩阵号举报向导(白名单功能;链接+原因+描述 → 执行账号(可多选) → 合规确认) */}
+      {matrixReportPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixReportWizard
+              platformLabel={i18nService.t('rpBrand')}
+              platform={matrixReportPlatform}
+              accounts={matrixReportAccounts}
+              accountsLoading={matrixReportAccountsLoading}
+              initialTask={matrixReportTask}
+              onCancel={() => { setMatrixReportPlatform(null); setMatrixReportTask(null); }}
+              onSave={saveMatrixReportTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {matrixImageTextPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixImageTextWizard
+              platformLabel={(() => { const p = matrixImageTextPlatform; return p === 'douyin' ? '抖音' : p === 'xhs' ? '小红书' : p === 'shipinhao' ? '视频号' : p === 'toutiao' ? '头条号' : String(p); })()}
+              platform={matrixImageTextPlatform}
+              accounts={matrixImageTextAccounts}
+              accountsLoading={matrixImageTextAccountsLoading}
+              downloadAccounts={matrixImageTextDownloadAccounts}
+              initialTask={matrixImageTextTask}
+              onCancel={() => { setMatrixImageTextPlatform(null); setMatrixImageTextTask(null); }}
+              onSave={saveMatrixImageTextTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {matrixTweetPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixTweetPostWizard
+              platformLabel={(() => { const p = matrixTweetPlatform; return p === 'x' ? '推特' : String(p); })()}
+              platform={matrixTweetPlatform}
+              accounts={matrixTweetAccounts}
+              accountsLoading={matrixTweetAccountsLoading}
+              initialTask={matrixTweetTask}
+              onCancel={() => { setMatrixTweetPlatform(null); setMatrixTweetTask(null); }}
+              onSave={saveMatrixTweetTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {matrixBinancePlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixBinancePostWizard
+              platformLabel={platformDisplayName(String(matrixBinancePlatform))}
+              platform={matrixBinancePlatform}
+              accounts={matrixBinanceAccounts}
+              accountsLoading={matrixBinanceAccountsLoading}
+              initialTask={matrixBinanceTask}
+              onCancel={() => { setMatrixBinancePlatform(null); setMatrixBinanceTask(null); }}
+              onSave={saveMatrixBinanceTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {matrixFacebookPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixFacebookPostWizard
+              platformLabel={(() => { const p = matrixFacebookPlatform; return p === 'facebook' ? 'Facebook' : String(p); })()}
+              platform={matrixFacebookPlatform}
+              accounts={matrixFacebookAccounts}
+              accountsLoading={matrixFacebookAccountsLoading}
+              initialTask={matrixFacebookTask}
+              onCancel={() => { setMatrixFacebookPlatform(null); setMatrixFacebookTask(null); }}
+              onSave={saveMatrixFacebookTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {matrixRedditPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixRedditPostWizard
+              platformLabel={(() => { const p = matrixRedditPlatform; return p === 'reddit' ? 'Reddit' : String(p); })()}
+              platform={matrixRedditPlatform}
+              accounts={matrixRedditAccounts}
+              accountsLoading={matrixRedditAccountsLoading}
+              initialTask={matrixRedditTask}
+              onCancel={() => { setMatrixRedditPlatform(null); setMatrixRedditTask(null); }}
+              onSave={saveMatrixRedditTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {matrixInstagramPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixInstagramPostWizard
+              platformLabel={(() => { const p = matrixInstagramPlatform; return p === 'instagram' ? 'Instagram' : String(p); })()}
+              platform={matrixInstagramPlatform}
+              accounts={matrixInstagramAccounts}
+              accountsLoading={matrixInstagramAccountsLoading}
+              initialTask={matrixInstagramTask}
+              onCancel={() => { setMatrixInstagramPlatform(null); setMatrixInstagramTask(null); }}
+              onSave={saveMatrixInstagramTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {matrixRepostPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixBinanceRepostWizard
+              platformLabel={platformDisplayName(String(matrixRepostPlatform))}
+              platform={matrixRepostPlatform}
+              accounts={matrixRepostAccounts}
+              sourceAccounts={matrixRepostSourceAccounts}
+              accountsLoading={matrixRepostAccountsLoading}
+              initialTask={matrixRepostTask}
+              onCancel={() => { setMatrixRepostPlatform(null); setMatrixRepostTask(null); }}
+              onSave={saveMatrixRepostTask}
+            />
+          </div>
+        </div>
+      )}
+
+      {matrixViralPlatform && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-auto">
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <MatrixViralRewriteWizard
+              platformLabel={(() => { const p = matrixViralPlatform; return p === 'xhs' ? '小红书' : String(p); })()}
+              platform={matrixViralPlatform}
+              accounts={matrixViralAccounts}
+              accountsLoading={matrixViralAccountsLoading}
+              initialTask={matrixViralTask}
+              onCancel={() => { setMatrixViralPlatform(null); setMatrixViralTask(null); }}
+              onSave={saveMatrixViralTask}
+            />
+          </div>
+        </div>
+      )}
+
+
+      {/* Link-mode edit modal */}
+      {linkEditTask && (
+        <LinkModeEditModal
+          task={linkEditTask}
+          scenario={scenarios.find(s => s.id === linkEditTask.scenario_id) || null}
+          onCancel={closeLinkEdit}
+          onSaved={async () => {
+            closeLinkEdit();
+            await refreshAll();
+          }}
+        />
+      )}
+    </div>
+  );
+};
+
+// ─── Link-mode edit modal ────────────────────────────────────────────────
+// Dedicated editor for tasks created via 🔗 指定链接 flow. Takes URL list
+// + auto_upload toggle — deliberately does NOT ask for track / keywords /
+// persona, which would be meaningless for link-mode tasks.
+
+const LinkModeEditModal: React.FC<{
+  task: Task;
+  scenario: Scenario | null;
+  onCancel: () => void;
+  onSaved: () => void | Promise<void>;
+}> = ({ task, scenario, onCancel, onSaved }) => {
+  const isZh = i18nService.currentLanguage === 'zh' || i18nService.currentLanguage === 'zh-TW';
+  const initialUrls: string[] = (task as any).urls || [];
+  const [linksText, setLinksText] = useState(initialUrls.join('\n'));
+  const [autoUpload, setAutoUpload] = useState<boolean>((task as any).auto_upload !== false);
+  const [isBlueV, setIsBlueV] = useState<boolean>(!!(task as any).is_blue_v);
+  const [submitting, setSubmitting] = useState(false);
+
+  // v4.25.5: 平台感知。之前硬编码"小红书",x_link_rewrite / binance_from_x_link
+  // 任务点编辑也走这个 modal,但显示文案 / URL 校验 / 上传去向都按 XHS 来 →
+  // x.com URL 保存被 reject;且 Twitter 任务缺 is_blue_v 选项,AI 字数走默认。
+  const platform: 'xhs' | 'x' | 'binance' = scenario?.platform === 'x' ? 'x'
+    : scenario?.platform === 'binance' ? 'binance'
+    : 'xhs';
+  const isX = platform === 'x';
+  const isBinance = platform === 'binance';
+  // 部分 binance 链接搬运任务粘的也是 x.com 链接(从推特搬到币安),所以
+  // binance + x 都接受 x.com / twitter.com。
+  const acceptsTwitterUrl = isX || isBinance;
+  const platformLabel = isX ? (isZh ? '推特' : 'X (Twitter)')
+    : isBinance ? (isZh ? '币安广场' : 'Binance Square')
+    : (isZh ? '小红书' : 'XHS');
+  // v6.x: XHS/抖音/TikTok 视频无水印下载任务都带 urls[] → openWizardEdit 把它们路
+  //   由到这个 link 编辑 modal,但它们不是"指定链接 AI 仿写":文案/去向都不同(纯下
+  //   载,无 AI、无上传)。三个平台共用同一个分支,只在 label + 域名校验上分流。
+  const isVideoDownload = scenario?.id === 'xhs_video_download'
+    || scenario?.id === 'douyin_video_download'
+    || scenario?.id === 'tiktok_video_download'
+    || scenario?.id === 'kuaishou_video_download'
+    || scenario?.id === 'bilibili_video_download';
+  const vdPlatform: 'xhs' | 'douyin' | 'tiktok' | 'kuaishou' | 'bilibili' = scenario?.id === 'douyin_video_download'
+    ? 'douyin'
+    : scenario?.id === 'tiktok_video_download'
+    ? 'tiktok'
+    : scenario?.id === 'kuaishou_video_download'
+    ? 'kuaishou'
+    : scenario?.id === 'bilibili_video_download'
+    ? 'bilibili'
+    : 'xhs';
+  const vdLabel = vdPlatform === 'douyin'
+    ? (isZh ? '抖音' : 'Douyin')
+    : vdPlatform === 'tiktok'
+    ? 'TikTok'
+    : vdPlatform === 'kuaishou'
+    ? (isZh ? '快手' : 'Kuaishou')
+    : vdPlatform === 'bilibili'
+    ? (isZh ? '哔哩哔哩' : 'Bilibili')
+    : (isZh ? '小红书' : 'XHS');
+  // v4.28.x: sourceLabel 之前用在描述文案里("粘贴 1-3 个 ${sourceLabel} 原文链接"),
+  // 现在描述按 acceptsTwitterUrl 直接走两个固定文案,不再需要 sourceLabel 占位 ——
+  // TS strict 模式抛 unused 编译错(打包失败),直接移除。
+
+  const validate = (text: string): { ok: string[]; err: string | null } => {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length < 1) return { ok: [], err: i18nService.t('svErrPasteAtLeast1') };
+    // v4.28.x: 跟 ConfigWizard 创建流程对齐 —— 创建那边一直是 1-5,这里编辑 modal
+    // 之前卡在 1-3,导致用户在编辑里加第 4 个 URL 直接被拒。统一为 1-5。
+    // v6.x: 上限从 5 提到 20。用户反馈"一次想批 10-20 条爆款链路",5 个太紧。
+    if (lines.length > 20) return { ok: [], err: i18nService.t('svErrMax20') };
+    for (const l of lines) {
+      if (isVideoDownload) {
+        // 按视频下载场景分平台校验:抖音(含短链 v.douyin.com / iesdouyin)、
+        // TikTok(含 vt/vm.tiktok.com 短链)、小红书(含 xhslink 短链)。
+        if (vdPlatform === 'douyin') {
+          if (!/^https?:\/\/([\w-]+\.)?(douyin|iesdouyin)\.com\//i.test(l)) {
+            return { ok: [], err: i18nService.t('svErrNotDouyinLink') + l.slice(0, 80) };
+          }
+        } else if (vdPlatform === 'tiktok') {
+          if (!/^https?:\/\/([\w-]+\.)?tiktok\.com\//i.test(l)) {
+            return { ok: [], err: i18nService.t('svErrNotTiktokLink') + l.slice(0, 80) };
+          }
+        } else if (vdPlatform === 'kuaishou') {
+          if (!/^https?:\/\/([\w-]+\.)?(kuaishou|chenzhongtech)\.com\//i.test(l)) {
+            return { ok: [], err: i18nService.t('svErrNotKuaishouLink') + l.slice(0, 80) };
+          }
+        } else if (vdPlatform === 'bilibili') {
+          if (!/^https?:\/\/([\w-]+\.)?(bilibili\.com|b23\.tv)\//i.test(l)) {
+            return { ok: [], err: i18nService.t('svErrNotBilibiliLink') + l.slice(0, 80) };
+          }
+        } else {
+          if (!/^https?:\/\/(www\.)?xiaohongshu\.com\//i.test(l) && !/^https?:\/\/xhslink\.com\//i.test(l)) {
+            return { ok: [], err: i18nService.t('svErrNotXhsLink') + l.slice(0, 80) };
+          }
+        }
+      } else if (acceptsTwitterUrl) {
+        if (!/^https?:\/\/(www\.)?(twitter|x)\.com\/.+\/status\/\d+/i.test(l)) {
+          return { ok: [], err: i18nService.t('svErrNotValidTweetLink') + l.slice(0, 80) };
+        }
+      } else {
+        if (!/^https?:\/\/(www\.)?xiaohongshu\.com\//i.test(l) && !/^https?:\/\/xhslink\.com\//i.test(l)) {
+          return { ok: [], err: i18nService.t('svErrNotXhsLink') + l.slice(0, 80) };
+        }
+      }
+    }
+    return { ok: lines, err: null };
+  };
+
+  const handleSubmit = async () => {
+    if (submitting) return;
+    const { ok, err } = validate(linksText);
+    if (err) { alert(err); return; }
+    setSubmitting(true);
+    try {
+      const patch: any = {
+        urls: ok,
+        daily_count: ok.length,
+        auto_upload: autoUpload,
+        active: true,
+        enabled: true,
+      };
+      if (isX) patch.is_blue_v = isBlueV;
+      await scenarioService.updateTask(task.id, patch);
+      await onSaved();
+    } catch (e) {
+      alert(i18nService.t('svSaveFailed') + String(e).slice(0, 120));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+    >
+      <div
+        className="w-full max-w-2xl rounded-2xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 shadow-2xl p-6"
+      >
+        <h3 className="text-lg font-bold dark:text-white mb-2">
+          {isVideoDownload
+            ? '⬇️ ' + i18nService.t('svVideoLinksHeading').replace('{platform}', vdLabel)
+            : '🔗 ' + i18nService.t('svEditLinkTask')}
+        </h3>
+        <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+          {isVideoDownload
+            ? i18nService.t('svDescVideoDownload').replace('{platform}', vdLabel)
+            : acceptsTwitterUrl
+            ? i18nService.t('svDescTweetRewrite')
+            : i18nService.t('svDescXhsRewrite')}
+        </p>
+        <label className="text-sm font-medium dark:text-gray-200 mb-2 block">
+          {isVideoDownload ? i18nService.t('svVideoLinks') : i18nService.t('svSourceUrls')}
+        </label>
+        <textarea
+          value={linksText}
+          onChange={e => setLinksText(e.target.value)}
+          rows={8}
+          className="w-full rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 py-2 text-sm font-mono dark:text-white focus:outline-none focus:ring-2 focus:ring-purple-500/50 resize-y min-h-[200px] break-all"
+          disabled={submitting}
+        />
+
+        {/* v4.25.5: 推特账号类型(蓝V) — 仅 X link rewrite 显示。决定 AI 生成
+            上限(普通号 ≤140 字硬限,蓝V 自由短/中/长)。 */}
+        {isX && (
+          <div className="mt-4">
+            <label className="text-sm font-medium dark:text-gray-200 mb-2 block">
+              {i18nService.t('svTwitterAccountType')}
+            </label>
+            <div
+              className={`flex items-start gap-3 rounded-xl border px-4 py-3 cursor-pointer transition-colors ${
+                isBlueV ? 'border-blue-500 bg-blue-500/10' : 'border-gray-300 dark:border-gray-700 hover:border-blue-500/50'
+              }`}
+              onClick={() => setIsBlueV(!isBlueV)}
+            >
+              <input
+                type="checkbox"
+                checked={isBlueV}
+                onChange={e => setIsBlueV(e.target.checked)}
+                onClick={e => e.stopPropagation()}
+                className="mt-0.5 h-4 w-4 accent-blue-500 cursor-pointer"
+                disabled={submitting}
+              />
+              <div className="flex-1 text-sm">
+                <div className="font-medium dark:text-white">
+                  {i18nService.t('svIsBlueV')}
+                </div>
+                <div className="mt-1 text-[11px] text-gray-500 dark:text-gray-400 leading-relaxed">
+                  <>
+                        <strong className="text-blue-500">{i18nService.t('svBlueVCheckedLabel')}</strong>{i18nService.t('svBlueVCheckedDesc')}<br/>
+                        <strong className="text-gray-500">{i18nService.t('svBlueVUncheckedLabel')}</strong>{i18nService.t('svBlueVUncheckedDesc1')}<strong>{i18nService.t('svBlueVUncheckedDesc2')}</strong>
+                      </>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {!isVideoDownload && (<>
+        <label className="text-sm font-medium dark:text-gray-200 mt-4 mb-2 block">
+          {i18nService.t('svAfterGeneration')}
+        </label>
+        <div className="space-y-2">
+          <label className={`flex items-start gap-2 p-3 rounded-lg border cursor-pointer transition-colors ${autoUpload ? 'border-purple-500 bg-purple-500/5' : 'border-gray-300 dark:border-gray-700'}`}>
+            <input type="radio" name="link_edit_auto_upload" checked={autoUpload} onChange={() => setAutoUpload(true)} className="mt-0.5" disabled={submitting} />
+            <div className="flex-1 text-xs leading-relaxed">
+              <div className="font-semibold dark:text-white mb-0.5">
+                {i18nService.t('svAutoPublishTo').replace('{platform}', platformLabel)}
+              </div>
+              <div className="text-gray-500 dark:text-gray-400">
+                {i18nService.t('svAutoPublishDesc')}
+              </div>
+            </div>
+          </label>
+          <label className={`flex items-start gap-2 p-3 rounded-lg border cursor-pointer transition-colors ${!autoUpload ? 'border-purple-500 bg-purple-500/5' : 'border-gray-300 dark:border-gray-700'}`}>
+            <input type="radio" name="link_edit_auto_upload" checked={!autoUpload} onChange={() => setAutoUpload(false)} className="mt-0.5" disabled={submitting} />
+            <div className="flex-1 text-xs leading-relaxed">
+              <div className="font-semibold dark:text-white mb-0.5">
+                {i18nService.t('svGenerateOnly')}
+              </div>
+              <div className="text-gray-500 dark:text-gray-400">
+                {i18nService.t('svGenerateOnlyDesc')}
+              </div>
+            </div>
+          </label>
+        </div>
+        </>)}
+
+        <div className="flex gap-2 mt-4">
+          <button
+            type="button"
+            onClick={() => !submitting && onCancel()}
+            disabled={submitting}
+            className="flex-1 py-2.5 rounded-lg text-sm font-medium border border-gray-300 dark:border-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50"
+          >
+            {i18nService.t('svCancel')}
+          </button>
+          <button
+            type="button"
+            onClick={handleSubmit}
+            disabled={submitting}
+            className="flex-1 py-2.5 rounded-lg text-sm font-semibold bg-purple-500 text-white hover:bg-purple-600 disabled:opacity-50"
+          >
+            {submitting
+              ? i18nService.t('svSaving')
+              : i18nService.t('svSave')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default ScenarioView;

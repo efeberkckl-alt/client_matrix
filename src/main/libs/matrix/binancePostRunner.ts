@@ -1,0 +1,550 @@
+import { runAutomationScript } from './kernelPool';
+/**
+ * 矩阵「币安广场自动发帖」运行时(目前仅币安广场)—— 让一批账号在各自指纹内核里各自抓 web3 资讯、
+ * AI 原创一条币安广场图文并发布。
+ *
+ * 复用后端 fork 的 binance_post orchestrator(单账号单条:取材[web3 资讯] → Pro 深度创作 → 可选配图
+ * → 发到币安广场),这里提供它需要的整套 ctx,把浏览器命令路由到该账号的 CDP(matrixCmd),
+ * AI/配图调后端、计费走 AI token(发帖本身不收平台费,同旧 binance_square_post_creator / x_post)。
+ *
+ * 结构与 tweetPostRunner 对齐(onLog/onItem/onTargets/signal → EngageReport),sidecar 进度聚合零改动复用。
+ * 与 x_post 的差异:登录预检导航币安广场首页;仅 web3 资讯模式(无 free / 无蓝V / 无各号参考文案);
+ * 每号身份=人设/赛道/关键词,加 withImage/language/autoPublish 全局配置。
+ *
+ * ⚠️ 币安需 VPN/代理,首屏慢;orchestrator 的编辑器写入/配图上传/发文按钮在指纹内核 CDP 上第一次跑
+ *    可能要据真机反馈微调(沿用旧 binance_square_post_creator 的 selector,生产已验证)。
+ */
+
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { coworkLog } from '../coworkLogger';
+import { acquireKernel, releaseKernel, isKernelLeaseCurrent, kernelNavigate, checkKernelLogin, NO_KERNEL_ERROR } from './kernelPool';
+import { inspectHoldMs } from './inspectHold';
+import { installedKernelPath } from './kernelInstaller';
+import { matrixCmd } from './cdpCommands';
+import { getAccount, setAccountStatus, accountBadgeLabel, matrixGroupTitle, markAccountAlive, platformKey } from './accountManager';
+import { trackIdFromGroup } from './trackPresets';
+import { promptReloginForExpiredAccount } from './reloginPrompt';
+import { getNoobClawAuthToken } from '../claudeSettings';
+import * as newsUsageStore from '../scenario/newsUsageStore';
+import type { EngageItemResult, EngageReport } from './engageRunner';
+import type { BinancePostConfig } from './types';
+
+const DEFAULT_BASE_URL = 'https://api.noobclaw.com';
+function baseUrl(): string { return process.env.NOOBCLAW_API_BASE_URL || DEFAULT_BASE_URL; }
+function sleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
+/** 可中断等待:点停止后立即返回,不再干等整段(错峰 3-15s 是任务停不下来的主因)。 */
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const t = setTimeout(() => { cleanup(); resolve(); }, ms);
+    const onAbort = () => { cleanup(); resolve(); };
+    const cleanup = () => { clearTimeout(t); try { signal?.removeEventListener('abort', onAbort); } catch { /* ignore */ } };
+    try { signal?.addEventListener('abort', onAbort, { once: true }); } catch { /* ignore */ }
+  });
+}
+function randInt(min: number, max: number): number {
+  const lo = Math.min(min, max), hi = Math.max(min, max);
+  return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
+// 发帖登录态校验主页。binance 走广场;FB/Reddit/IG 复用本 runner(sidecar 路由),
+// 各自导航自家主页做登录预检(对齐 engageRunner PLATFORM_HOME),否则全落币安广场→判据失败拿失效号空跑。
+const BINANCE_LOGIN_HOME: Record<string, string> = {
+  binance: 'https://www.binance.com/square',
+  facebook: 'https://www.facebook.com/',
+  reddit: 'https://www.reddit.com/',
+  instagram: 'https://www.instagram.com/',
+  // 交易所广场三家(各自独立平台,共用本 runner —— 剧本 id 走 `${platform}_post` 自动对上)。
+  gate: 'https://www.gate.com/post',
+  bitget: 'https://www.bitget.com/insights',
+  bybit: 'https://www.bybit.com/social/',
+  okx: 'https://www.okx.com/orbit',
+};
+// 日志用平台名 —— 本 runner 服务 8 个平台,提示语不能写死「币安」(用户实拍:IG 任务弹「币安登录态失效」)。
+const PLATFORM_LABEL: Record<string, string> = {
+  binance: '币安广场', facebook: 'Facebook', reddit: 'Reddit', instagram: 'Instagram',
+  gate: 'Gate广场', bitget: 'Bitget Insight', bybit: 'Bybit Byx', okx: 'OKX星球',
+};
+
+export interface BinancePostTaskOptions {
+  platform: string;                 // 目前 binance
+  taskId?: string;
+  accountIds: string[];
+  config: BinancePostConfig;        // 发帖配置(配图/语言/发布)
+  concurrency?: number;
+  jitterMinMs?: number; jitterMaxMs?: number;
+  kernelPath?: string;
+  authToken?: string;
+  signal?: AbortSignal;
+  onLog?: (accountId: string, msg: string) => void;
+  onItem?: (item: EngageItemResult) => void;
+  onTargets?: (accountId: string, targets: { like?: number; follow?: number; comment?: number }) => void;
+}
+
+// ── scenario pack 下发(/api/matrix/scenarios/binance_post)──
+async function fetchPack(id: string): Promise<any | null> {
+  try {
+    const res = await fetch(`${baseUrl()}/api/matrix/scenarios/${id}`, { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    coworkLog('WARN', 'binancePostRunner', 'fetch pack failed', { err: String(e) });
+    return null;
+  }
+}
+
+// ── aiCall(同 tweetPostRunner 口径:'__raw__' → system=prompt / user=JSON)──
+function makeAiCall(authToken: string | undefined, onCost?: (credits: number, usd: number) => void, signal?: AbortSignal) {
+  return async (promptNameOrRaw: string, promptOrInput: any, rawInput?: string, opts?: any) => {
+    const prompt = promptNameOrRaw === '__raw__' ? String(promptOrInput) : String(promptOrInput || '');
+    const userMessage = promptNameOrRaw === '__raw__'
+      ? String(rawInput || '')
+      : (typeof promptOrInput === 'string' ? promptOrInput : JSON.stringify(promptOrInput));
+    if (!authToken) throw new Error('AI_NOT_CONFIGURED');
+    const body: any = {
+      model: (opts && opts.model) || 'noobclawai-chat',
+      messages: [{ role: 'system', content: prompt }, { role: 'user', content: userMessage }],
+      stream: false, max_tokens: (opts && opts.max_tokens) || 3072,
+    };
+    const wantJson = opts?.expectJson !== false;
+    if (wantJson && (/json/i.test(prompt) || /json/i.test(userMessage))) body.response_format = { type: 'json_object' };
+    else if (!wantJson) body.response_format = { type: 'text' };
+    const res = await fetch(`${baseUrl()}/api/ai/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+      body: JSON.stringify(body),
+      signal,
+    });
+    const data: any = await res.json().catch(() => ({}));
+    // 后端非 2xx(余额不足 402 / 内容审核 / 限流 / 5xx)必须抛错,不能把 {error,message}
+    //   当成空 content 静默吞掉 —— 否则上层只看到空串误报「返回空」,看不出是余额不足。
+    if (!res.ok) {
+      const beMsg = String((data && (data.message || data.error)) || ('http_' + res.status));
+      if (res.status === 402 || /INSUFFICIENT_TOKENS|insufficient|余额/i.test(beMsg)) throw new Error('余额不足,请充值后重试 (' + beMsg + ')');
+      throw new Error('AI 请求失败 ' + res.status + ': ' + beMsg);
+    }
+    try {
+      const aiCredits = Number(data?._noobclaw?.billableTokens) || 0;
+      const aiUsd = Number(data?._noobclaw?.costUsd) || 0;
+      if ((aiCredits > 0 || aiUsd > 0) && onCost) onCost(aiCredits, aiUsd);
+    } catch { /* ignore */ }
+    const content = data?.choices?.[0]?.message?.content ?? '';
+    if (opts?.expectJson === false) return content;
+    try { return JSON.parse(content); } catch { return content; }
+  };
+}
+
+// 多平台通用验证码检测(同 tweetPostRunner)。
+const CAPTCHA_DETECT_EXPR = "(function(){try{"
+  + "if(document.querySelector('#captcha_container,#captcha-verify-image,[id*=\"captcha\" i][class*=\"verify\" i],[class*=\"captcha_verify\" i],[class*=\"geetest\" i]'))return true;"
+  + "var b=document.body?(document.body.innerText||'').slice(0,3000):'';"
+  + "if(/Verify you are human|请完成安全验证|向右滑动|拖动滑块/i.test(b))return true;"
+  + "return false;}catch(e){return false;}})()";
+
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+
+// holdAfter=false:多条循环的中间轮 —— 外层已用引用计数吊着窗口(见 runBinancePostTask),
+// 这里不用再留 20s 检查期(窗口反正不关,留了纯属拖慢),也不真关窗(closeKernel 只把计数 -1)。
+// 发帖平台费(2026-08-30):发布成功后按条扣 post 费。失败退避重试 3 次;余额不足不重试。
+async function chargePostAction(authToken: string | undefined, platform: string): Promise<{ ok: boolean; charged?: number; cost_usd?: number; reason?: string }> {
+  if (!authToken) return { ok: false, reason: 'auth_missing' };
+  const once = async () => {
+    try {
+      const res = await fetch(`${baseUrl()}/api/charge/action`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+        body: JSON.stringify({ action_type: 'post', platform, ref_id: null }),
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, reason: String(data?.error || `http_${res.status}`) };
+      return { ok: true, charged: Number(data?.charged) || 0, cost_usd: Number(data?.cost_usd) || 0 };
+    } catch { return { ok: false, reason: 'network_error' }; }
+  };
+  let chg = await once();
+  for (let ci = 1; ci < 4 && !chg.ok && !/insufficient|余额/i.test(String(chg.reason || '')); ci++) { await sleep(3000 * ci); chg = await once(); }
+  return chg;
+}
+async function runOne(opts: BinancePostTaskOptions, pack: any, accountId: string, holdAfter = true, chargeFatal?: { reason: string }): Promise<EngageItemResult> {
+  const acc = getAccount(accountId);
+  const cfg = opts.config;
+  const log = (m: string) => { try { opts.onLog?.(accountId, m); } catch { /* ignore */ } };
+  if (opts.signal?.aborted) { log('⏹ 已停止,跳过本号'); return { accountId, state: 'skipped', reason: 'aborted' }; }
+  if (!acc) { log('❌ 跳过:账号不存在'); return { accountId, state: 'skipped', reason: 'account_not_found' }; }
+  if (acc.platform !== opts.platform) { log('❌ 跳过:账号平台与任务不符'); return { accountId, state: 'skipped', reason: 'platform_mismatch' }; }
+  if (acc.status === 'banned' || acc.status === 'limited') { log('❌ 跳过:账号状态为 ' + acc.status); return { accountId, state: 'skipped', reason: 'account_' + acc.status }; }
+
+  await abortableSleep(randInt(opts.jitterMinMs ?? 3000, opts.jitterMaxMs ?? 15000), opts.signal); // 错峰(可中断:停止立即结束)
+
+  const counts = { like: 0, follow: 0, comment: 0, post: 0 };
+  if (chargeFatal && chargeFatal.reason) { return { accountId, state: 'skipped', counts, reason: 'charge_failed:' + chargeFatal.reason }; }
+  let chargedCredits = 0, chargedUsd = 0;
+  const authToken = opts.authToken || getNoobClawAuthToken() || undefined;
+  let finished: { status: string; error?: string } | null = null;
+  // launch 失败时 kernelPool 已回退本次的引用计数/使用锁,finally 不能再 closeKernel(会错关/错放别的流程)。
+  let kernelReceipt: Awaited<ReturnType<typeof acquireKernel>> | undefined;
+
+  try {
+    log('启动指纹内核');
+    kernelReceipt = await acquireKernel({
+      signal: opts.signal,
+      accountId, kernelPath: opts.kernelPath, kernelVersion: acc.kernelVersion,
+      userDataDir: acc.userDataDir, fingerprint: acc.fingerprint, proxy: acc.proxy,
+      label: accountBadgeLabel(acc),
+      groupTitle: matrixGroupTitle(opts.platform, opts.taskId),
+    });
+    if (!isKernelLeaseCurrent(kernelReceipt)) throw Error('navigation:cancelled');
+    setAccountStatus(accountId, 'running');
+    // 先导航到本平台首页校验登录态(对齐 feedback_matrix_task_login_precheck)。
+    await kernelNavigate(accountId, BINANCE_LOGIN_HOME[opts.platform] || BINANCE_LOGIN_HOME.binance);
+    await sleep(2500);
+    let loggedIn: boolean | null = null;
+    try { loggedIn = await checkKernelLogin(accountId, platformKey(acc)); } catch { loggedIn = null; }
+    if (!isKernelLeaseCurrent(kernelReceipt)) throw Error('navigation:cancelled');
+    if (loggedIn === null) {
+      setAccountStatus(accountId, 'limited', '登录状态未确认，请检查网络或页面后重试');
+      log('⚠️ 登录检测未完成，本轮跳过，保留登录资料');
+      return { accountId, state: 'skipped', reason: 'login_unknown' };
+    }
+    if (!loggedIn) {
+      setAccountStatus(accountId, 'login_required');
+      log(`⚠️ ${PLATFORM_LABEL[opts.platform] || opts.platform}登录态失效/未关联,弹窗扫码重连(其它号照跑)`);
+      if (!opts.signal?.aborted) { try { await promptReloginForExpiredAccount(accountId); } catch { /* ignore */ } }
+      return { accountId, state: 'skipped', reason: 'login_expired' };
+    }
+    markAccountAlive(accountId);
+
+    // 本号 task —— withImage/language/autoPublish 走全局 config;persona/track/keywords 用账号已配身份。
+    // 仅 web3 资讯模式(orchestrator 强制),无 mode / is_blue_v / reference。
+    const accKeywords = Array.isArray(acc.keywords) ? acc.keywords.filter((k) => String(k || '').trim()) : [];
+    // 本地图模式:读盘转 base64 传给 orchestrator 直接附到帖子(跳过 源图/AI 生图)。
+    const localImagePayload: Array<{ base64: string; mimeType: string; name: string }> = [];
+    if ((cfg as any).imageMode === 'local') {
+      const paths: string[] = Array.isArray((cfg as any).localImages) ? (cfg as any).localImages : [];
+      for (const p of paths.slice(0, 6)) {
+        try {
+          const st = fs.statSync(p);
+          if (!st.isFile() || st.size > 10 * 1024 * 1024) { log(`⚠️ 本地图跳过(不存在或超10MB):${path.basename(p)}`); continue; }
+          const ext = path.extname(p).toLowerCase().replace('.', '');
+          const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif' : 'image/jpeg';
+          localImagePayload.push({ base64: fs.readFileSync(p).toString('base64'), mimeType: mime, name: path.basename(p) });
+        } catch { log(`⚠️ 本地图读取失败,跳过:${path.basename(p)}`); }
+      }
+      if (localImagePayload.length === 0) {
+        log('❌ 跳过:本地图模式但一张图都读不到(文件被移动/删除?重新编辑任务选图)');
+        return { accountId, state: 'skipped', reason: 'no_local_images' };
+      }
+      log(`📁 本地图就绪:${localImagePayload.length} 张`);
+    }
+    const task: any = {
+      id: accountId,
+      with_image: !!cfg.withImage || localImagePayload.length > 0,
+      local_images: localImagePayload.length > 0 ? localImagePayload : undefined,
+      language: cfg.language || 'mixed',
+      auto_upload: !!cfg.autoPublish,
+      persona: acc.persona || '',
+      track: acc.track || '',
+      keywords: accKeywords,
+    };
+    // facebook_post / reddit_post 复用本 runner:cfg 带数据源字段(binance 无 → orchestrator 默认 news)。
+    if ((cfg as any).sourceKind) {
+      task.source_kind = (cfg as any).sourceKind;
+      task.source = (cfg as any).source || '';
+      task.cat_key = (cfg as any).catKey || '';
+    }
+    // 多选数据源(新任务):orchestrator 每轮从 task.sources 随机挑 1 个;旧 orchestrator 忽略此字段,
+    // 走上面的单选字段(向导已把第一个选中源写回单选字段兜底)。
+    if (Array.isArray((cfg as any).sources) && (cfg as any).sources.length) task.sources = (cfg as any).sources;
+    // 「仅账号赛道相关」(默认开):FB/IG/Reddit 有数据源 → 传本号赛道 id,取材按 track 过滤;binance(无 sourceKind)/关开关则空。
+    if ((cfg as any).sourceKind && (cfg as any).sourceTrackMatch !== false) task.track_id = trackIdFromGroup(acc.group);
+    if ((cfg as any).subreddit) task.subreddit = (cfg as any).subreddit; // reddit_post 目标 subreddit
+    // 参考文案模式(FB/Reddit/IG,2026-07-10):contentSource='reference' → orchestrator 跳过数据源取材,
+    //   按本号身份 + 本号参考文案(references[accountId],可空)自由创作。binance_post 无此字段 → 恒数据源模式,不受影响。
+    if ((cfg as any).contentSource === 'reference') {
+      task.content_source = 'reference';
+      const refMap = ((cfg as any).references || {}) as Record<string, string>;
+      task.reference = String(refMap[accountId] || '').trim();
+    }
+
+    const onAiCost = (credits: number, usd: number) => {
+      chargedCredits += credits; chargedUsd += usd;
+      try { opts.onItem?.({ accountId, state: 'success', counts: { ...counts }, chargedCredits, chargedUsd }); } catch { /* ignore */ }
+    };
+    const aiCall = makeAiCall(authToken, onAiCost, opts.signal);
+    const browserFn: any = (command: string, params?: any, timeout?: number) => matrixCmd(accountId, command, params, timeout);
+    const taskTab: any = {
+      id: 'main', browser: browserFn,
+      navigate: async (url: string) => { await kernelNavigate(accountId, url); },
+      scroll: (amount?: number) => matrixCmd(accountId, 'scroll', { amount: amount || randInt(2, 4) }),
+    };
+
+    // apiCall:/api/scenario/fresh-news(GET 带 query)+ /api/image/generate(POST)+ /api/image/status/:id(GET)。
+    const apiCall = async (endpoint: string, body?: any) => {
+      const res = await fetch(`${baseUrl()}${endpoint}`, {
+        method: body == null ? 'GET' : 'POST',
+        headers: { 'Content-Type': 'application/json', ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}) },
+        body: body == null ? undefined : JSON.stringify(body),
+        signal: opts.signal,
+      });
+      const data = await res.json().catch(() => ({}));
+      // 累加 AI 生图 token/费用到「本次消耗」(imageGen 走通用 apiCall 不经 onCost,原漏此大头;
+      //   sync /generate 与 async /status(done) 都返 token_cost+_noobclaw.costUsd,仅 done 时>0 天然不重复)。
+      try {
+        const imgTokens = Number((data as any)?.token_cost) || 0;
+        if (imgTokens > 0) { chargedCredits += imgTokens; chargedUsd += Number((data as any)?._noobclaw?.costUsd) || 0; }
+      } catch { /* non-fatal */ }
+      return data;
+    };
+
+    const ctx: any = {
+      task, config: pack?.config || {}, manifest: pack?.manifest || {},
+      appLocale: cfg.language === 'en' ? 'en' : 'zh',
+      aborted: () => !!opts.signal?.aborted,
+      browser: browserFn,
+      navigate: (url: string) => kernelNavigate(accountId, url),
+      scroll: (amount?: number) => matrixCmd(accountId, 'scroll', { amount: amount || randInt(2, 4) }),
+      openTab: async (o: any) => { if (o?.url) { await kernelNavigate(accountId, o.url); await sleep(1500); } return taskTab; },
+      getTaskTab: async () => taskTab,
+      report: (m: string) => { log(m); try { coworkLog('INFO', 'binancePost', `[${accountId}] ${m}`); } catch { /* ignore */ } },
+      stepStart: (s: number) => log('▶ 步骤 ' + s),
+      stepLog: (_s: number, _st: string, m: string) => log(m),
+      stepDone: (_s: number) => {},
+      startAction: (..._a: any[]) => {},
+      stepResetAll: () => {},
+      setActionTargets: (t: any) => { if (typeof t?.post === 'number') log(`🎯 本号目标:发 ${t.post} 条`); },
+      addActionCount: (type: string, n: number) => {
+        if (type === 'post') { counts.post += Number(n) || 0; log(`✅ 已发布 ${counts.post} 条`); }
+        try { opts.onItem?.({ accountId, state: 'success', counts: { ...counts }, chargedCredits, chargedUsd }); } catch { /* ignore */ }
+      },
+      finish: (status: string, error?: string) => { finished = { status, error }; },
+      aiCall,
+      apiCall,
+      // 选题查重(照搬老 client 的 phaseRunner:ctx.newsUsage,binance_square_post_creator 一直用的就是它)。
+      //   isUsed(title)  → 这个钱包在这个 scenario 下是不是已经拿这篇资讯发过
+      //   markUsed(title) → 发布成功后记一笔
+      // 🚨 矩阵这边一直没挂这个,所以 fresh-news 每轮都可能返回同一篇 —— 选题重复的根因。
+      //   scenarioId 取 manifest.id(bitget_post / bybit_post / …各家独立)→ 同一条资讯
+      //   每个交易所各能发一次,跟搬运「每个发布平台各记各的」口径一致。
+      newsUsage: {
+        isUsed: (title: string): boolean => {
+          const scenarioId = String(pack?.manifest?.id || '');
+          if (!scenarioId) return false;
+          try { return newsUsageStore.isNewsUsed(scenarioId, title); } catch { return false; }
+        },
+        markUsed: (title: string): void => {
+          const scenarioId = String(pack?.manifest?.id || '');
+          if (!scenarioId) return;
+          try { newsUsageStore.markNewsUsed(scenarioId, title); } catch { /* ignore */ }
+        },
+      },
+      // 仅本地模式落盘(可选;失败不阻塞)。
+      saveDrafts: async (arr: any[]) => {
+        try {
+          const base = process.env.NOOBCLAW_MATRIX_DIR || path.join(os.homedir(), 'NoobClaw', 'matrix');
+          const draftsBase = path.join(base, 'drafts', opts.platform || acc.platform || 'binance', accountId);
+          let lastDir = '';
+          for (const d of (Array.isArray(arr) ? arr : [])) {
+            const rawId = String(d?.source_post?.external_post_id || `draft_${Date.now()}`);
+            const safeId = rawId.replace(/[\\/:*?"<>|]/g, '_').slice(0, 120);
+            const dir = path.join(draftsBase, safeId);
+            fs.mkdirSync(dir, { recursive: true });
+            if (d?.text) { try { fs.writeFileSync(path.join(dir, 'text.txt'), String(d.text), 'utf8'); } catch { /* ignore */ } }
+            fs.writeFileSync(path.join(dir, 'draft.json'), JSON.stringify(d, null, 2), 'utf8');
+            const imgs = Array.isArray(d?.images) ? d.images : [];
+            for (let i = 0; i < imgs.length; i++) {
+              const img = imgs[i];
+              if (img && img.base64) {
+                const ext = String(img.mimeType || '').indexOf('png') >= 0 ? 'png' : 'jpg';
+                try { fs.writeFileSync(path.join(dir, `img_${i}.${ext}`), Buffer.from(img.base64, 'base64')); } catch { /* ignore */ }
+              }
+            }
+            lastDir = dir;
+          }
+          return { ok: true, dir: lastDir };
+        } catch (err: any) {
+          return { ok: false, reason: String(err?.message || err) };
+        }
+      },
+      getPrompt: (name: string) => { const t = pack?.prompts?.[name]; if (!t) throw new Error('Missing prompt: ' + name); return t; },
+      appendKeywords: (_arr: string[]) => { /* matrix: no-op */ },
+      sleep: (min: number, max?: number) => new Promise<void>((resolve) => {
+        const ms = max ? randInt(min, max) : min;
+        if (opts.signal?.aborted) return resolve();
+        const t = setTimeout(resolve, ms);
+        try { opts.signal?.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true }); } catch { /* ignore */ }
+      }),
+      waitForCaptchaCleared: async (o?: { maxMs?: number }) => {
+        const maxMs = (o && o.maxMs) || 180000;
+        const startedWait = Date.now();
+        let notified = false;
+        while (Date.now() - startedWait < maxMs) {
+          if (opts.signal?.aborted) return { ok: false, reason: 'aborted' };
+          let showing = false;
+          try { const r: any = await matrixCmd(accountId, 'cdp_eval', { expression: CAPTCHA_DETECT_EXPR }); showing = !!(r && (r.value === true || r.value === 'true')); } catch { showing = false; }
+          if (!showing) { if (notified) log('✅ 验证码已通过,继续任务'); return { ok: true }; }
+          if (!notified) { notified = true; log('🧩 检测到验证码,请在该账号浏览器窗口【手动完成验证】(最多等 ' + Math.round(maxMs / 60000) + ' 分钟,过了自动继续)…'); }
+          await sleep(4000);
+        }
+        log('⏱ 验证码等待超时,放弃本号');
+        return { ok: false, reason: 'captcha_timeout' };
+      },
+      randInt,
+      log: (m: string) => coworkLog('INFO', 'binancePost-orch', m),
+    };
+
+    const code = pack?.orchestrator;
+    if (!code) { coworkLog('ERROR', 'binancePost', `[${accountId}] no_orchestrator`); return { accountId, state: 'failed', reason: 'no_orchestrator' }; }
+    const fn = new AsyncFunction('ctx', code);
+    await runAutomationScript(accountId, fn, ctx, kernelReceipt);
+
+    if (isKernelLeaseCurrent(kernelReceipt)) setAccountStatus(accountId, 'idle');
+    const fin = finished as { status: string; error?: string } | null;
+    if (fin && fin.status === 'error') {
+      coworkLog('ERROR', 'binancePost', `[${accountId}] finished error: ${fin.error}`);
+      return { accountId, state: 'failed', counts, chargedCredits, chargedUsd, reason: fin.error };
+    }
+    // 发布成功(非草稿)按条扣 post 平台费。草稿(autoPublish=false)只烧 token,不扣。
+    if ((cfg as any).autoPublish !== false && counts.post > 0) {
+      for (let pc = 0; pc < counts.post; pc++) {
+        const chg = await chargePostAction(authToken, opts.platform);
+        if (chg && chg.ok) { chargedCredits += Number(chg.charged) || 0; chargedUsd += Number(chg.cost_usd) || 0; }
+        else {
+          const why = String((chg && chg.reason) || 'unknown');
+          if (chargeFatal && !chargeFatal.reason) chargeFatal.reason = why;
+          log(/insufficient|余额/i.test(why) ? '⛔ 任务已暂停，请充值后继续' : '⛔ 任务已停止，请稍后重试');
+          coworkLog('WARN', 'binancePost', `[${accountId}] post charge failed: ${why}`);
+          return { accountId, state: 'failed', counts, chargedCredits, chargedUsd, reason: 'charge_failed:' + why };
+        }
+      }
+      try { opts.onItem?.({ accountId, state: 'success', counts: { ...counts }, chargedCredits, chargedUsd }); } catch { /* ignore */ }
+    }
+    coworkLog('INFO', 'binancePost', `[${accountId}] done 发 ${counts.post} 条 · 扣费 ${chargedCredits}积分`);
+    return { accountId, state: 'success', counts, chargedCredits, chargedUsd };
+  } catch (e: any) {
+    if (isKernelLeaseCurrent(kernelReceipt)) setAccountStatus(accountId, 'idle');
+    coworkLog('ERROR', 'binancePost', `[${accountId}] threw: ${String(e?.stack || e?.message || e).slice(0, 300)}`);
+    return { accountId, state: 'failed', counts, chargedCredits, chargedUsd, reason: 'binancepost_threw:' + String(e?.message || e).slice(0, 140) };
+  } finally {
+    // 完成后留时间让用户检查浏览器里的结果再关窗(点「停止」立即关、不等)。
+    // 普通 20s;撞到登录墙/验证墙留 60s,好让用户当场手动登录/过验证(2026-07-06 用户要求)。
+    // 多条循环的中间轮(holdAfter=false)两样都省:窗口由外层引用吊着不会关,检查期留到最后一轮。
+    const holdMs = holdAfter ? inspectHoldMs(finished?.error) : 0;
+    if (holdMs > 0 && !opts.signal?.aborted) {
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, holdMs);
+        try { opts.signal?.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true }); } catch { /* ignore */ }
+      });
+    }
+    if (kernelReceipt) { try { releaseKernel(kernelReceipt); } catch { /* ignore */ } }
+  }
+}
+
+async function runPool(ids: string[], k: number, worker: (id: string) => Promise<EngageItemResult>, onItem?: (i: EngageItemResult) => void): Promise<EngageItemResult[]> {
+  const results: EngageItemResult[] = new Array(ids.length);
+  let cursor = 0;
+  async function lane() {
+    while (true) {
+      const i = cursor++;
+      if (i >= ids.length) return;
+      const r = await worker(ids[i]);
+      results[i] = r;
+      try { onItem?.(r); } catch { /* ignore */ }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(k, ids.length)) }, () => lane()));
+  return results;
+}
+
+export async function runBinancePostTask(opts: BinancePostTaskOptions): Promise<EngageReport> {
+  if (!opts.kernelPath && !installedKernelPath()) {
+    throw new Error(`${NO_KERNEL_ERROR}: 指纹浏览器内核未安装,请先到「我的矩阵账号」下载内核`);
+  }
+  const k = Math.max(1, Math.min(opts.concurrency ?? 3, 10));
+  // 没选账号 → 直接空转完成会「瞬间结束、零日志」,先广播一条说明,别让用户摸不着头脑。
+  if (!opts.accountIds.length) {
+    opts.onLog?.('', '⚠️ 本任务未选择任何账号,无可执行对象(请编辑任务勾选已登录的币安账号)');
+    coworkLog('WARN', 'binancePostRunner', 'no accounts on task', { taskId: opts.taskId });
+    return { platform: opts.platform, total: 0, success: 0, failed: 0, skipped: 0, items: [] };
+  }
+  const scenarioId = `${opts.platform}_post`;
+  const pack = await fetchPack(scenarioId);
+  if (!pack || !pack.orchestrator) {
+    // 后端剧本拉取失败(未部署 / 网络 / 超时)→ 每个号都广播原因,便于定位。
+    const reason = `❌ 后端发帖剧本(${scenarioId})拉取失败:可能后端未部署该剧本,或网络/VPN 不通 ${baseUrl()}。本次跳过`;
+    coworkLog('ERROR', 'binancePostRunner', 'fetch pack returned null', { scenarioId, base: baseUrl() });
+    for (const id of opts.accountIds) {
+      opts.onLog?.(id, reason);
+      try { opts.onItem?.({ accountId: id, state: 'skipped', reason: 'no_scenario(后端未部署?)' }); } catch { /* ignore */ }
+    }
+    return {
+      platform: opts.platform, total: opts.accountIds.length, success: 0, failed: 0, skipped: opts.accountIds.length,
+      items: opts.accountIds.map((id) => ({ accountId: id, state: 'skipped' as const, reason: 'no_scenario(后端未部署?)' })),
+    };
+  }
+  // 每号每轮发几条(1-100,默认 1 = 老行为;上限原是 10,用户 2026-08-14 要求各平台放到 100)。
+  // 🚨 循环放在【这里】而不是剧本里,是有意的:
+  //   ① 剧本的 STEP 2 是线性流程、中间好几处 return,五份剧本又不同构(344~581 行),
+  //      在里面套循环等于重构五条【真发布 + 真扣费】的链路,风险远大于收益;
+  //   ② 选题去重本来就在客户端:ctx.newsUsage 背后是 newsUsageStore(按 scenarioId + 标题
+  //      持久化),剧本每跑一次都会 markUsed → 重跑自然换选题,不用改剧本一行;
+  //   ③ 每条之间隔 10-60s(同搬运的防连坐口径),避免同号短时间连发被平台盯上。
+  const perAcc = Math.max(1, Math.min(100, Number((opts.config as any)?.dailyCount) || 1));
+  coworkLog('INFO', 'binancePostRunner', `binance_post ${opts.platform} x${opts.accountIds.length} (${scenarioId}) perAcc=${perAcc}`);
+  const chargeFatal = { reason: '' };   // 任务级扣费熔断:任何号 post 扣费失败 → 后续号跳过
+  const items = await runPool(opts.accountIds, k, async (id) => {
+    let last: EngageItemResult = { accountId: id, state: 'skipped', reason: 'no_run' };
+    // 🚨 多条时整轮吊住浏览器窗口:runOne 每轮结尾都 closeKernel(发完一条、休息期间窗口就被
+    //    关掉,下一条再冷启动 —— 用户 2026-08-14 实拍反馈)。这里用 skipLease 多拿一份引用计数
+    //    (不占互斥锁,与 runOne 里正常的 launch/close 配对互不干扰):循环内 closeKernel 只把
+    //    计数 2→1、不真关;整轮完(或异常/停止)finally 归还这份引用才关。拿不到就退回逐条
+    //    开关的老行为,不影响发帖。
+    let holdRef: Awaited<ReturnType<typeof acquireKernel>> | undefined;
+    if (perAcc > 1) {
+      const acc = getAccount(id);
+      // 吊窗前先做 runOne 顶部同款校验:必被跳过的账号(平台不符/被禁/受限)或已点停止,
+      // 不白开一次冷启动(审计发现:原来只查了 acc 存在)。
+      const willSkip = !acc || acc.platform !== opts.platform || acc.status === 'banned' || acc.status === 'limited' || !!opts.signal?.aborted;
+      if (!willSkip && acc) {
+        try {
+          holdRef = await acquireKernel({
+            signal: opts.signal,
+            accountId: id, kernelPath: opts.kernelPath, kernelVersion: acc.kernelVersion,
+            userDataDir: acc.userDataDir, fingerprint: acc.fingerprint, proxy: acc.proxy,
+            label: accountBadgeLabel(acc),
+            groupTitle: matrixGroupTitle(opts.platform, opts.taskId),
+            skipLease: true,
+          });
+        } catch { /* 启动失败:kernelPool 已自行回退计数,runOne 里会再报具体错 */ }
+      }
+    }
+    try {
+      for (let n = 0; n < perAcc; n++) {
+        if (opts.signal?.aborted) break;
+        if (n > 0) {
+          const gap = randInt(10000, 60000);
+          opts.onLog?.(id, `⏳ 距上一条发布间隔 ${Math.round(gap / 1000)}s…(本号第 ${n + 1}/${perAcc} 条)`);
+          await abortableSleep(gap, opts.signal);
+          if (opts.signal?.aborted) break;
+        }
+        last = await runOne(opts, pack, id, n === perAcc - 1, chargeFatal);
+        if (last.reason && String(last.reason).indexOf('charge_failed') === 0) { opts.onLog?.(id, '⛔ 任务已停止'); break; }
+        // 登录失效 / 账号被限 → 剩下几十条也必然同样收场,别再空转白等(往「能完成的事尽快完成」靠)。
+        if (last.state === 'skipped' && /login_expired|account_|platform_mismatch|no_local_images/.test(String(last.reason || ''))) {
+          opts.onLog?.(id, `⏭ 本号后续 ${perAcc - n - 1} 条跳过(${last.reason})`);
+          break;
+        }
+        // 中间几条也要上报,否则界面只看得到最后一条;最后一条由 runPool 统一上报,别重复。
+        if (n < perAcc - 1) { try { opts.onItem?.(last); } catch { /* ignore */ } }
+      }
+    } finally {
+      if (holdRef) { try { releaseKernel(holdRef); } catch { /* ignore */ } }
+    }
+    return last;
+  }, opts.onItem);
+  return {
+    platform: opts.platform, total: items.length,
+    success: items.filter((x) => x.state === 'success').length,
+    failed: items.filter((x) => x.state === 'failed').length,
+    skipped: items.filter((x) => x.state === 'skipped').length,
+    items,
+  };
+}

@@ -1,0 +1,86 @@
+/**
+ * 每次安装(含重装、自动升级)后第一次打开时选「简洁版 / 专业版」(2026-10-28)。之后随时切换,两版数据完全共用。
+ * current:当前在用的版本(重装 / 升级时有),高亮它;没有就高亮简洁版。
+ */
+import React from 'react';
+import { i18nService } from '../services/i18n';
+import type { UiEdition } from '../uiEdition';
+
+const L = (zh: string, tw: string, en: string): string => {
+  const lang = i18nService.currentLanguage;
+  return lang === 'zh' ? zh : lang === 'zh-TW' ? tw : en;
+};
+
+/** onClose:从顶部横条「切换版本」按钮手动打开时传,可关闭(✕ / 点空白 / Esc);首次安装弹出时不传,必须选一个。 */
+const EditionChooser: React.FC<{ onPick: (e: UiEdition) => void; current?: UiEdition | null; onClose?: () => void }> = ({ onPick, current, onClose }) => {
+  React.useEffect(() => {
+    if (!onClose) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  const hi: UiEdition = current || 'simple';
+  const cards: Array<{ e: UiEdition; icon: string; title: string; tag?: string; lines: string[] }> = [
+    {
+      e: 'simple', icon: '🌱', title: L('简洁版', '簡潔版', 'Simple'), tag: L('新手推荐', '新手推薦', 'For beginners'),
+      lines: [
+        L('菜单少,一眼看懂', '選單少,一眼看懂', 'Fewer menus, easy to follow'),
+        L('首页四步引导 + 教学视频', '首頁四步引導 + 教學影片', 'Home: 4-step guide + video tutorials'),
+        L('弹窗选平台和任务 → 设置 → 选账号,一路点下去就建好', '彈窗選平台和任務 → 設置 → 選帳號,一路點下去就建好', 'Pick platform & task → set up → pick accounts, done'),
+        L('所有任务放一起,下拉筛选', '所有任務放一起,下拉篩選', 'All tasks in one list with a filter'),
+      ],
+    },
+    {
+      e: 'pro', icon: '🚀', title: L('专业版', '專業版', 'Pro'),
+      lines: [
+        L('完整功能和全部菜单', '完整功能和全部選單', 'Every feature and menu'),
+        L('按平台分开管理任务、运行记录', '按平台分開管理任務、執行紀錄', 'Tasks and run history per platform'),
+        L('AI 对话、热点等进阶工具', 'AI 對話、熱點等進階工具', 'AI chat, trending and other advanced tools'),
+        L('适合已经熟悉矩阵运营的用户', '適合已經熟悉矩陣運營的用戶', 'For experienced matrix operators'),
+      ],
+    },
+  ];
+  return (
+    <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={onClose}>
+      <div className="relative w-full max-w-2xl rounded-2xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 shadow-2xl p-6" onClick={(e) => e.stopPropagation()}>
+        {onClose && (
+          <button type="button" onClick={onClose} aria-label={L('关闭', '關閉', 'Close')}
+            className="absolute top-3 right-3 h-8 w-8 inline-flex items-center justify-center rounded-lg text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800">✕</button>
+        )}
+        <div className="text-center mb-5">
+          <img src="logo.png" alt="logo" className="w-12 h-12 mx-auto rounded-2xl shadow mb-2" />
+          <div className="text-lg font-bold dark:text-white text-gray-900">{onClose ? L('切换界面版本', '切換介面版本', 'Switch layout') : L('欢迎使用 NoobClaw,选一个界面开始吧', '歡迎使用 NoobClaw,選一個介面開始吧', 'Welcome to NoobClaw — pick a layout')}</div>
+          <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">{L('之后随时可以切换(右上角 ☰ 菜单 → 切换版本),账号和任务两边通用', '之後隨時可以切換(右上角 ☰ 選單 → 切換版本),帳號和任務兩邊通用', 'Switch any time (top-right ☰ menu → Switch layout); accounts and tasks are shared')}</div>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {cards.map((c) => (
+            <button
+              key={c.e}
+              type="button"
+              onClick={() => onPick(c.e)}
+              // 高亮卡的淡绿底用 style 写:深色主题里 `button[class*="bg-claude-accent"]` 会被强制刷成实心亮绿 + 黑字(noobclaw-theme.css),
+              //   卡里的灰字就看不清了(用户 2026-10-29 截图)
+              style={c.e === hi ? { background: 'rgba(0,255,136,0.06)' } : undefined}
+              className={`text-left rounded-2xl border-2 p-4 transition-all hover:-translate-y-0.5 hover:shadow-lg ${c.e === hi ? 'border-claude-accent/60 hover:border-claude-accent' : 'border-gray-200 dark:border-gray-700 hover:border-claude-accent/50'}`}
+            >
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-2xl">{c.icon}</span>
+                <span className="text-base font-bold dark:text-white text-gray-900">{c.title}</span>
+                {c.e === current && <span className="text-[11px] px-2 py-0.5 rounded-full border border-claude-accent/50 text-claude-accent">{L('当前', '目前', 'Current')}</span>}
+                {c.tag && <span className="ml-auto text-[11px] font-semibold px-2 py-0.5 rounded-full bg-claude-accent text-[#04130B]">{c.tag}</span>}
+              </div>
+              <ul className="space-y-1">
+                {c.lines.map((l) => <li key={l} className="text-xs text-gray-600 dark:text-gray-300">· {l}</li>)}
+              </ul>
+              <div className={`mt-3 w-full py-2 rounded-xl text-center text-sm font-semibold ${c.e === hi ? 'bg-claude-accent text-[#04130B]' : 'bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-200'}`}>
+                {L(`用${c.title}`, `用${c.title}`, `Use ${c.title}`)}
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default EditionChooser;

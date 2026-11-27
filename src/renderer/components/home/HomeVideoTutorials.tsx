@@ -1,0 +1,230 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { i18nService } from '../../services/i18n';
+import SimpleSelect from '../common/SimpleSelect';
+
+/**
+ * 首页「视频教程」区 — 分类标签(全部/成片效果/各平台) + 两行横向翻页(首/末页藏对应箭头)。
+ *
+ * 数据来自 R2 清单 site/videos/manifest.json(backend/scripts/sync-bili-videos.js 生成),
+ * B 站发新视频重跑脚本即对所有已装客户端生效,零打包。带 ?v=时间戳 绕 CDN 缓存;
+ * 清单经 tauriShim 的 fetch 代理走 sidecar 拉取,拉不到时整个区不渲染。
+ *
+ * 点卡片【新开系统浏览器】到 B 站视频页播放 —— 不在应用内嵌播:B 站外嵌播放器对
+ * 未登录观众限 480p 不清晰(用户拍板 2026-08-09,弃应用内弹层方案)。
+ */
+
+const MANIFEST_URL = 'https://static.noobclaw.com/site/videos/manifest.json';
+// 「更多教程」与官网一致直达文档站;中文界面进中文版,其余进英文版。
+const moreTutorialsUrl = (): string =>
+  (i18nService.currentLanguage === 'zh' || i18nService.currentLanguage === 'zh-TW')
+    ? 'https://docs.noobclaw.com/' : 'https://docs.noobclaw.com/english';
+
+interface ManifestVideo { bvid: string; cid: number; title: string; cover: string; duration: number; w: number; h: number; group: string; }
+interface ManifestGroup { key: string; label: string; count: number; }
+
+const fmtDur = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+
+// 分类标签多语:清单里的 label 是同步脚本生成的中文(B 站内容),非中文界面按稳定的
+// group.key 走 i18n(hvVideoGroup_*);清单以后新增未知 key → t() 原样返回 key → 回落
+// 清单 label(顶多显示中文,标签不丢)。
+const groupLabel = (g: ManifestGroup): string => {
+  const k = `hvVideoGroup_${g.key}`;
+  const t = i18nService.t(k);
+  return t === k ? g.label : t;
+};
+
+/** filter='select':分类用一个下拉框(简洁版);默认 'tags' 是一排标签(专业版,不变)。 */
+const HomeVideoTutorials: React.FC<{ filter?: 'tags' | 'select' }> = ({ filter = 'tags' }) => {
+  const [videos, setVideos] = useState<ManifestVideo[]>([]);
+  const [groups, setGroups] = useState<ManifestGroup[]>([]);
+  // 先渲染骨架占住版位(标题/标签/两行卡位),清单到了原地填充 —— 避免整个区
+  // "loading 完才突然冒出来"把下方内容顶下去。只有拉取失败才整区消失。
+  const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [active, setActive] = useState('all');
+  const rowRef = useRef<HTMLDivElement>(null);
+  const [canPrev, setCanPrev] = useState(false);
+  const [canNext, setCanNext] = useState(false);
+
+  // 2026-10-29 用户:「有时候视频教程整块不见」—— 清单是经 sidecar 代理拉的,刚启动 / 网络抖一下就会失败,
+  //   失败一次整块就隐藏了。改成:① 先用上次成功的清单(本地缓存)立刻显示;② 拉取失败自动重试(2s / 5s / 10s);
+  //   三次都失败、又没有缓存,才隐藏。
+  useEffect(() => {
+    let alive = true;
+    const CACHE_KEY = 'noobclaw_home_videos_manifest';
+    let hasCache = false;
+    try {
+      const c = JSON.parse(localStorage.getItem(CACHE_KEY) || 'null');
+      if (c && Array.isArray(c.videos) && c.videos.length) {
+        setVideos(c.videos); setGroups(c.groups || []); setStatus('ready'); hasCache = true;
+      }
+    } catch { /* 缓存坏了就当没有 */ }
+    const delays = [0, 2000, 5000, 10000];
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const attempt = (i: number) => {
+      timer = setTimeout(() => {
+        // 8 秒拿不到就算这次失败(sidecar 代理没响应时别把重试链卡死)
+        const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const to = ac ? setTimeout(() => ac.abort(), 8000) : null;
+        fetch(`${MANIFEST_URL}?v=${Date.now()}`, ac ? { signal: ac.signal } : undefined)
+          .finally(() => { if (to) clearTimeout(to); })
+          .then((r) => r.json())
+          .then((m) => {
+            if (!alive) return;
+            const vs = (m && m.videos) || [];
+            if (!vs.length) throw new Error('empty');
+            setVideos(vs); setGroups(m.groups || []); setStatus('ready');
+            try { localStorage.setItem(CACHE_KEY, JSON.stringify({ videos: vs, groups: m.groups || [] })); } catch { /* ignore */ }
+          })
+          .catch(() => {
+            if (!alive) return;
+            if (i + 1 < delays.length) attempt(i + 1);
+            else if (!hasCache) setStatus('error');
+          });
+      }, delays[i]);
+    };
+    attempt(0);
+    return () => { alive = false; if (timer) clearTimeout(timer); };
+  }, []);
+
+  const shown = active === 'all' ? videos : videos.filter((v) => v.group === active);
+
+  const updateArrows = () => {
+    const r = rowRef.current;
+    if (!r) return;
+    setCanPrev(r.scrollLeft > 5);
+    setCanNext(r.scrollLeft + r.clientWidth < r.scrollWidth - 5);
+  };
+  useEffect(() => {
+    rowRef.current?.scrollTo({ left: 0 });
+    // 等布局落定再算一次(切分类后 scrollWidth 变化)
+    const t = setTimeout(updateArrows, 50);
+    return () => clearTimeout(t);
+  }, [shown.length, active, videos.length]);
+
+  const pageBy = (d: number) => {
+    const r = rowRef.current;
+    if (r) r.scrollBy({ left: d * r.clientWidth * 0.9, behavior: 'smooth' });
+  };
+
+  const openExternal = (url: string) => { try { window.electron?.shell?.openExternal?.(url); } catch { /* noop */ } };
+  const openVideo = (v: ManifestVideo) => openExternal(`https://www.bilibili.com/video/${v.bvid}/`);
+
+  if (status === 'error') return null;
+  const loading = status === 'loading';
+
+  return (
+    <div className="space-y-4">
+      {/* 标题行:📺 视频教程 + 更多教程 → 文档站 */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 min-w-0">
+          <h2 className="text-base font-bold dark:text-claude-darkText text-claude-text">
+            📺 {i18nService.t('hvVideosTitle')}
+          </h2>
+          {/* 下拉框还没数据时先放一个同尺寸的灰条占位,标题行高度不变 */}
+          {filter === 'select' && loading && <span className="w-40 h-[30px] rounded-lg dark:bg-white/[0.06] bg-gray-200/70 animate-pulse" />}
+          {filter === 'select' && groups.length > 0 && (
+            <SimpleSelect
+              size="sm"
+              className="w-40"
+              value={active}
+              onChange={setActive}
+              ariaLabel={i18nService.t('hvVideosTitle')}
+              options={[
+                ...(!groups.some((g) => g.key === 'all') ? [{ value: 'all', label: `${i18nService.currentLanguage === 'zh' ? '全部' : i18nService.currentLanguage === 'zh-TW' ? '全部' : 'All'} (${videos.length})` }] : []),
+                ...groups.map((g) => ({ value: g.key, label: `${groupLabel(g)} (${g.count})` })),
+              ]}
+            />
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={() => openExternal(moreTutorialsUrl())}
+          className="text-xs font-medium text-claude-accent hover:underline inline-flex items-center gap-1"
+        >
+          {i18nService.t('hvVideosMore')}
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
+        </button>
+      </div>
+
+      {/* 分类标签(标签文案来自清单,B 站内容为中文);loading 时先放灰条占位 */}
+      <div className={`flex flex-wrap gap-1.5 ${filter === 'select' ? 'hidden' : ''}`}>
+        {loading && Array.from({ length: 6 }).map((_, i) => (
+          <span key={i} className="h-[26px] w-16 rounded-full dark:bg-white/[0.06] bg-gray-200/70 animate-pulse" />
+        ))}
+        {groups.map((g) => (
+          <button
+            key={g.key}
+            type="button"
+            onClick={() => setActive(g.key)}
+            className={`px-2.5 py-1 rounded-full text-[11px] font-medium border transition-colors ${
+              active === g.key
+                ? 'bg-claude-accent text-black border-transparent'
+                : 'dark:bg-white/[0.03] bg-white dark:border-white/10 border-gray-200/80 dark:text-gray-300 text-gray-600 hover:border-claude-accent/50'
+            }`}
+          >
+            {groupLabel(g)} ({g.count})
+          </button>
+        ))}
+      </div>
+
+      {/* 两行横向翻页 */}
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => pageBy(-1)}
+          style={{ visibility: canPrev ? 'visible' : 'hidden' }}
+          className="shrink-0 w-8 h-8 rounded-full dark:bg-white/10 bg-gray-100 dark:hover:bg-white/20 hover:bg-gray-200 dark:text-white text-gray-700 flex items-center justify-center transition-colors"
+          aria-label="上一页"
+        >←</button>
+        <div
+          ref={rowRef}
+          onScroll={updateArrows}
+          className="flex-1 overflow-x-auto"
+          style={{ display: 'grid', gridAutoFlow: 'column', gridTemplateRows: filter === 'select' ? 'repeat(1, auto)' : 'repeat(2, auto)', gridAutoColumns: '176px', gap: 10, scrollBehavior: 'smooth', scrollbarWidth: 'none' }}
+        >
+          {loading && Array.from({ length: 8 }).map((_, i) => (
+            <div key={i} className="rounded-xl overflow-hidden border dark:border-white/10 border-gray-200/80 dark:bg-white/[0.03] bg-white">
+              <div className="dark:bg-white/[0.06] bg-gray-200/70 animate-pulse" style={{ aspectRatio: '16/10' }} />
+              <div className="px-2 py-1.5 h-[42px]">
+                <div className="h-3 w-11/12 rounded dark:bg-white/[0.06] bg-gray-200/70 animate-pulse mb-1.5" />
+                <div className="h-3 w-2/3 rounded dark:bg-white/[0.06] bg-gray-200/70 animate-pulse" />
+              </div>
+            </div>
+          ))}
+          {shown.map((v) => (
+            <div
+              key={v.bvid}
+              role="button"
+              tabIndex={0}
+              onClick={() => openVideo(v)}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openVideo(v); } }}
+              className="group cursor-pointer rounded-xl overflow-hidden border dark:border-white/10 border-gray-200/80 dark:bg-white/[0.03] bg-white hover:-translate-y-0.5 hover:shadow-md transition-all"
+              aria-label={`播放:${v.title}`}
+              title={v.title}
+            >
+              <div className="relative bg-black" style={{ aspectRatio: '16/10' }}>
+                <img src={v.cover} alt={v.title} loading="lazy" className="w-full h-full object-cover" />
+                <span className="absolute right-1.5 bottom-1.5 px-1.5 py-0.5 rounded bg-black/75 text-white text-[10px]">{fmtDur(v.duration)}</span>
+                <span className="absolute inset-0 m-auto w-9 h-9 rounded-full bg-black/55 text-white group-hover:bg-emerald-400 group-hover:text-black flex items-center justify-center transition-colors">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
+                </span>
+              </div>
+              <div className="px-2 py-1.5 text-[11px] leading-snug dark:text-gray-200 text-gray-700 h-[42px] overflow-hidden" style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                {v.title}
+              </div>
+            </div>
+          ))}
+        </div>
+        <button
+          type="button"
+          onClick={() => pageBy(1)}
+          style={{ visibility: canNext ? 'visible' : 'hidden' }}
+          className="shrink-0 w-8 h-8 rounded-full dark:bg-white/10 bg-gray-100 dark:hover:bg-white/20 hover:bg-gray-200 dark:text-white text-gray-700 flex items-center justify-center transition-colors"
+          aria-label="下一页"
+        >→</button>
+      </div>
+    </div>
+  );
+};
+
+export default HomeVideoTutorials;

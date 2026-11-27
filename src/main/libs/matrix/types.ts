@@ -1,0 +1,456 @@
+/**
+ * 矩阵号核心数据模型(本地,不上云)。
+ * 见方案 project_matrix_product_plan / 边界 feedback_matrix_isolation_boundary。
+ *
+ * 铁律:fingerprint.seed 与 proxy 一旦绑定某号即【永久固定】——指纹/IP 漂移本身
+ * 就是平台关联信号。
+ */
+
+import type { CustomCommentPolicy } from '../../../types/matrixCommentPolicy';
+import type { CommentLikeMode, CommentPost } from '../../../types/matrixCommentPosts';
+import type { SavedCommentAssignmentPlan } from '../../../types/matrixCommentPlan';
+
+export type AccountStatus =
+  | 'idle'          // 可用
+  | 'running'       // 正在跑任务
+  | 'login_required'// 登录态失效,需重新扫码
+  | 'limited'       // 被限流,冷却中
+  | 'banned';       // 已封
+
+/** 指纹种子 + 维度,直接映射 fingerprint-chromium 的 --fingerprint-* flag。 */
+export interface Fingerprint {
+  seed: number;                                   // --fingerprint=<32位整数>,一号一固定种子
+  platformOs?: 'windows' | 'macos' | 'linux';     // --fingerprint-platform
+  brand?: 'Chrome' | 'Edge' | 'Opera' | 'Vivaldi';// --fingerprint-brand
+  hardwareConcurrency?: number;                    // --fingerprint-hardware-concurrency
+  lang?: string;                                   // --lang / --accept-lang(与 IP 地域对齐)
+  timezone?: string;                               // --timezone(与 IP 地域对齐)
+}
+
+/** 出口代理。Chromium --proxy-server 不支持内联账密 → 带 auth 时需本地中转端口。 */
+export interface Proxy {
+  protocol: 'socks5' | 'socks5h' | 'http' | 'https';
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  localBridgePort?: number;        // 带 auth 时:本地无认证中转端口(上游带 auth)
+  geo?: string;                    // 归属地(用户手填的显示标注)
+  // 校验时自动查到的出口/host 归属地(展示在账号卡片「代理IP」旁,让用户一眼看到 IP 在哪)。
+  geoCountry?: string;             // 'Vietnam'
+  geoCountryCode?: string;         // 'VN'
+  geoCity?: string;                // 'Quỳnh Lôi'
+  ispType?: 'residential' | 'mobile' | 'datacenter';
+  // 通用代理连通性，不代表目标平台可访问、登录有效或账号未受限。
+  health?: 'ok' | 'leaking' | 'banned' | 'dead';
+  healthCheckedAt?: number;
+  exitIp?: string;                 // 经该代理实际观测的出口，绝不能用 host 代替
+  exitCountryCode?: string;        // Only the current observed exit IP's region, never host/label.
+  exitTimezone?: string;
+  exitLocaleObservedAt?: number;   // Separate from the IP observation: an IP-only refresh does not refresh geo.
+  exitIpObservedAt?: number;       // 最近观测时间；不是持续在线或固定出口的保证
+}
+
+/** 一个矩阵账号 = 身份 + 持久 profile + 固定指纹 + 固定代理 + 健康态。 */
+export interface MatrixAccount {
+  authority?: import('./accountProtection').AccountAuthority;
+  id: string;
+  platform: string;                // douyin / xhs / ... (对齐 backend/matrix/drivers 文件名)
+  displayName: string;
+  group?: string;                  // 赛道/分组
+  persona?: string;                // 人设(喂评论 AI 口吻;点赞/关注用不到)
+  status: AccountStatus;
+  statusReason?: string;           // 暂停/待检查原因，不等同于账号封禁或退出登录
+  recovery?: { attempts: number; nextCheckAt: number; reason: string };
+  chargeUncertain?: { action: string; platform: string; refId?: string; at: number; holdReason?: string };
+  egress?: { baselineIp: string; baselineAt: number; ip?: string; observedAt?: number; changedAt?: number; holdReason?: string };
+  // 用户主动「断开连接」标记(与意外过期区分):断开也是 login_required,但 keepAlive 不对它做
+  // 误标复验(cookie 已清、永远验不过,复验只会每 12h 开窗白闪)。重新连上(状态翻 idle)即自动清除。
+  manualDisconnect?: boolean;
+  bindingConflict?: boolean;      // 重复身份拒绝绑定;保留 Cookie,但禁止自动任务,直到确认新的唯一身份。
+  userDataDir: string;             // 持久 profile 目录(登录态长期粘住)
+  fingerprint: Fingerprint;
+  proxy?: Proxy;
+  debugPort?: number;              // 运行时分配的 CDP 调试端口
+  lastPostAt?: number;
+  lastAliveAt?: number;            // 最近一次确认登录态有效的时间(任务/发布/保活成功时更新);主动保活据此筛「超 N 天没活跃」的号
+  lastLoginRecheckAt?: number;     // keepAlive 最近一次对 login_required 号开窗复验的时间:24h 内不重复复验(降噪,防每 12h 白开窗)
+  // 互动配置:赛道关键词(自动点赞/评论/关注时按这些词搜内容)+ 赛道 id(engageHistory 去重维度)
+  keywords?: string[];          // 【原始关键词】用户设的,永不被 AI 衍生覆盖/删除
+  // 【AI 衍生关键词池】原始词搜尽时 AI 按赛道衍生的新词,持久化于此(与原始词分开存,上限 30,满了整批换)。
+  // 搜索时 = keywords + derivedKeywords 合用(见 accountManager.effectiveKeywords)。
+  derivedKeywords?: string[];
+  track?: string;
+  // 绑定的指纹内核版本(指纹稳定:一号长期用固定版本)。空 = 用任意已装版本。
+  kernelVersion?: string;
+  // 登录后从平台页面/接口读到的真实身份。nickname 昵称展示;displayId 平台号(抖音号/小红书号/
+  // 快手号/@handle/视频号ID 等,用户可辨识);avatar 头像 URL;boundUid 内部 uid(「换号告警」绑定校验)。
+  nickname?: string;
+  displayId?: string;
+  avatar?: string;
+  boundUid?: string;
+  // 内容语言:赛道名/人设/关键词按 zh 还是 en 预填与显示(建号时按界面语言默认,可切换)。
+  // group 始终存中文规范名(供 trackIdFromGroup 匹配),此字段仅决定展示/预填语言。存量号无此字段视为 'zh'。
+  contentLang?: 'zh' | 'en';
+  // 登录场景(仅快手用):'main'=主站 www.kuaishou.com(涨粉互动+读身份)、'creator'=创作者中心
+  // cp.kuaishou.com(视频发布)。快手主站与创作端登录互不覆盖(实测),故拆成两类账号、各自登录。
+  // 建号时确定、之后不可改。其它平台不设(主站登录即覆盖创作端 / 同域)。
+  loginScope?: 'main' | 'creator';
+}
+
+/** 互动配额区间(各项在 [min,max] 内随机)。 */
+export interface EngageQuota {
+  daily_like_min?: number; daily_like_max?: number;
+  daily_follow_min?: number; daily_follow_max?: number;
+  daily_comment_min?: number; daily_comment_max?: number;
+  // 收藏配额(2026-08-23 新增,抖音/快手/小红书/B站/TikTok)。老任务没有 = 0,不会凭空多做收藏。
+  daily_favorite_min?: number; daily_favorite_max?: number;
+  // 单个作品最多评论几次(0~5)。老任务没有这个字段 → 剧本回落 1 = 老行为「评过就不再评这条」。
+  max_comment_per_work?: number;
+  comment_lang?: string;            // 评论语言(海外平台强制模式)
+  // ''=关键词筛选 / 'binge'=刷剧(抖音/快手/TikTok) / 'precise'=精准(粘链接逐条互动)
+  engage_mode?: '' | 'binge' | 'precise';
+  // ── 精准模式配置(engage_mode==='precise' 时才用)──
+  //   所有链接一视同仁:每条都按下面这几个数做动作。多账号则各自把这批链接做一遍。
+  precise_urls?: string[];          // 作品/帖子链接,最多 50 条
+  precise_like?: number;            // 0/1 点赞
+  precise_favorite?: number;        // 0/1 收藏
+  precise_follow?: number;          // 0/1 关注作者
+  precise_comment?: number;         // 0-3 评论条数(剧本会把多条打散,不连着发)
+}
+
+/**
+ * 「自动回复粉丝评论」(reply_fan)任务的配置。无配额(回复对象=粉丝评论本身,不是搜出来的),
+ * 只有可选引流尾巴。回复对象/人设/账号身份在各矩阵账号上(persona 喂回复 AI 口吻)。
+ */
+export interface ReplyFanConfig {
+  funnel_phrase?: string;        // 引流文案(选填,空则纯 AI 回复不带尾巴)
+  funnel_probability?: number;   // 引流尾巴出现概率 1-100(引流语为空时失效)
+  funnel_rewrite?: boolean;      // AI改写引流语:缺省/true = AI 改写(老行为);false = 原样发布
+}
+
+/**
+ * 发帖/图文类任务共用的「数据源」项(向导多选存数组,orchestrator 每轮随机挑 1 个取题)。
+ *   kind='news'     → /api/scenario/fresh-news(web3 深度资讯)
+ *   kind='category' → /api/video/hotspot/preview 的 items[catKey](web3 / tech)
+ *   kind='hot'      → /api/web3/hot-search?sources=<source>(热搜榜,source 名与后端一致)
+ */
+export interface PostSourceSel {
+  kind: 'news' | 'category' | 'hot';
+  source?: string;
+  catKey?: string;
+}
+
+/**
+ * 「图文创作」(image_text)任务配置。N 个号各自按身份(赛道/人设/关键词,沿用账号已有配置)
+ * + 可选参考文案 + 维度化创意引擎 → AI 生成各异内容,配图全局二选一(AI生图 / 网络图按本号关键词搜),
+ * 发到各自创作者中心。配图方式/张数/篇数全局统一,参考文案可按号填(选填)。
+ * 内容来源二选一(contentSource):'reference'=参考文案(老行为,缺省);'sources'=数据源选题
+ * (sources 多选,orchestrator 每轮随机挑一条最新热点/资讯当创作种子)。
+ */
+export interface ImageTextConfig {
+  contentSource?: 'reference' | 'sources'; // 缺省 'reference'(老任务无此字段=老行为)
+  sources?: PostSourceSel[];               // 仅 contentSource='sources':多选数据源
+  sourceTrackMatch?: boolean;              // 数据源模式:仅取账号赛道相关的选题(缺省 true)
+  useRealPhotos: boolean;        // 配图方式【全局】:false=AI 生图,true=网络图(按账号关键词搜实景图)
+  imageSource?: 'ai' | 'real' | 'local'; // 图源三选一(缺省按 useRealPhotos 映射;'local'=用户本地图)
+  localImages?: string[];        // 仅 imageSource='local':本地图片绝对路径(≤6,runner 读盘转 base64 传给 orchestrator)
+  imageCount: number;            // 每篇配图张数 2-6
+  dailyCount: number;            // 每号每轮生成几篇 1-50
+  aiImageStyle?: string;         // AI 生图风格(仅 useRealPhotos=false 用,缺省 'ai_auto')
+  autoPublish: boolean;          // true=直接群发,false=仅本地保存(用户逐条审核后手动发)
+  references?: Record<string, string>; // 可选:各账号参考文案 { accountId: text };不填则按身份合成种子
+  // 仅【视频号 + 网络图】用:视频号浏览器没登录抖音、游客搜图拿不到 → 选 1 个【已登录抖音】的号当下图号,
+  // 用它的浏览器搜+下网络图,再喂给各视频号发布。一个抖音号服务 N 个视频号,故网络图模式整任务串行。
+  imageDownloadAccountId?: string;
+}
+
+/**
+ * 「爆款批量仿写」(viral_rewrite)任务配置(目前仅小红书)。N 个号各自用【自己的赛道/关键词/人设】
+ * 去小红书搜本 niche 爆款 → 维度化创意引擎仿写 → AI 生图 → 发布。来源=每号关键词搜(沿用账号已配)。
+ */
+export interface ViralRewriteConfig {
+  dailyCount: number;            // 每号每轮仿写几篇 1-50
+  aiImageStyle?: string;         // AI 生图风格(缺省 'ai_auto')
+  imageMode?: 'auto' | 'local';   // 配图来源:'auto'(缺省,AI 生图)/ 'local'=用户本地图
+  localImages?: string[];        // 仅 imageMode='local':本地图绝对路径(≤6,runner 读盘转 base64)
+  autoPublish: boolean;          // true=直接发布(坐标),false=仅本地保存
+}
+
+/**
+ * 「自动发推」(x_post)任务配置(目前仅推特 X)。N 个号各自按【自己的人设/赛道/关键词】(沿用账号已配身份)
+ * AI 原创一条推文,发到各自时间线。每号每轮固定 1 条,内容互不相同。
+ *   mode='web3':抓近 3 周 web3 热门资讯 → Pro 紧贴资讯原创(web3 KOL 流,复刻旧 x_post_creator);
+ *   mode='free':按本号身份 + 可选参考文案 → Pro 自由原创(适合非 web3 赛道)。
+ * 配图可选(withImage→AI 生图附到推文);语言 zh/en/mixed(mixed 跟随客户端语言)。
+ */
+export interface TweetPostConfig {
+  mode: 'web3' | 'free';         // 内容来源:'web3'=数据源选题(历史字段名保留)/ 'free'=按账号身份自由创作
+  sources?: PostSourceSel[];     // 数据源模式的多选源(每轮随机挑 1 个取题;老任务无此字段=仅 web3 资讯)
+  sourceTrackMatch?: boolean;    // 数据源模式:仅取账号赛道相关的选题(缺省 true)
+  withImage: boolean;            // true=AI 生图配图,false=纯文字推
+  imageMode?: 'auto' | 'local';   // 配图来源:'auto'(缺省,AI 生图)/ 'local'=用户本地图
+  localImages?: string[];        // 仅 imageMode='local':本地图绝对路径(≤6,runner 读盘转 base64)
+  language: string;   // 'mixed'/'auto'=跟随账号;或 9 种语言码之一(见 postLangs.ts)
+  isBlueV: boolean;              // 蓝V(X Premium)→ 字数自由(三档随机);普通号 ≤140 字
+  autoPublish: boolean;          // true=直接发布,false=仅本地生成(不发)
+  references?: Record<string, string>; // 可选:各账号参考文案 { accountId: text }(仅 free 模式参考);空则按身份生成
+  // 每号每轮发几条(1-10,默认 3)。循环在 runner 里(binancePostRunner/tweetPostRunner),
+  //   每条之间隔 60-120s;选题去重靠 ctx.newsUsage(newsUsageStore 持久化),重跑自然换选题。
+  dailyCount?: number;
+}
+
+/**
+ * 「币安广场自动发帖」(binance_post)任务配置(目前仅币安广场)。N 个号各自按【自己的人设/赛道/关键词】
+ * (沿用账号已配身份)抓近 3 周 web3 热门资讯 → Pro 紧贴资讯深度创作一条币安广场图文,发到币安广场。
+ * 每号每轮固定 1 条,内容互不相同。仅 web3 资讯模式(对齐旧 binance_square_post_creator)。
+ * 配图可选(withImage→源资讯原图优先,无则 AI 生图);语言 zh/en/mixed(mixed 跟随客户端语言)。
+ */
+export interface BinancePostConfig {
+  withImage: boolean;            // true=配图(源图优先→AI 生图),false=纯文字
+  imageMode?: 'auto' | 'local';   // 配图来源:'auto'(缺省,源图优先→AI 生图)/ 'local'=用户本地图
+  localImages?: string[];        // 仅 imageMode='local':本地图绝对路径(≤6,runner 读盘转 base64)
+  language: string;   // 'mixed'/'auto'=跟随账号;或 9 种语言码之一(见 postLangs.ts)
+  autoPublish: boolean;          // true=直接发布,false=仅本地生成(不发)
+  // 每号每轮发几条(1-10,默认 3)。循环在 runner 里(binancePostRunner/tweetPostRunner),
+  //   每条之间隔 60-120s;选题去重靠 ctx.newsUsage(newsUsageStore 持久化),重跑自然换选题。
+  dailyCount?: number;
+}
+
+/**
+ * 「Facebook 自动发帖」(facebook_post)任务配置。同 binance_post 骨架(N 号各自 AI 原创一条图文 + 可选配图 → 发布),
+ * 但 FB 不是 web3 专场 → 数据源可选:sourceKind 'news'(web3 深度资讯)/ 'category'(hotspot 分类如 tech)/
+ * 'hot'(微博/抖音/知乎/百度/B站/雪球/海外热榜)。source=hot 模式的热榜名;catKey=category 模式的分类键(web3/tech)。
+ * 复用 binancePostRunner(runBinancePostTask 按 ${platform}_post 解析剧本 = facebook_post)。
+ */
+export interface FacebookPostConfig {
+  withImage: boolean;
+  imageMode?: 'auto' | 'local';   // 配图来源:'auto'(缺省,源图优先→AI 生图)/ 'local'=用户本地图
+  localImages?: string[];        // 仅 imageMode='local':本地图绝对路径(≤6,runner 读盘转 base64)
+  language: string;   // 'mixed'/'auto'=跟随账号;或 9 种语言码之一(见 postLangs.ts)
+  autoPublish: boolean;
+  // 内容来源二选一(contentSource):'sources'(缺省)=数据源选题;'reference'=参考文案(按本号身份+可选参考文案自由创作,跳过数据源)。
+  contentSource?: 'reference' | 'sources';
+  references?: Record<string, string>;      // 仅 contentSource='reference':各账号参考文案 { accountId: text };空则该号按身份自由创作
+  sources?: PostSourceSel[];                // 多选数据源(每轮随机挑 1 个;老任务无此字段走下面单选)
+  sourceTrackMatch?: boolean;               // 仅取账号赛道相关的选题(缺省 true)
+  sourceKind: 'news' | 'category' | 'hot';  // 数据源类型(旧单选字段=第一个选中源,兼容旧 orchestrator)
+  source?: string;                          // hot 模式:热榜名(如 "微博热搜")
+  catKey?: string;                          // category 模式:分类键(web3 / tech)
+  // 每号每轮发几条(1-10,默认 3)。循环在 runner 里(binancePostRunner/tweetPostRunner),
+  //   每条之间隔 60-120s;选题去重靠 ctx.newsUsage(newsUsageStore 持久化),重跑自然换选题。
+  dailyCount?: number;
+}
+
+/**
+ * 「Reddit 自动发帖」(reddit_post)任务配置。同 facebook_post 的可选数据源,但发布走 Reddit API(POST /api/submit,
+ * self/文字帖),且需指定目标 subreddit。无配图(Reddit 图片帖要 media lease 上传,二期)。
+ * 复用 binancePostRunner(scenarioId = reddit_post)。
+ */
+export interface RedditPostConfig {
+  language: string;   // 'mixed'/'auto'=跟随账号;或 9 种语言码之一(见 postLangs.ts)
+  autoPublish: boolean;
+  // 内容来源二选一(contentSource):'sources'(缺省)=数据源选题;'reference'=参考文案(按本号身份+可选参考文案自由创作,跳过数据源)。
+  contentSource?: 'reference' | 'sources';
+  references?: Record<string, string>;      // 仅 contentSource='reference':各账号参考文案 { accountId: text };空则该号按身份自由创作
+  sources?: PostSourceSel[];                // 多选数据源(每轮随机挑 1 个;老任务无此字段走下面单选)
+  sourceTrackMatch?: boolean;               // 仅取账号赛道相关的选题(缺省 true)
+  sourceKind: 'news' | 'category' | 'hot';
+  source?: string;
+  catKey?: string;
+  subreddit: string;                        // 目标 subreddit(选填,不带 r/ 前缀也行;空 = 发到账号自己的个人主页 u_用户名)
+  // 每号每轮发几条(1-10,默认 3)。循环在 runner 里(binancePostRunner/tweetPostRunner),
+  //   每条之间隔 60-120s;选题去重靠 ctx.newsUsage(newsUsageStore 持久化),重跑自然换选题。
+  dailyCount?: number;
+}
+
+/**
+ * 「Instagram 自动发帖」(instagram_post)任务配置。同 facebook_post 的可选数据源,但发布走 IG「新建帖子」
+ * 多步弹窗(上传图 → 下一步 → 写文案 → 分享)。**Instagram 网页帖必须带图** → withImage 恒 true(拿不到图判失败)。
+ * 复用 binancePostRunner(scenarioId = instagram_post)。
+ */
+export interface InstagramPostConfig {
+  withImage: boolean; // 恒 true(IG 帖必带图);保留字段与 facebook 对齐
+  imageMode?: 'auto' | 'local';   // 配图来源:'auto'(缺省,源图优先→AI 生图)/ 'local'=用户本地图
+  localImages?: string[];        // 仅 imageMode='local':本地图绝对路径(≤6,runner 读盘转 base64)
+  language: string;   // 'mixed'/'auto'=跟随账号;或 9 种语言码之一(见 postLangs.ts)
+  autoPublish: boolean;
+  // 内容来源二选一(contentSource):'sources'(缺省)=数据源选题;'reference'=参考文案(按本号身份+可选参考文案自由创作,跳过数据源)。
+  contentSource?: 'reference' | 'sources';
+  references?: Record<string, string>;      // 仅 contentSource='reference':各账号参考文案 { accountId: text };空则该号按身份自由创作
+  sources?: PostSourceSel[];                // 多选数据源(每轮随机挑 1 个;老任务无此字段走下面单选)
+  sourceTrackMatch?: boolean;               // 仅取账号赛道相关的选题(缺省 true)
+  sourceKind: 'news' | 'category' | 'hot';
+  source?: string;
+  catKey?: string;
+  // 每号每轮发几条(1-10,默认 3)。循环在 runner 里(binancePostRunner/tweetPostRunner),
+  //   每条之间隔 60-120s;选题去重靠 ctx.newsUsage(newsUsageStore 持久化),重跑自然换选题。
+  dailyCount?: number;
+}
+
+/**
+ * 「币安广场批量搬运」(binance_repost)任务配置。区别于其它矩阵任务:本任务有【两种账号角色】——
+ *   · 1 个【采集号】(sourceAccountId,在 sourcePlatform 上已登录):按关键词搜索 → 筛选 → 下载,
+ *     一次性采够 N 条候选素材(图文 / 视频);
+ *   · N 个【币安号】(task.accountIds):各领一条候选,AI 仿写改成币安口吻 + 配图 → 发到各自币安广场。
+ * 「采集发布解耦」:采集只跑一次(不需要每个币安号自己登录源平台),候选任务级去重保证两号不撞同源,
+ * 每号独立改写降低连坐。计费按成功条数(repost_image_text / repost_video)+ AI 仿写 token。
+ *   material='image':搬图文(源图 + 仿写正文 → 币安图文帖);'video':搬视频(无水印源视频 → 币安视频帖)。
+ *   sourcePlatform 决定采集剧本(douyin/xhs/tiktok/x);keyword 为空则用采集号自己的关键词。
+ */
+export interface BinanceRepostConfig {
+  sourcePlatform: 'douyin' | 'xhs' | 'tiktok' | 'x'; // 搬运来源平台(决定采集剧本)
+  sourceAccountId: string;       // 采集号(该 sourcePlatform 上已登录的矩阵账号 id)
+  keyword?: string;              // 搜索词(选填;空则用采集号 account.keywords)
+  material: 'image' | 'video';   // 搬运形态:图文 / 视频
+  withImage: boolean;            // 图文模式恒配源图;视频模式此项保留兼容(一般 true)
+  language: string;   // 'mixed'/'auto'=跟随账号;或 9 种语言码之一(见 postLangs.ts) // 仿写语言(mixed 跟随客户端)
+  autoPublish: boolean;          // true=直接发布,false=仅本地生成(不发)
+  perRunCount?: number;          // 【旧】本轮目标条数;缺省=min(币安号数, 候选池数)。老任务仍按此语义
+  // 【新】每号每轮搬几条(1-10,默认 1 = 老行为)。采集量 = 号数 × 本值;分发按轮次交替
+  //   (第 1 轮每号各一条、第 2 轮再各一条…),同号两条之间隔着其它号 + 各自 60-120s 间隔。
+  perAccountCount?: number;
+}
+
+// 互动(点赞/评论/关注)= engage;自动回复粉丝评论 = reply_fan(抖音创作者中心评论管理);
+// 视频无水印下载 = video_download(单账号:选 1 个号 + 粘贴多个链接,逐个下载,不多开);
+// 图文创作 = image_text(N 个号各自按身份生成图文 + 配图 + 发到各自创作者中心);
+// 爆款批量仿写 = viral_rewrite(N 个号各自按关键词搜小红书爆款 → 仿写 → AI 生图 → 发布);
+// 自动发推 = x_post(N 个号各自按身份 AI 原创一条推文 + 可选配图 → 发到各自时间线,仅推特);
+// 币安广场自动发帖 = binance_post(N 个号各自抓 web3 资讯 AI 原创一条币安广场图文 + 可选配图 → 发币安广场,仅币安);
+// 币安广场批量搬运 = binance_repost(1 个采集号从源平台搜+下 N 条 → N 个币安号各领一条 AI 仿写 + 配图 → 发币安广场)。
+// 举报 = report(白名单功能,admin 配 UID 才可见;目前仅抖音):1-4 条链接各配原因+描述,
+//   只能选【1 个】账号执行,只能手动触发(每次逐条只提交一次),不定时、不重试;可编辑、可再次运行。
+// 评论区点赞评论 = comment_like(目前仅 TikTok,剧本 tiktok_comment_like):粘贴 1-20 条作品链接(urls),
+//   每个执行账号逐条打开、翻评论区给每位留言者的评论点赞,每号每次最多 commentLikeMax 个。
+export type MatrixTaskType = 'engage' | 'reply_fan' | 'video_download' | 'image_text' | 'viral_rewrite' | 'x_post' | 'binance_post' | 'binance_repost' | 'facebook_post' | 'reddit_post' | 'instagram_post' | 'lead_engage' | 'report' | 'comment_like' | 'block' | 'folder_post';
+
+/** 评论区点赞评论(comment_like)的约束:客户端存盘校验 + 剧本再兜一层。 */
+export const COMMENT_LIKE_LIMITS = { maxLinks: 20, maxMin: 1, maxMax: 5000, maxDefault: 100 } as const;
+// 批量拉黑 = block(目前仅抖音,剧本 douyin_block):名单(主页/作品链接、短链、抖音号)和/或 关键词;不限人数。
+export const BLOCK_LIMITS = { maxTargets: 2000, maxKeywords: 20, keywordMaxLen: 30 } as const;
+// 文件夹定时发布 = folder_post(目前仅抖音,2026-10-28):每个号 3 个时段文件夹(素材 / 文案 / 话题),
+//   到点由客户端自己按顺序取下一条拼成帖子发出去(不用抖音自带定时);图文走 matrix driver douyin_images,
+//   视频走 douyin。发完的文件挪进「已发布」。
+export const FOLDER_POST_LIMITS = { slots: 3, jitterMaxMin: 30, catchUpMin: 180, maxImages: 35 } as const;
+export interface FolderPostSlot { time: string; on: boolean }          // time = 'HH:MM'(本机时区)
+export interface FolderPostConfig {
+  slotsByAccount: Record<string, FolderPostSlot[]>;                      // accountId → 3 个时段
+  jitterMin: number;                                                     // 发布时间前后随机 ±N 分钟(0 = 准点)
+}
+
+/** 一条 Report:被举报的作品(视频/图文)或账号链接 + 抖音原文原因/具体类型 + 描述(用户手填,原样提交)。
+ *  reason / subReason 必须是 reportTaxonomy.ts 里的抖音原文选项。 */
+export interface ReportItem {
+  url: string;
+  targetType: 'content' | 'account';
+  reason: string;
+  subReason?: string;
+  description: string;
+}
+/** 每条链接的执行结果(剧本回传,存到任务上给专属详情页展示)。 */
+export interface ReportItemResult {
+  url: string;
+  status: 'submitted' | 'dry_run_ok' | 'failed';
+  why?: string;          // 失败/跳过原因码(见剧本 error_map)
+  confirmed?: boolean;   // 提交后是否看到平台确认提示
+  ts?: number;
+  accountId?: string;    // 哪个执行账号提交的(多账号时按号区分结果)
+}
+/** 举报合规上限(客户端存盘校验 + 后端剧本再兜一层)。 */
+export const REPORT_LIMITS = { minItems: 1, maxItems: 4, descMin: 5, descMax: 200 } as const;
+export type { ReportTargetType } from './reportTaxonomy';
+
+/**
+ * 定向获客(tiktok_lead_engage 剧本)配置。两段式:采集同行评论者当潜客名单(长期账本)→
+ * 逐个触达点赞/评论/关注。字段直接对应 orchestrator 读的 ctx.task.*(engageRunner 注入时铺平)。
+ */
+export interface LeadEngageConfig {
+  mode: 'accounts' | 'keywords' | 'live';      // 精准获客(填同行号)/ 关键词获客(赛道搜)/ 直播间获客(TikTok/抖音)
+  liveUrls?: string[];                // live 模式:直播间链接
+  liveDwellMinutes?: number;          // live 模式:每个直播间最多停几分钟(1-60)
+  seedAccounts: string[];             // accounts 模式:同行种子(【共用/回落】—— 老任务或未逐账号配时用)
+  // 每个执行账号各自的同行种子(accounts 模式,2026-08-23):键=矩阵账号 id,值=该号盯的同行/视频链接。
+  //   有它就每号跑自己的;缺省(老任务)回落 seedAccounts 共用。
+  seedByAccount?: Record<string, string[]>;
+  keywords: string[];                 // keywords 模式:赛道关键词
+  maxLeads: number;                   // 单次【新增】获客上限 1-1000
+  // 本次总量上限(2026-08-21 改定):每人分到多少由剧本按「总量 / 实际触达人数」算,
+  //   目的是优先保证互动人数。
+  maxLikes: number;                   // 本次点赞总量 0-5000(0=不点赞)
+  maxFollows: number;                 // 本次关注总量 0-100(0=不关注)
+  maxComments: number;                // 本次评论总量 0-100(0=不评论)
+  leadsPerRun: number;                // 单次运行最多触达多少人(新旧客轮转)
+  doLike: boolean;
+  doComment: boolean;
+  doFollow: boolean;                  // 关注固定终身一次
+  commentPrompt?: string;             // 评论口味提示词(复用 comment_composer)
+}
+// 频率枚举对齐老客户端 DouyinConfigWizard(便于复用频率算法/文案)。
+export type MatrixTaskFrequency = 'once' | '30min' | '1h' | '3h' | '6h' | 'daily_random';
+
+/**
+ * 矩阵任务 = 某平台一类自动化(目前只有互动)的「可保存配置 + 调度」。
+ * 约束:每平台最多 5 个任务、同平台同类型只允许 1 个;全局同时只跑 1 个(运行时锁)。
+ */
+export interface MatrixTask {
+  id: string;
+  platform: string;
+  type: MatrixTaskType;
+  name: string;
+  enabled: boolean;                // 定时调度是否启用(手动运行不受此限)
+  accountIds: string[];            // 勾选的(已登录)账号
+  quota: EngageQuota;              // 仅 engage 用;reply_fan / video_download 任务为空对象
+  funnel?: ReplyFanConfig;         // 仅 reply_fan 用:引流尾巴配置
+  // 各账号独立引流语(可选):有值 = 「各账号各自」模式,未配的账号视为不带引流;
+  // 为空/undefined = 沿用 funnel(所有账号共用,老行为)。key=accountId。
+  funnelByAccount?: Record<string, ReplyFanConfig>;
+  // AI自主评论(engage / reply_fan / lead_engage):缺省 = 开(老行为);false = AI 只发引流语(概率固定 100)。
+  ai_comment?: boolean;
+  // 单个用户评论最大回复数(1~5,仅抖音回复粉丝)。没配 = 1 = 老行为「回过就不再回」。
+  maxReplyPerComment?: number;
+  // 每号本次运行最多回复几条(1~300,仅抖音回复粉丝)。没配 = 剧本按 100 兜底(抖音单账号一天评论条数有限,到数就收工,防风控)。
+  maxRepliesPerRun?: number;
+  imageText?: ImageTextConfig;     // 仅 image_text 用:图文创作配置
+  viralRewrite?: ViralRewriteConfig; // 仅 viral_rewrite 用:爆款仿写配置
+  tweetPost?: TweetPostConfig;     // 仅 x_post 用:自动发推配置
+  binancePost?: BinancePostConfig; // 仅 binance_post 用:币安广场自动发帖配置
+  facebookPost?: FacebookPostConfig; // 仅 facebook_post 用:Facebook 自动发帖配置(含数据源)
+  redditPost?: RedditPostConfig;   // 仅 reddit_post 用:Reddit 自动发帖配置(含数据源 + subreddit)
+  instagramPost?: InstagramPostConfig; // 仅 instagram_post 用:Instagram 自动发帖配置(含数据源,图必带)
+  binanceRepost?: BinanceRepostConfig; // 仅 binance_repost 用:币安广场批量搬运配置
+  leadEngage?: LeadEngageConfig;   // 仅 lead_engage 用:定向获客配置
+  urls?: string[];                 // video_download:待下载视频链接清单;comment_like:要点赞评论区的作品链接(1-20)
+  commentLikeMax?: number;         // 仅 comment_like 用(老字段,2026-10-29 起不再使用:不设上限,翻完评论区为止)
+  // 仅 comment_like 用(2026-10-29):'precise'=粘作品/主页链接逐条处理(每条评论点赞+回复);
+  //   'keywords'=按账号关键词搜索后互动；'custom'=按表格链接发一级评论。缺省 = precise。
+  commentMode?: CommentLikeMode;
+  commentPosts?: CommentPost[];
+  customCommentPolicy?: CustomCommentPolicy;
+  commentAssignmentPlan?: SavedCommentAssignmentPlan;
+  commentVideoLimit?: number;      // 关键词模式:每账号每次最多处理的视频数
+  commentRepliesPerVideo?: number; // 关键词模式:每个视频最多成功回复数
+  commentDoLike?: boolean;         // 仅 comment_like:要不要给评论点赞(和 commentDoReply 至少开一个)
+  commentDoReply?: boolean;        // 仅 comment_like:要不要回复评论(AI 按评论逐条写)
+  blockTargets?: string[];         // 仅 block 用:要拉黑的名单(主页/作品链接、短链、抖音号)
+  blockKeywords?: string[];        // 仅 block 用:关键词(搜视频,拉黑相关作者)
+  // 仅 block 用:模式。'precise'=各账号自己的名单(blockTargetsByAccount);'keyword'=用各账号自己的关键词
+  //   (matrix 账号的 keywords,运行时取)。缺省 = 老任务,按 blockTargets/blockKeywords 原样跑。
+  blockMode?: 'precise' | 'keyword';
+  blockTargetsByAccount?: Record<string, string[]>; // 仅 block 精准模式:accountId → 该号要拉黑的名单
+  folderPost?: FolderPostConfig;    // 仅 folder_post 用:各号时段 + 随机浮动
+  reportItems?: ReportItem[];      // 仅 report 用:1-4 条举报条目
+  // 仅 report 用:最近一次正式执行时间(展示用,不锁定)。
+  reportExecutedAt?: number;
+  reportResults?: ReportItemResult[];      // 仅 report:正式执行的逐条结果
+  reportDryRunAt?: number;                 // 仅 report:最近一次试运行时间(试运行不占执行锁、不计费)
+  reportDryRunResults?: ReportItemResult[]; // 仅 report:最近一次试运行的逐条结果
+  concurrency?: number;            // 同时开窗数(video_download 固定 1,单账号顺序下载)
+  frequency: MatrixTaskFrequency;  // 运行频率
+  nextPlannedRunAt?: number;       // 下次计划运行(epoch ms;调度器预排,UI 展示)
+  lastRunAt?: number;              // 上次运行(调度判断 + 展示)
+  retryCount?: number;             // 连续技术失败次数，用于持久化退避
+  lastError?: string;              // 最近未正常完成原因
+  recoveryPaused?: boolean;       // 未知/配置错误，编辑或明确手动重试后再调度
+  createdAt: number;
+}

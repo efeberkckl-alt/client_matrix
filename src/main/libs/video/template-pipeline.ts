@@ -1,0 +1,726 @@
+/**
+ * template-pipeline — 「模板速生」HF 派出片流水线(engine==='template')。
+ *
+ * v3 改动(抄 HyperFrames 核心 insight):
+ *   1. **TTS 先出,HTML 跟着音频时长走**(不做 ffmpeg 拉伸对齐)
+ *   2. **渲染+编码合一**(htmlVideoRenderer.renderHtmlToVideo 一步出 mp4,不落盘 PNG)
+ *   3. **字幕走 HTML 内渲染**(声明式 data-caption-start/end,跟动画同引擎无对齐误差)
+ *
+ * 步骤:
+ *   ① AI 解析 dataText → {title,subtitle,items[,voiceScript]}(narration 时同时产口播稿)
+ *   ② [narration 时] edge-tts 出 wav,拿真实 durationSec + 词级 cues(短语)
+ *   ③ 用真实时长 + cues 构造 TemplateSpec,渲染 HTML(含字幕轨)
+ *   ④ renderHtmlToVideo:逐帧 seek + 截图 → ffmpeg stdin → 同时混 narration + BGM → 出 mp4
+ *
+ * 全程不落盘中间 PNG,音画对齐误差 = 0(字幕跟动画同 seek 协议)。
+ */
+
+import fs from 'fs';
+import path from 'path';
+import { isFfmpegAvailable, runFfmpeg, probeDuration } from './ffmpegRuntime';
+import { resolveBgmPath } from './bgm';
+import {
+  ProgressTracker, resolveOutputDirs, outputFileName, throwIfAborted,
+  type VideoCreationInput, type VideoCreationResult, type ProgressEmitter,
+} from './pipeline';
+import { videoTempBase } from './outputRoot';
+import { generateTemplateData, detectTemplateLang, type ContentLang } from './templateHtmlWriter';
+import { contentLangName } from './scriptWriter';
+import { getVideoConfig } from './videoConfig';
+import { renderTemplate, pageSizeFor, calcPageCount, calcPageRanges, type TemplateSpec } from './templateLibrary';
+import { renderHtmlToVideo, resolveHeadlessBrowser, auditHtml } from './htmlVideoRenderer';
+import { generateFreeformScene, deterministicFallbackScene, type FreeformResult } from './freeformWriter';
+import { wrapTemplateHtml } from './templateAnim';
+import { loadFontFaceCss } from './fontAsset';
+import { loadGsapSource } from './gsapAsset';
+import { synthesize, getLastTtsError, getVoiceFallbacks, alignSentencesToCues, voiceProviderLabel } from './tts';
+import { getTtsVoice } from './config';
+import { chargeMode1Video, refundMode1Video } from './billing';
+import type { CaptionCue } from './templateAnim';
+
+const TEMPLATE_STEPS = [
+  { key: 'data', label: '生成动效数据' },
+  { key: 'voice', label: '生成 AI 配音' },     // narration off 时仍存在,但秒过
+  { key: 'render', label: '渲染 + 编码合成' },
+  // 跟 stock/ai pipeline 对齐:publish 步骤 —— 出片完成后发到用户勾选的平台。
+  //   publishPlatforms 为空时秒过,日志推「📂 未选发布平台 · 仅存本地」。
+  { key: 'publish', label: '发布到各大平台' },
+];
+
+function clamp(n: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+/** 没给时长时按数据行数估个合理时长(标题 2s + 每行约 0.9s),clamp[4,14]。 */
+function autoDuration(dataText: string): number {
+  const rows = (dataText || '').split(/\r?\n/).filter((s) => s.trim()).length;
+  return clamp(Math.round(2 + rows * 0.9), 4, 14);
+}
+
+/** edge-tts 的 cue(相对本句起点) → templateAnim 的 CaptionCue(秒,相对成片起点)。 */
+function ttsCuesToCaption(cues: { text: string; start: number; end: number }[] | undefined): CaptionCue[] | undefined {
+  if (!cues || cues.length === 0) return undefined;
+  return cues.map((c) => ({
+    text: c.text,
+    startSec: Math.max(0, c.start),
+    endSec: Math.max(c.start + 0.05, c.end),
+  }));
+}
+
+/** 抠净文案给 TTS:去 emoji + 多余空白(不动中文标点;edge-tts 自己处理停顿)。 */
+function cleanForTts(s: string): string {
+  return (s || '')
+    .replace(/[☀-➿\u{1F000}-\u{1FFFF}]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** 跑一次 TTS(带 voice fallback 链),返回 audio + 时长 + cues 或 null。 */
+async function ttsWithFallback(
+  text: string, primary: string, outPath: string, rate?: number, signal?: AbortSignal,
+): Promise<{ audioPath: string; durationSec: number; cues?: CaptionCue[]; voice: string; chargedTokens?: number; costUsd?: number } | null> {
+  const chain = getVoiceFallbacks(primary);
+  for (const v of chain) {
+    if (signal?.aborted) return null; // 用户停止 → 不再试下一个音色
+    // ⚠️ signal 必须传:synthesize 内部 voiceChain × 最多 5 次重试 × 单次最长 60s。
+    const r = await synthesize(text, outPath, v, rate, { signal });
+    if (r.ok && r.synthesized) {
+      return {
+        audioPath: r.audioPath,
+        durationSec: r.durationSec,
+        cues: ttsCuesToCaption(r.cues),
+        voice: v,
+        // 豆包按字符实扣;不带出去的话账单里有钱、任务页是 0。Edge 免费为空。
+        chargedTokens: r.chargedTokens,
+        costUsd: r.costUsd,
+      };
+    }
+  }
+  return null;
+}
+
+/** 热榜数据源:出片时实时抓的条数(跟向导 TEMPLATE_HOTLIST_TOPN 对齐)。 */
+const HOTLIST_TOPN = 12;
+
+/**
+ * hotlistSource 里 Web3 资讯 / 科技不是 hot_topics 榜单,而是按 category 聚合(同热搜成片),
+ * 走 /api/video/hotspot/preview 取 items[catKey]。key 须跟向导 TEMPLATE_HOTLISTS 的 name 精确一致。
+ */
+const HOTLIST_CATEGORY_KEYS: Record<string, 'web3' | 'tech'> = {
+  'Web3 资讯': 'web3',
+  '科技 / AI': 'tech',
+};
+
+/**
+ * 实时抓某个热榜前 N 条标题,拼成逐行文本当 dataText。走公开接口 /api/web3/hot-search
+ * (无需鉴权,同 GlobalHotSearchPage);Web3 资讯 / 科技走 /hotspot/preview 按 category 聚合。
+ * 失败/空 → null,调用方退回快照。绝不抛。
+ */
+async function fetchHotlistText(source: string): Promise<string | null> {
+  try {
+    const base = process.env.NOOBCLAW_API_BASE_URL || 'https://api.noobclaw.com';
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    try {
+      const catKey = HOTLIST_CATEGORY_KEYS[source];
+      if (catKey) {
+        const resp = await fetch(`${base}/api/video/hotspot/preview`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ perSource: HOTLIST_TOPN }), signal: ctrl.signal,
+        });
+        if (!resp.ok) return null;
+        const json: any = await resp.json();
+        const arr = Array.isArray(json?.items?.[catKey]) ? json.items[catKey] : [];
+        const items: string[] = arr.map((it: any) => String(it?.title || '').trim()).filter(Boolean).slice(0, HOTLIST_TOPN);
+        return items.length ? items.join('\n') : null;
+      }
+      const resp = await fetch(`${base}/api/web3/hot-search?sources=${encodeURIComponent(source)}`, { signal: ctrl.signal });
+      if (!resp.ok) return null;
+      const json: any = await resp.json();
+      const src = Array.isArray(json?.sources)
+        ? (json.sources.find((s: any) => s?.source === source) || json.sources[0]) : null;
+      const items: string[] = Array.isArray(src?.items)
+        ? src.items.map((it: any) => String(it?.title || '').trim()).filter(Boolean).slice(0, HOTLIST_TOPN) : [];
+      return items.length ? items.join('\n') : null;
+    } finally { clearTimeout(timer); }
+  } catch { return null; }
+}
+
+/** 自由排版「写 → 体检 → 修」迭代上限。每轮 = 1 次 AI 调用 + 1 次无头体检(~1-2s)。 */
+const MAX_FREEFORM_ATTEMPTS = 3;
+
+interface FreeformHtmlArgs {
+  dataText: string;
+  title?: string;
+  lang: ContentLang;
+  /** 用户显式选的生成语言名(如 'Japanese'):画面文字强制该语言(AI 翻译)。undefined = 跟内容语言。 */
+  forceLangName?: string;
+  brandColor: string;
+  accentColor?: string;
+  durationSec: number;
+  fps: number;
+  /** 是否开了配音(决定 freeform 是否要把内容揭示沿整段时长铺开、跟口播逐条推进)。 */
+  narrationOn: boolean;
+  captionCues?: CaptionCue[];
+  watermark?: string;
+  brief?: string;
+  themeId?: string;
+}
+
+/**
+ * 「AI 自由排版」产 HTML 的迭代闭环:AI 写整页 → 无头浏览器体检(溢出/裁切/重叠/动画/确定性)
+ * → 把问题喂回 AI 重写,最多 MAX_FREEFORM_ATTEMPTS 轮。体检通过即返回;轮次耗尽用最后一版。
+ * AI 整个挂了(走纯代码兜底)就不再循环。永远返回可渲染 HTML。
+ */
+async function produceFreeformHtml(
+  args: FreeformHtmlArgs,
+  tracker: ProgressTracker,
+  onCost: (tokens: number, usd: number) => void,
+): Promise<string> {
+  const gsapSource = loadGsapSource();
+  const gsapAvailable = !!gsapSource;
+  const captionsOn = !!(args.captionCues && args.captionCues.length);
+  let prev: FreeformResult | null = null;
+  let lastIssues: string[] = [];
+  let lastHtml = '';
+  let safeHtml: string | null = null;   // 最近一版【结构化安全排版】HTML(物理上不重叠),末端保底用。
+  // 严重排版问题 = 交付即废片:重叠 / 超出画布 / 文字被裁 / 侵入字幕区 / 画面空白。
+  //   「内容推进太靠前 / 后半段静止 / 没有动画」属轻微瑕疵,可容忍(不重叠但推进略早,远好过重叠废片)。
+  const SEVERE = /重叠|超出画布|被裁|裁切|字幕区|空白/;
+  // 把一版排版结果包成完整可渲染 HTML(loop 与末端安全网共用)。
+  const wrap = (scene: FreeformResult): string => {
+    const useGsap = !!scene.setupScript && gsapAvailable;
+    return wrapTemplateHtml({
+      bodyHtml: scene.bodyHtml,
+      css: scene.css,
+      brandColor: args.brandColor,
+      durationSec: args.durationSec,
+      fps: args.fps,
+      captionCues: args.captionCues,
+      watermark: args.watermark,
+      fontFaceCss: loadFontFaceCss(),
+      gsapSource: useGsap ? gsapSource! : undefined,
+      setupScript: useGsap ? scene.setupScript : undefined,
+    });
+  };
+  for (let attempt = 1; attempt <= MAX_FREEFORM_ATTEMPTS; attempt++) {
+    tracker.progress(attempt === 1
+      ? `🎨 AI 自由排版生成中${gsapAvailable ? '(GSAP 可用)' : ''}…`
+      : `🎨 自由排版修订第 ${attempt} 轮(修上轮 ${lastIssues.length} 个问题)…`);
+    const scene = await generateFreeformScene({
+      dataText: args.dataText,
+      title: args.title,
+      lang: args.lang,
+      forceLangName: args.forceLangName,
+      brandColor: args.brandColor,
+      accentColor: args.accentColor,
+      durationSec: args.durationSec,
+      narrationOn: args.narrationOn,
+      captionsOn,
+      gsapAvailable,
+      brief: args.brief,
+      themeId: args.themeId,
+      fixHint: prev
+        ? { prevCss: prev.css, prevBodyHtml: prev.bodyHtml, prevSetupScript: prev.setupScript, issues: lastIssues }
+        : undefined,
+    }, (m) => tracker.progress(m)); // 把模型尝试/超时/降级的细分进度透出来,别让用户对着一句话干等
+    onCost(scene.tokens, scene.costUsd);
+    const html = wrap(scene);
+    lastHtml = html;
+    tracker.progress('🔎 正在无头浏览器体检排版(抽帧检查溢出/重叠/动画/内容推进)…');
+    const audit = await auditHtml(html, { narrationOn: args.narrationOn });
+    const modelTag = scene.source === 'fallback' ? '兜底版' : scene.structured ? '结构化安全版' : (scene.model === 'noobclawai-chat' ? 'flash 降级' : 'Pro');
+    const hasSevere = audit.issues.some((x) => SEVERE.test(x));
+    // 结构化/兜底版物理上不重叠 → 只要无严重问题就记为「安全兜底版」,轮次耗尽时优先它。
+    if (scene.structured && !hasSevere) safeHtml = html;
+    if (audit.ok) {
+      tracker.progress(`✅ 自由排版体检通过(第 ${attempt} 轮 · ${modelTag})`);
+      return html;
+    }
+    tracker.progress(`🔎 体检发现 ${audit.issues.length} 个问题:${audit.issues.slice(0, 3).join(' / ')}${audit.issues.length > 3 ? ' …' : ''}`);
+    // 结构化安全版只剩【轻微】瑕疵(内容推进/静止等,无重叠溢出)→ 直接采用:别为小瑕疵再耗轮次,
+    //   更别倒退回会重叠的原始整页 HTML。这正是过去「小瑕疵→切原始HTML→重叠废片」的病根。
+    if (scene.structured && !hasSevere) {
+      tracker.progress(`✅ 结构化安全排版采用(第 ${attempt} 轮 · 容忍 ${audit.issues.length} 个非严重项)`);
+      return html;
+    }
+    // AI 整个挂了(两个模型都失败 → 走了纯代码兜底)→ 再循环也没意义,兜底版本身不重叠,直接出片。
+    // 把失败原因 log 出来(产物只看得到「又是绿条兜底」,看不到为什么 —— 靠这行定位是截断/解析/超时)。
+    if (scene.source === 'fallback') {
+      tracker.progress(`⚠️ AI 自由排版失败,采用纯代码兜底排版${scene.failReason ? ` · 原因:${scene.failReason}` : ''}`);
+      return html;
+    }
+    prev = scene;
+    lastIssues = audit.issues;
+  }
+  // ── 轮次耗尽 ──【绝不交付带重叠/溢出的原始整页 HTML】:
+  //   末版无严重问题 → 用末版;否则优先记录的结构化安全版;都没有 → 产确定性兜底排版(永不重叠)。
+  if (!lastIssues.some((x) => SEVERE.test(x))) {
+    tracker.progress(`⚠️ 自由排版体检 ${MAX_FREEFORM_ATTEMPTS} 轮仍有小瑕疵(无严重项),采用最后一版出片`);
+    return lastHtml;
+  }
+  if (safeHtml) {
+    tracker.progress('⚠️ 末版仍有严重排版问题(重叠/溢出),改用结构化安全版出片');
+    return safeHtml;
+  }
+  tracker.progress('⚠️ 末版仍有严重排版问题,改用确定性兜底排版出片(保证不重叠)');
+  return wrap(deterministicFallbackScene({
+    dataText: args.dataText, title: args.title, lang: args.lang,
+    brandColor: args.brandColor, accentColor: args.accentColor || '#0ecb81',
+    durationSec: args.durationSec, narrationOn: args.narrationOn, captionsOn,
+    gsapAvailable,
+  }));
+}
+
+export async function runTemplatePipeline(
+  input: VideoCreationInput,
+  emit?: ProgressEmitter,
+  signal?: AbortSignal,
+): Promise<VideoCreationResult> {
+  const jobId = `tpl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const tracker = new ProgressTracker(jobId, emit, TEMPLATE_STEPS);
+
+  if (!isFfmpegAvailable()) {
+    const err = 'ffmpeg 不可用(开发机请确保 PATH 上有 ffmpeg;打包版需内置 ffmpeg 资源)';
+    tracker.fail('data', err);
+    return { ok: false, error: err };
+  }
+  if (!resolveHeadlessBrowser()) {
+    const err = '未检测到 Chrome / Edge。模板速生需要其一来渲染画面(Windows 自带 Edge 即可,请确认未被卸载)。';
+    tracker.fail('data', err);
+    return { ok: false, error: err };
+  }
+  const tpl = input.template;
+  // 有 hotlistSource(热榜数据源)时,内容出片时实时抓,这里允许 dataText 快照为空。
+  if (!tpl || (!(tpl.dataText || '').trim() && !tpl.hotlistSource)) {
+    const err = '请先填写榜单/要点内容(模板速生靠这些内容生成画面)。';
+    tracker.fail('data', err);
+    return { ok: false, error: err };
+  }
+
+  const { taskDir, runDir: destDir } = resolveOutputDirs(input);
+  tracker.setOutputDir(taskDir);
+  const tmpAudioDir = fs.mkdtempSync(path.join(videoTempBase(), 'noobclaw-tpl-audio-'));
+  const narrationPath = path.join(tmpAudioDir, 'narration.mp3');
+
+  // 平台基础费(预扣);失败时 refund。对齐 stock 模式定价口径,口径在 billing.chargeMode1Video。
+  let chargeId: string | undefined;
+  let refundOnExit = false;
+
+  try {
+    // ── STEP 1:AI 产数据 + 可选口播稿(分段以便音画同步)──────────────
+    throwIfAborted(signal);
+    tracker.start('data', `输出目录:${taskDir}`);
+    // 热榜数据源:出片时实时抓该榜前 N 条标题当内容(定时任务每次跑都是最新榜单);
+    // 抓失败 → 退回 tpl.dataText(向导选榜时存的快照)。粘贴模式 hotlistSource 为空,直接用 dataText。
+    let dataText = tpl.dataText || '';
+    if (tpl.hotlistSource) {
+      const fresh = await fetchHotlistText(tpl.hotlistSource);
+      if (fresh) {
+        // 标注抓取日期(2026-07-18 用户反馈:画面写「今日热点」却没日期,观众无从判断时效)。
+        // 首行注入「(M月D日)」提示,AI 解析 dataText 出 title 时会带上;英文内容 AI 会自行转写。
+        const now = new Date();
+        dataText = `(${now.getMonth() + 1}月${now.getDate()}日榜单,标题里带上这个日期)\n` + fresh;
+        tracker.progress(`🔥 已抓「${tpl.hotlistSource}」实时榜单 ${fresh.split('\n').length} 条`);
+      } else {
+        tracker.progress(`⚠️ 实时榜单「${tpl.hotlistSource}」抓取失败,用已保存的快照`);
+      }
+    }
+    // 生成语言:用户在向导显式选了(tpl.lang 非空非 auto)就用它,画面文字 + 口播稿都强制该语言
+    // (AI 负责翻译);否则按内容自动探测(老行为)。
+    const langSel = String(tpl.lang || '').trim();
+    const langExplicit = !!(langSel && langSel !== 'auto');
+    const lang: ContentLang = langExplicit ? (langSel as ContentLang) : detectTemplateLang(`${dataText} ${tpl.title || ''}`);
+    const forceLangName = langExplicit ? contentLangName(lang) : undefined;
+    if (langExplicit) tracker.progress(`🌐 生成语言:${forceLangName}(画面文字 + 口播稿)`);
+    const wantNarration = tpl.narration === true;
+    // 「AI 自由排版」:AI 写整页 HTML(freeformWriter + 体检闭环),不走固定模板渲染、不分页。
+    const isFreeform = tpl.style === 'ai_freeform';
+    const vcfg = await getVideoConfig();
+    // 估算 items 数量(就是 dataText 的非空行数,clamp 到模板上限 12),
+    // 算 pageMeta 用 —— 让 AI 知道画面分几页、每页几条,据此分段输出 voiceSegments。
+    const estItemCount = Math.min(12, Math.max(1,
+      (dataText || '').split(/\r?\n/).filter((l) => l.trim()).length || 1));
+    const pageSize = pageSizeFor(tpl.style);
+    const estPageCount = calcPageCount(estItemCount, pageSize);
+    const pageRanges = calcPageRanges(estItemCount, pageSize);
+    let data: Awaited<ReturnType<typeof generateTemplateData>>;
+    if (isFreeform && !wantNarration) {
+      // 自由排版 + 无配音:不需要抽 items / 口播稿,AI 稍后直接读原文排版,省一次 AI 调用。
+      data = { items: [], source: 'fallback', tokens: 0, costUsd: 0 } as Awaited<ReturnType<typeof generateTemplateData>>;
+      tracker.done('data', '✅ 自由排版 · 跳过数据抽取(AI 将直接读原文)');
+    } else {
+      data = await generateTemplateData(
+        {
+          style: tpl.style,
+          title: tpl.title,
+          // 模板速生不再用 track —— 它对 AI 排版/口播稿都没指导意义(2026-06-12 删字段);
+          // 编辑老任务时 input.track 可能还在,但生成不参考。
+          dataText,
+          lang,
+          forceLangName,
+          needVoiceScript: wantNarration,
+          // 开了配音才传 pageMeta(让 AI 按页切分 voiceSegments);纯视觉/自由排版不需要
+          pageMeta: (wantNarration && !isFreeform) ? { pageCount: estPageCount, pageRanges } : undefined,
+        },
+        // 服务端可调 prompt(只覆盖纯数据版;needVoiceScript 时仍用本地的强约束版,避免改坏)
+        wantNarration ? undefined : vcfg.templateDataSystemPrompt,
+      );
+      tracker.addTokens(data.tokens, data.costUsd);
+      tracker.done('data', data.source === 'ai'
+        ? (isFreeform ? '✅ AI 已生成口播稿 · 自由排版' : '✅ AI 已整理数据 · 精品模板')
+        : (isFreeform ? '✅ 口播稿已就绪 · 自由排版' : '✅ 数据已整理 · 精品模板'));
+    }
+
+    // ── STEP 2:配音(开了才跑;关了直接跳过)──────────────────────────
+    throwIfAborted(signal);
+    let realNarrationPath: string | undefined;
+    let realDurationSec = 0;
+    let captionCues: CaptionCue[] | undefined;
+    // 配音的真实时间戳 cue(不管字幕开没开都留着):分页翻页窗口用它对齐,比字数比例估算准。
+    let narrCues: CaptionCue[] | undefined;
+    // 每页画面时间窗(固定模板分页 + 配音时在 STEP 2.5 结算;必须在时长决策/计费之前,
+    // 因为逐页重配兜底会重制配音轨、改变总时长)。
+    let pageTimings: Array<{ startSec: number; durSec: number }> | undefined;
+    if (wantNarration) {
+      tracker.start('voice', '🎤 正在合成配音…');
+      const script = cleanForTts(tpl.voiceScript || data.voiceScript || '');
+      if (!script) {
+        tracker.fail('voice', '配音稿为空(AI 产稿失败,且未填自定义口播稿)');
+        return { ok: false, error: '配音稿为空,请关闭配音或填写自定义口播稿' };
+      }
+      // 把最终口播稿亮进进度日志(对齐 stock pipeline 的「📝 视频文案」),用户不用翻输出目录
+      // 的 文案.txt 就能看到生成结果;显式选了生成语言时一并标出。
+      tracker.progress(`📝 口播稿(约 ${script.length} 字${forceLangName ? ` · ${forceLangName}` : ''}${tpl.voiceScript ? '' : ' · AI 生成'}):${script}`);
+      const voice = tpl.voice || input.voice || getTtsVoice();
+      // 说清是哪家配音:豆包按字数计费、Edge 免费,用户有权在日志里一眼看到。
+      tracker.progress(`🎤 配音:${voiceProviderLabel(voice)} · 音色 ${voice}`);
+      const rate = typeof tpl.voiceRate === 'number' ? tpl.voiceRate
+        : typeof input.voiceRate === 'number' ? input.voiceRate : 0;
+      const r = await ttsWithFallback(script, voice, narrationPath, rate, signal);
+      if (r?.chargedTokens) tracker.addTokens(r.chargedTokens, r.costUsd || 0);
+      if (!r) {
+        // 用户停止时 ttsWithFallback 也返回 null —— 先归一成「已停止」,别报成配音失败。
+        throwIfAborted(signal);
+        const why = getLastTtsError() || '请稍后再试';
+        tracker.fail('voice', `配音失败:${why}`);
+        return { ok: false, error: `配音失败:${why}` };
+      }
+      realNarrationPath = r.audioPath;
+      realDurationSec = r.durationSec;
+      // 荒谬值护栏:>10 分钟判 TTS 异常(正常口播 800 字 AI 稿 ≈ 3 分钟;用户自定义长稿
+      //   也到不了这)。重点是【显式失败】而不是默默截断 —— 任何"砍音频凑上限"都会交付
+      //   念一半戛然而止的废片(2026-06-11 的 60s clamp 截断事故就是这么来的)。
+      //   此时平台基础费还没预扣(charge 在渲染前才调),直接 return 即可,与配音失败同路径。
+      if (realDurationSec > 600) {
+        const err = `配音时长异常(${Math.round(realDurationSec)}s > 600s 上限),疑似 TTS 异常或口播稿过长。请缩短稿子后重试。`;
+        tracker.fail('voice', err);
+        return { ok: false, error: err };
+      }
+      // 字幕开关:默认 true,显式 false 时关
+      narrCues = r.cues;
+      if (tpl.subtitleEnabled !== false) captionCues = r.cues;
+      // 把口播稿存一份到任务目录(对齐 stock pipeline 的「文案.txt」)。失败不阻塞出片 ——
+      //   只是供用户事后查看 / 复用稿子。voiceSegments 有就一并列出,标明每段对应哪一页画面。
+      try {
+        const segs = data.voiceSegments;
+        const lines: string[] = [
+          `📝 模板速生口播稿(共 ${script.length} 字 / 配音时长 ${realDurationSec.toFixed(1)}s)`,
+          '',
+          script,
+        ];
+        if (Array.isArray(segs) && segs.length > 0) {
+          lines.push('', `── 分页朗读分段(共 ${segs.length} 页) ──`);
+          segs.forEach((s, i) => lines.push(`[第 ${i + 1} 页] ${s}`));
+        }
+        fs.writeFileSync(path.join(destDir, '文案.txt'), lines.join('\n'), 'utf8');
+      } catch { /* 写文案 txt 失败不影响出片 */ }
+      tracker.done('voice', `✅ 配音已生成 · ${realDurationSec.toFixed(1)}s${captionCues ? ` · ${captionCues.length} 句字幕` : ''}`);
+
+      // ── STEP 2.5:分页音画同步结算(固定精品模板 + 多页 + AI 按页切了段)──────
+      // 三条腿按准确度排序,任何一腿成功即止:
+      //   ① 整段配音 + cue 真实时间戳对齐(零额外请求、零累积误差)
+      //   ② cue 对不齐 → 【逐页重新合成】:每页画面时长 = 该页配音实测时长(MoneyPrinterPlus
+      //     同款结构,按段落出音频、时长天然对齐)。热榜类内容满是数字/日期(「7月24日」2 字符
+      //     念 6 个音节),edge-tts 会把数字规整成读法 → 字符流差异超阈 → ① 常年失败;旧代码
+      //     此时退「字数比例估算」,数字段被系统性低估 → 画面翻页与口播漂移逐页累积,字幕
+      //     (走真实 cue)和画面(走估算)成了两条时间轴 —— 这就是「字幕和画面对不上」的根因。
+      //     逐页实测从结构上消灭该问题,代价是 N-1 次额外 TTS 请求(段间 900ms 限频)。
+      //   ③ 逐页合成也失败 → 字数比例估算(有累积误差但不至于失联)
+      if (!isFreeform) {
+        const syncPageSize = pageSizeFor(tpl.style);
+        const syncPageCount = calcPageCount(data.items.length, syncPageSize);
+        const segs = data.voiceSegments;
+        if (segs && segs.length === syncPageCount && syncPageCount > 1) {
+          // ① cue 真实时间戳对齐
+          if (narrCues && narrCues.length > 0) {
+            const spans = alignSentencesToCues(
+              segs,
+              narrCues.map((c) => ({ text: c.text, start: c.startSec, end: c.endSec })),
+              realDurationSec,
+            );
+            if (spans && spans.length === segs.length) {
+              pageTimings = spans.map((s, i) => ({
+                startSec: s.start,
+                // 末页吃掉尾留白(+0.4s 与时长决策同口径),画面撑到视频结束不黑屏。
+                durSec: (i === spans.length - 1 ? Math.max(s.end, realDurationSec + 0.4) : s.end) - s.start,
+              }));
+              tracker.progress(`🎬 音画同步就绪 · ${syncPageCount} 页按配音真实时间戳对齐`);
+            }
+          }
+          // ② 逐页重新合成(实测每页时长,零漂移;同时字幕换成逐段 cue 平移,与画面同一时间轴)
+          if (!pageTimings) {
+            tracker.progress(`↩️ cue 对不齐(念读与文本差异大,常见于数字/日期多的榜单)→ 逐页重新配音实测对齐(${syncPageCount} 页)…`);
+            const segAudios: Array<{ p: string; d: number; cues?: CaptionCue[] }> = [];
+            let segOk = true;
+            for (let i = 0; i < segs.length; i++) {
+              throwIfAborted(signal);
+              // edge-tts 连发限频:段间隔 ~900ms 降请求密度(与爆帖逐段兜底同口径)
+              if (i > 0) await new Promise((res) => setTimeout(res, 900));
+              const segPath = path.join(tmpAudioDir, `narr_page_${i}.mp3`);
+              const sr = await ttsWithFallback(cleanForTts(segs[i]), r.voice, segPath, rate, signal);
+              if (sr?.chargedTokens) tracker.addTokens(sr.chargedTokens, sr.costUsd || 0);
+              if (!sr || !(sr.durationSec > 0)) { segOk = false; break; }
+              segAudios.push({ p: sr.audioPath, d: sr.durationSec, cues: sr.cues });
+            }
+            if (segOk && segAudios.length === segs.length) {
+              // mp3 同源同码流,concat demuxer + c copy 无损拼接(帧粒度 ~26ms 误差,末页兜底吸收)
+              const listPath = path.join(tmpAudioDir, 'narr_pages.txt');
+              fs.writeFileSync(listPath, segAudios.map((a) => `file '${a.p.replace(/'/g, "'\\''")}'`).join('\n'), 'utf8');
+              const concatPath = path.join(tmpAudioDir, 'narration_paged.mp3');
+              const cr = await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatPath], { timeoutMs: 60_000, signal });
+              if (cr.ok && fs.existsSync(concatPath)) {
+                let cursor = 0;
+                const newCues: CaptionCue[] = [];
+                pageTimings = segAudios.map((a) => {
+                  const startSec = cursor;
+                  for (const c of a.cues || []) newCues.push({ text: c.text, startSec: c.startSec + cursor, endSec: c.endSec + cursor });
+                  cursor += a.d;
+                  return { startSec, durSec: a.d };
+                });
+                const total = await probeDuration(concatPath).catch(() => 0);
+                realNarrationPath = concatPath;
+                realDurationSec = Math.max(cursor, total || 0);
+                pageTimings[pageTimings.length - 1].durSec =
+                  (realDurationSec + 0.4) - pageTimings[pageTimings.length - 1].startSec;
+                narrCues = newCues.length ? newCues : undefined;
+                if (tpl.subtitleEnabled !== false) captionCues = narrCues;
+                tracker.progress(`🎬 音画同步就绪 · ${syncPageCount} 页逐页实测配音时长(零漂移)· 共 ${realDurationSec.toFixed(1)}s`);
+              }
+            }
+            if (!pageTimings) tracker.progress('⚠️ 逐页配音对齐失败,退回按字数比例估算');
+          }
+          // ③ 字数比例估算兜底
+          if (!pageTimings) {
+            const totalChars = segs.reduce((s, x) => s + x.length, 0);
+            if (totalChars > 0) {
+              // 留 0.3s 入场 + 0.3s 尾留白(跟 paginate 兜底分支同口径)
+              const usable = Math.max(2.0, realDurationSec - 0.6);
+              let cursor = 0.3;
+              pageTimings = segs.map((seg) => {
+                const dur = (seg.length / totalChars) * usable;
+                const startSec = cursor;
+                cursor += dur;
+                return { startSec, durSec: dur };
+              });
+              tracker.progress(`🎬 音画同步就绪 · ${syncPageCount} 页按字数比例估算(时间戳不可用)`);
+            }
+          }
+        } else if (syncPageCount > 1) {
+          // 开了配音但 segments 没拿到/对不上 → 提示用户后会走均分,画面跟配音不严格对齐
+          tracker.progress(`⚠️ AI 未按页切分配音,画面将按时长均分(${syncPageCount} 页)`);
+        }
+      }
+    } else {
+      // 跳过这一步(UI 上仍显示但直接 done)
+      tracker.done('voice', '⏭ 已跳过(未开配音)');
+    }
+
+    // ── STEP 3:渲染 + 编码合成(一步到位)────────────────────────────
+    throwIfAborted(signal);
+    tracker.start('render', '🎞️ 渲染 + 编码…');
+
+    // 时长决策:
+    //   · 有配音 → 真实音频时长 + 0.4s 尾留白,**不设上限**。配音是真理源,视频必须跟完
+    //     整段音频 —— 任何"砍到上限"都会交付念一半戛然而止的废片(60s clamp 时代
+    //     2026-06-11 实测截断)。荒谬值(>600s)已在 STEP 2 TTS 之后显式 fail,
+    //     走到这里的时长一定是合法的,只兜个 3s 下限防 0/负值。
+    //   · 无配音 → 用户配置 / 自动估算(clamp[3, 20])
+    const durationSec = wantNarration && realDurationSec > 0
+      ? Math.max(3, realDurationSec + 0.4)
+      : clamp(tpl.durationSec || autoDuration(dataText), 3, 20);
+    const fps = tpl.fps && tpl.fps > 0 ? tpl.fps : 30;
+
+    // 平台基础费预扣(对齐 stock 模式定价口径,单条约 $0.09~$0.18,服务端权威值)。
+    // 在 AI 数据/配音已经实扣 token 之后、渲染【真起 ffmpeg】之前调:
+    //   · 失败 → return + 不渲染(AI 部分已实扣无法退,与 stock 同行为)
+    //   · 渲染失败 → catch 里 refundMode1Video 退回这笔(幂等)
+    //   · videoCount=1(模板速生当前只出 1 条),aiCostUsd=本次 AI 已扣总额
+    const charge = await chargeMode1Video(durationSec, { videoCount: 1, aiCostUsd: data.costUsd });
+    if (!charge.ok) {
+      let err: string;
+      if (charge.reason === 'insufficient') err = '余额不足,无法生成(需先预扣平台基础费,请充值后重试)';
+      else if (charge.reason === 'no_auth') err = '未登录 NoobClaw,无法生成';
+      else err = '平台基础费预扣失败,请稍后重试';
+      tracker.fail('render', err);
+      return { ok: false, error: err };
+    }
+    chargeId = charge.chargeId;
+    refundOnExit = true;
+    tracker.addTokens(charge.chargedTokens || 0, charge.feeUsd || 0);
+    tracker.progress(`💎 平台基础费已预扣 ${charge.chargedTokens || 0} 积分（≈$${(charge.feeUsd || 0).toFixed(2)}），失败将自动退回`);
+
+    const brandColor = /^#[0-9a-f]{6}$/i.test(tpl.brandColor || '') ? tpl.brandColor! : '#f0b90b';
+    let html: string;
+    if (isFreeform) {
+      // ── AI 自由排版:写 → 体检 → 修,迭代闭环(没有视觉模型,靠无头浏览器自查)──
+      html = await produceFreeformHtml({
+        dataText,
+        title: data.title || tpl.title,
+        lang,
+        forceLangName,
+        brandColor,
+        accentColor: tpl.accentColor,
+        durationSec,
+        fps,
+        narrationOn: wantNarration,
+        captionCues,
+        watermark: tpl.watermark,
+        brief: tpl.brief,
+        themeId: tpl.themeId,
+      }, tracker, (tk, usd) => tracker.addTokens(tk, usd));
+    } else {
+      // ── 固定精品模板:每页时间窗已在 STEP 2.5 结算(① cue 真实时间戳对齐 → ② 逐页
+      //    重配实测 → ③ 字数比例估算),这里直接下发给 templateLibrary 替代均分。
+      const spec: TemplateSpec = {
+        style: tpl.style,
+        title: data.title || tpl.title,
+        subtitle: data.subtitle,
+        items: data.items,
+        brandColor,
+        accentColor: tpl.accentColor,
+        durationSec,
+        fps,
+        captions: captionCues,
+        pageTimings,
+      };
+      html = renderTemplate(spec);
+    }
+    try { fs.writeFileSync(path.join(destDir, '模板.html'), html, 'utf8'); } catch { /* non-fatal */ }
+
+    // BGM 解析(本地 / 内置 / 云端;失败兜底为无 BGM,绝不阻塞出片)
+    const bgm = await resolveBgmPath(input.bgmPath, (m) => tracker.progress(m)).catch(() => undefined);
+
+    const outPath = path.join(destDir, outputFileName(0));
+    // 渲染进度:每秒推一次,避免 ffmpeg 编码阶段假死
+    let lastPush = 0;
+    await renderHtmlToVideo({
+      html,
+      width: 1080, height: 1920,
+      fps, durationSec,
+      outPath,
+      narrationPath: realNarrationPath,
+      narrationVolume: 1.0,
+      bgmPath: bgm,
+      bgmVolume: typeof input.bgmVolume === 'number' ? input.bgmVolume : 0.18,
+      signal,
+      onProgress: (done, total) => {
+        const now = Date.now();
+        if (now - lastPush < 700 && done !== total) return;
+        lastPush = now;
+        tracker.progress(`🎞️ 渲染 ${done}/${total} 帧`);
+      },
+    });
+
+    tracker.progress(`✅ 已生成 ${path.basename(outPath)}`);
+    // 结尾把【本次实际写片的目录】绝对路径推一条 —— 渲染端 renderVideoLog 会自动把含 NoobClaw
+    // 的路径转成可点击 button(点一下用 Finder/资源管理器打开),跟 stock 模式日志末尾的口径一致。
+    tracker.progress(`📂 输出目录:${destDir}`);
+    // 渲染编码成功 = 不再退款(用户拿到了成片,平台费名正言顺收下)
+    refundOnExit = false;
+
+    // ── Step 4: 发布到各大平台(同 stock/ai pipeline 口径) ──────────────────
+    // 视觉/口播稿 都已经稳了,放心调 publisher。未登录的平台自动跳过,日志会说明。
+    // ⚠️ 同 pipeline.ts:进 publish 前查 abort,且【不抛】(成片已落地、平台费已收下)。
+    //    这里不查的话,即便 runPublish 会挡住"真发出去",resolvePublishCaption 仍会先烧
+    //    一笔 AI token 写发布文案 —— 用户停了还扣钱。
+    if (signal?.aborted) {
+      tracker.progress('⏹ 已停止 · 成片已保存,跳过发布');
+      tracker.finish(outPath, 1, true); // aborted → UI 显示「已停止」而非「生成完成」
+      return { ok: true, outputPath: outPath, outputPaths: [outPath], aborted: true };
+    }
+    tracker.start('publish');
+    const wantPublish = Array.isArray(input.publishPlatforms) && input.publishPlatforms.length > 0;
+    try {
+      const { resolvePublishCaption } = require('./publishCaptionWriter');
+      const titleHint = tpl.title || (dataText || '').split(/\r?\n/).filter(Boolean)[0]?.slice(0, 40);
+      // 平台发布文案:AI 据 voiceScript/dataText 写钩人文案(不再把口播稿/榜单原样当 caption)。
+      const cap = await resolvePublishCaption({
+        wantPublish,
+        summary: tpl.voiceScript || dataText || titleHint || '',
+        title: titleHint,
+        keywords: [],
+        track: input.track,
+        lang,
+        userTitle: input.publishTitle,
+        userCaption: input.publishCaption,
+        userTags: input.hashtags,
+        onLog: (m: string) => tracker.progress(m),
+        onCost: (tk: number, usd: number) => tracker.addTokens(tk, usd),
+      });
+      // 矩阵号 edition:发布走指纹内核 CDP(按平台→选定账号上传),不走扩展;非矩阵走旧 runPublishStep。
+      const { MATRIX_EDITION } = require('../../matrixEdition');
+      if (MATRIX_EDITION && wantPublish) {
+        const { runMatrixPublishStep } = require('./publishers/runMatrixPublish');
+        await runMatrixPublishStep({
+          platforms: Array.isArray(input.publishPlatforms) ? input.publishPlatforms : [],
+          accounts: (input as any).publishAccounts || {},
+          videoPath: outPath,
+          title: cap.title,
+          description: cap.description,
+          tags: cap.tags,
+          onLog: (msg: string) => tracker.progress(msg),
+          signal,
+        });
+      } else {
+        const { runPublishStep } = require('./publishers/runPublish');
+        await runPublishStep({
+          platforms: Array.isArray(input.publishPlatforms) ? input.publishPlatforms : [],
+          videoPath: outPath,
+          title: cap.title,
+          description: cap.description,
+          tags: cap.tags,
+          onLog: (msg: string) => tracker.progress(msg),
+          signal,
+        });
+      }
+    } catch (e) {
+      tracker.progress(`⚠️ 发布步骤异常:${String((e as Error)?.message || e).slice(0, 120)}`);
+    }
+    tracker.finish(outPath, 1);
+    return { ok: true, outputPath: outPath, outputPaths: [outPath] };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.startsWith('VIDEO_ABORTED') || msg === 'aborted') {
+      // ⚠️ 被停止也必须发终态事件:tracker.fail 是唯一会 send('error') 的地方,
+      //    早先这里直接 return 就跳过了它 —— 一条终态都不发 → 渲染端 generate() 的
+      //    promise 永不 resolve → running 永远 true、卡片永远「生成中」(此时停止无效、
+      //    删除被拒,只能重启)、videoQueue 槽永不释放 → 之后所有视频任务全起不来。
+      tracker.fail(null, '已停止');
+      return { ok: false, error: '已停止', aborted: true };
+    }
+    tracker.fail(null, msg);
+    return { ok: false, error: msg };
+  } finally {
+    // 平台基础费失败退款(成片失败时;成功路径走完 refundOnExit=false 不退)。幂等,失败仅记日志。
+    if (refundOnExit && chargeId) {
+      try {
+        const refunded = await refundMode1Video(chargeId);
+        tracker.progress(refunded
+          ? '↩️ 成片失败，已退回预扣的平台基础费'
+          : '⚠️ 成片失败，平台基础费退回请求未成功（稍后可联系客服核对）');
+      } catch { /* 退款失败不抛,仅日志 */ }
+    }
+    try { fs.rmSync(tmpAudioDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}

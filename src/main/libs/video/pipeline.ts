@@ -1,0 +1,3103 @@
+﻿/**
+ * pipeline — 本地出片总编排(一期 路线 A:文案 → 配音 → 画面 → 字幕 → 合成 mp4)。
+ *
+ * 流程:
+ *   1. 拆解参考文案为逐句分镜
+ *   2. 每句 edge-tts 配音(拿到每镜真实时长)
+ *   3. 凑画面:参考图优先 → Pexels/Pixabay 素材图补 → 都没有上纯色文字卡
+ *   4. ffmpeg 逐镜 Ken Burns + 烧字幕,concat 成竖屏 mp4
+ *   5. 输出到 ~/Documents/NoobClaw/视频创作/<任务ID前8位>_<任务名>/<日期>/<批次号>/
+ *      (同一任务同一天每跑一次 +1:1/、2/、3/…;无任务上下文的老调用退回 视频创作/<日期>/<批次号>/)
+ *
+ * 全程 emit 进度(steps 数组)给渲染端 UI。
+ */
+
+import fs from 'fs';
+import path from 'path';
+import { randomUUID } from 'crypto';
+import { resolveVideoOutputRoot, videoTempBase } from './outputRoot';
+import { isFfmpegAvailable, setVideoAbortSignal, runFfmpeg, probeDuration } from './ffmpegRuntime';
+import {
+  synthesize, synthesizeWhole, getLastTtsError, getVoiceFallbacks, isDoubaoVoice, voiceProviderLabel,
+  alignSentencesToCues, groupWordCues,
+} from './tts';
+import { getTtsVoice } from './config';
+import { fetchStockImages, fetchStockVideosByTerms, type StockVideoAsset, type StockVideoByTerm, type StockOrientation } from './stockProvider';
+import { pickHotspotTopic, fetchHotspotMaterial, type HotspotTopic } from './hotspotProvider';
+import { getUsedHotspots, markHotspotUsed } from './usedHotspotStore';
+import { fetchDouyinClips } from './hotspotDouyinSource';
+import { fetchTiktokClips } from './hotspotTiktokSource';
+import { composeVideo, concatNativeClips, type SceneSpec, type SubtitleStyle, type SubtitleCue } from './compose';
+import { generateScript, generateSearchTerms, detectLang, type ContentLang } from './scriptWriter';
+import { getVideoConfig, localeFor } from './videoConfig';
+import { chargeMode1Video, chargeHotspotImages, refundMode1Video } from './billing';
+import { resolveBgmPath, buildMoodBgmTrack } from './bgm';
+import { generateSeedanceClips, generateStoryboard, type SeedanceClipResult, type SeedanceSceneSpec } from './seedanceProvider';
+import type { TemplateOptions } from './templateHtmlWriter';
+import { runTemplatePipeline } from './template-pipeline';
+import { runThreadPipeline } from './thread-pipeline';
+import { runRepostPipeline, transcribeAudio } from './repost-pipeline';
+import { generateStoryboardAnchor } from './storyboardAnchor';
+// 电影级(engine='ai')分镜表:把用户脚本 / 口播稿解析成结构化分镜,口播与画面彻底分家。
+import {
+  parseStoryboardScript, deriveStoryboard, storyboardToText, shotAllowsText, type StoryShot,
+} from './storyboardScript';
+import { buildFramePrompt, buildMotionPrompt, buildLegacyPrompt, DEFAULT_STYLE_LOCK } from './shotPrompts';
+
+/**
+ * 用户文案框里的东西是【完整脚本】还是【一句想法】?
+ *
+ * 决定 scriptMode:脚本 → strict(逐字保真,只做结构化,绝不让 AI 改写);
+ *                想法 → ai(拿它当主题去写一篇合适的稿子)。
+ * 🚨 原来只判「非空」,于是「讲讲比特币减半」这种一句话想法也被当成完整脚本,
+ *   整条片子就只剩那一句。判据(任一成立即视为脚本):
+ *     ① 带分镜/场景/旁白/台词这类结构标记(明显是写好的脚本)
+ *     ② 够长(≥60 字)
+ *     ③ 多句(≥3 句)
+ * 宁可把「短脚本」误判成想法 —— 那条路会拿它当主题扩写,产出仍然合理;
+ * 反过来把想法当脚本才是灾难(片子只有一句话)。
+ */
+function looksLikeFullScript(text: string): boolean {
+  const s = (text || '').trim();
+  if (!s) return false;
+  if (/分镜|镜头\s*[\d一二三四五六七八九十]|场景\s*[\d一二三四五六七八九十]|画面[：:]|旁白[：:]|台词[：:]|字幕[：:]|shot\s*\d|scene\s*\d/i.test(s)) return true;
+  if (s.length >= 60) return true;
+  const sentences = s.split(/[。！？!?\n]+/).map((x) => x.trim()).filter((x) => x.length > 1).length;
+  return sentences >= 3;
+}
+import { resolvePublishCaption } from './publishCaptionWriter';
+import { setCurrentVideoTask, clearCurrentVideoTask, videoTypeLabel } from './videoRunWindow';
+
+export type VideoAspect = '9:16' | '16:9' | '1:1';
+export type VideoPublishTarget = 'local' | 'douyin' | 'xhs' | 'binance';
+export type SubtitlePosition = 'top' | 'center' | 'lower' | 'bottom';
+
+/** aspect → 成片宽高(短边 1080)。 */
+function aspectToSize(aspect: VideoAspect): { width: number; height: number } {
+  switch (aspect) {
+    case '16:9': return { width: 1920, height: 1080 };
+    case '1:1': return { width: 1080, height: 1080 };
+    case '9:16':
+    default: return { width: 1080, height: 1920 };
+  }
+}
+
+/** aspect → 素材库搜索方向。 */
+function aspectToOrientation(aspect: VideoAspect): StockOrientation {
+  switch (aspect) {
+    case '16:9': return 'landscape';
+    case '1:1': return 'square';
+    case '9:16':
+    default: return 'portrait';
+  }
+}
+
+/** aspect → Seedance ratio 字段。 */
+function aspectToSeedanceRatio(aspect: VideoAspect): '9:16' | '16:9' | '1:1' {
+  if (aspect === '16:9') return '16:9';
+  if (aspect === '1:1') return '1:1';
+  return '9:16';
+}
+
+/**
+ * 【已降级为兜底路径】给一句口播稿构造单个 Seedance prompt。
+ *
+ * ⚠️ 这个函数的输出原本【同时】喂给图像模型(故事板首帧)和视频模型(片段生成)——
+ *   图像模型收到 "运镜:缓慢推近…避免时间闪烁" 这类视频专属指令,根本不知道要画什么,
+ *   这是首帧画错、进而整片跑偏的根因。
+ *
+ * 正常链路现在走分镜表:buildFramePrompt(给图) + buildMotionPrompt(给视频),见 shotPrompts.ts。
+ * 本函数仅在【分镜表构建失败】时作降级使用,保持老行为不变(绝不阻塞出片)。
+ */
+function buildSeedancePrompt(
+  sentence: string,
+  opts: { track?: string; persona?: string; lang?: string; isI2V?: boolean; shotIndex?: number },
+): string {
+  return buildLegacyPrompt(sentence, opts);
+}
+
+/**
+ * AI 大分镜:把逐句碎分镜合并成更长的段(每段旁白约 8–12s),减少切刀、更连贯,
+ * 也减少 Seedance"单镜最短时长"带来的浪费。按字数估时长(CJK ~4.5 字/秒):
+ * 累加到 ≥MIN 就出一段,超过 MAX 先把当前段收尾再起新段。Seedance(1.x/lite)单次
+ * 上限 12s,所以 MAX 字数对应 ≤~12s。
+ */
+function mergeSentencesForAi(sents: string[]): string[] {
+  const hasCJK = sents.some((s) => /[぀-ヿ㐀-鿿가-힯]/.test(s));
+  const MIN = hasCJK ? 36 : 90;   // ≈8s
+  const MAX = hasCJK ? 54 : 135;  // ≈12s(Seedance 单镜上限)
+  const out: string[] = [];
+  let buf = '';
+  for (const s of sents) {
+    if (buf && (buf.length + 1 + s.length) > MAX) { out.push(buf); buf = s; }
+    else buf = buf ? `${buf} ${s}` : s;
+    if (buf.length >= MIN) { out.push(buf); buf = ''; }
+  }
+  if (buf) out.push(buf);
+  return out.length ? out : sents;
+}
+
+/** 失败镜降级:借最近(左右就近)一个成功生成的片段路径;都没有返回 null。 */
+function findNearestClip(results: SeedanceClipResult[], i: number): string | null {
+  for (let d = 1; d < results.length; d++) {
+    const a = results[i - d];
+    if (a && a.path) return a.path;
+    const b = results[i + d];
+    if (b && b.path) return b.path;
+  }
+  return null;
+}
+
+export interface VideoCreationInput {
+  persona: string;
+  track: string;
+  keywords: string[];
+  /**
+   * 视频文案。语义随 scriptMode 变:
+   *   · strict → 逐字朗读的成片文案(必填),视频长度由其字数决定。
+   *   · ai     → 仅作 AI 写稿的参考方向(可空),最终文案由 DeepSeek 生成。
+   */
+  script: string;
+  /**
+   * 文案模式。'strict' = 严格按用户文案逐字出片;'ai' = AI 写稿(用户文案作参考)。
+   * 缺省时按老逻辑兼容:有 script → strict,无 → ai。
+   */
+  scriptMode?: 'strict' | 'ai';
+  /**
+   * 画面引擎(成片方式):
+   *   · 'stock'(默认) → AI 分镜 + 在线素材库空镜(+可选本地上传混拼)。
+   *   · 'ai'           → Seedance AI 自动成片:逐镜用 Seedance 生成视频片段,
+   *                      参考图(≤2)做风格/人设统一;失败镜降级到参考图静帧/邻镜。
+   *                      走服务端代理(/api/video/seedance/*),逐片段计费 + 失败退款。
+   */
+  engine?: 'stock' | 'ai' | 'template' | 'hotspot' | 'thread' | 'localmix' | 'repost' | 'uploadonly';
+  /** engine==='repost'(翻译搬运):源视频链接(与 repostSourceFile 二选一,走 yt-dlp 通用下载)。 */
+  repostSourceUrl?: string;
+  /** engine==='repost':本地源视频文件绝对路径(与 repostSourceUrl 二选一,优先)。 */
+  repostSourceFile?: string;
+  /** engine==='repost':目标语言(翻译+配音,如 'zh'/'en'/'ja');空回落 scriptLang。 */
+  repostTargetLang?: string;
+  /** engine==='repost':源语言 hint(可选,给 ASR;空=auto 检测)。 */
+  repostSourceLang?: string;
+  /** engine==='repost':是否把原声压低垫底保留 BGM/音效(默认关=纯配音替换)。 */
+  repostKeepBgm?: boolean;
+  /** AI 引擎分辨率档(成本敏感):'480p'|'720p'(默认)|'1080p'。 */
+  seedanceResolution?: '480p' | '720p' | '1080p';
+  /** AI 引擎模型档位:'lite'(1.0 Lite) | 'pro'(1.0 Pro) | 'pro15'(1.5 Pro,默认) | 'v2'(2.0)。 */
+  seedanceModel?: 'lite' | 'pro' | 'pro15' | 'v2';
+  /**
+   * engine==='ai'(电影级)是否启用【分镜表】链路(默认启用)。
+   * 分镜表把口播 / 画面 / 运动彻底分家:narration 只进 TTS、visualFirst 只进图像模型、
+   * motion 只进视频模型;同时解除 45s 硬上限。
+   * 显式传 false = 回到老链路(整篇 splitScript + 大分镜合并 + 45s 截断),用于出问题时兜底。
+   */
+  useStoryboardTable?: boolean;
+  /**
+   * engine==='ai':用户在分镜表界面确认/编辑过的分镜。传了就【直接用】,不再跑解析/派生
+   * (省一次 AI 调用,也保证用户改过的内容原样生效)。
+   */
+  storyboardShots?: StoryShot[];
+  /** engine==='template'(模板速生)专属配置;其它 engine 忽略。 */
+  template?: TemplateOptions;
+  /** engine==='hotspot'(热搜成片)专属:用户勾选的热点源('hotsearch'|'web3'|'tech')。
+   *  每次运行从这些源最新 20 条随机挑 1 条选题,服务端联网取材 → 写稿 → Serper 配图。 */
+  hotspotSources?: string[];
+  /** engine==='hotspot' 素材来源:'image'(默认,Serper 配图 Ken Burns)|
+   *  'douyin'(按标题搜抖音、下无水印视频混剪 + 底部黑条盖原字幕 + 配音)。 */
+  hotspotMaterialSource?: 'image' | 'douyin';
+  /** engine==='hotspot' 赛道筛选(可选):track-presets 赛道 id,选题只从该赛道相关热点里挑;
+   *  空 = 不过滤。该轮无相关 → backend 回退全量 + trackMiss,这里打日志。 */
+  hotspotTrack?: string;
+  /** 赛道显示名(展示/日志用)。 */
+  hotspotTrackName?: string;
+  /** engine==='thread'(爆帖成片)专属。内容源,v1 只有 'reddit'(字段留给以后加贴吧/虎扑等)。 */
+  threadSource?: 'reddit';
+  /** engine==='thread':勾选的 subreddit(如 ['AskReddit','tifu'])。 */
+  threadSubreddits?: string[];
+  /** engine==='thread':画面风格。'cards'(默认)= Reddit 真截图卡;'karaoke' = 跳字大字幕(TikTok 爆款风,不放截图卡);'both' = 截图卡 + 跳字。 */
+  threadCaptionStyle?: 'cards' | 'karaoke' | 'both';
+  /** engine==='thread':创作语言(卡片文字 + 口播都用它;'en' = 原声不翻译)。默认 zh。 */
+  threadLang?: 'zh' | 'en' | 'ja' | 'ko';
+  /** engine==='thread':游戏录屏背景来源。'douyin'(默认,国内可用)| 'youtube'(需 VPN)。 */
+  threadBgSource?: 'douyin' | 'youtube';
+  /** engine==='thread':背景选择('random' 或服务端清单里的背景/搜索词 id)。 */
+  threadBgChoice?: string;
+  /** engine==='thread'(矩阵):Reddit 取材账号 id(用该号指纹内核抓帖+截图;空 = 自动选/无头兜底)。 */
+  threadMaterialAccountId?: string;
+  /** engine==='localmix'(本地混剪)专属:本地素材文件夹绝对路径(出片时实时扫,新增素材下次运行自动用上)。 */
+  localMixFolder?: string;
+  /** engine==='localmix':素材形态。'video'=文件夹里的视频按换镜节奏循环拼接;'image'=图片逐镜 Ken Burns 合成。 */
+  localMixMediaType?: 'video' | 'image';
+  /** engine==='localmix':原片直发。true=不写稿/不配音/不字幕/不混剪,从文件夹挑一条原片直接发布(script 字段此时当「视频介绍」,AI 据此生成标题/简介/标签)。 */
+  uploadOnly?: boolean;
+  /** engine==='localmix':直接选中的素材文件(与 localMixFolder 二选一,非空时优先于文件夹)。 */
+  localMixFiles?: string[];
+  referenceImages: string[];
+  /**
+   * 用户上传的本地视频素材绝对路径(画面来源 = 本地上传)。非空时直接拿这些
+   * 片段循环拼成片,跳过在线素材库搜索(连 DeepSeek 搜索词也省了)。
+   */
+  localVideos?: string[];
+  aspect: VideoAspect;
+  /**
+   * 老字段,保留兼容(数据库 / 老任务可能还有 publishTarget:'local')。
+   * 新字段 publishPlatforms 才是【实际发哪几个平台】的来源 —— pipeline 出片完成后
+   * iterator forEach 它,对每个平台 driver 调 upload(不在数组里的不发,数组空 = 仅存本地)。
+   * 用户在向导里勾选 9 平台中的 N 个,持久化到这里(空数组等价于以前的 'local')。
+   */
+  /**
+   * 老字段,已废弃,只为兼容老任务/数据库里残留的 publishTarget:'local'。
+   * 实际发哪几个平台只看 publishPlatforms,不要再读这个字段。改可选,新建任务不写。
+   */
+  publishTarget?: VideoPublishTarget;
+  publishPlatforms?: string[];
+  /**
+   * 矩阵号 edition:每个发布平台选定的矩阵账号 id(平台→accountId)。非空时发布走该号
+   * 的指纹内核 CDP(runMatrixDriver),不走扩展。空 / 非矩阵 → 仍走旧 runPublishStep(扩展)。
+   */
+  publishAccounts?: Record<string, string>;
+  /**
+   * 平台发布文案(用户向导可选填,覆盖 AI 自动生成)。这三个是【配在视频下方钩人点击】
+   * 的文案,跟口播稿 / 视频标题是不同产物 —— 详见 publishCaptionWriter.ts。
+   * 都留空 → 出片时 AI 自动生成(generatePublishCaption);用户填了 → 用用户的。
+   */
+  publishTitle?: string;     // 钩人标题(B站/头条号标题 + 小红书标题 + 抖音 caption 开头)
+  publishCaption?: string;   // 正文(简介 + 引导互动)
+  hashtags?: string[];       // 话题标签(driver 按平台加 #)
+  /** 可选背景音乐本地路径。空 = 不加 BGM。 */
+  bgmPath?: string;
+  /** BGM 音量(0~1),默认 0.18。 */
+  bgmVolume?: number;
+  /** 目标视频时长(秒),仅在自动生成文案时用于控制长度。默认 45。 */
+  targetSeconds?: number;
+  /**
+   * 是否用在线素材【视频】(优先于图片)。默认 true。视频效果远好过图片
+   * Ken Burns(抄 MoneyPrinterTurbo)。下载失败/无匹配时自动降级到图片/文字卡。
+   */
+  useStockVideo?: boolean;
+  /** 口播稿语言(创作语言,ContentLang 码,如 'zh'/'zh-TW'/'en'/'ja'/'vi'…)。
+   *  空/'auto' = 维持原行为:按 文案→关键词→热点标题 自动探测。向导里与配音音色语种联动。 */
+  scriptLang?: string;
+  /** edge-tts 音色,空 = 用配置默认(zh-CN-XiaoxiaoNeural)。 */
+  voice?: string;
+  /** 语速档(-50~+50,单位%),0/空 = 正常语速。 */
+  voiceRate?: number;
+  /**
+   * 是否生成口播旁白 + 字幕。默认 true。
+   * 仅在 engine==='ai'(Seedance)下可设 false = 纯画面片:跳过 TTS、不烧字幕,
+   * 镜头时长按分镜稿字数估算,音频只用 BGM(没选则静音)。其它模式忽略此字段。
+   */
+  narrationEnabled?: boolean;
+  /** 是否烧字幕。默认 true。 */
+  subtitleEnabled?: boolean;
+  /** 字幕字号(成片原始分辨率下像素)。默认 52。 */
+  subtitleFontSize?: number;
+  /** 字幕位置。默认 bottom。 */
+  subtitlePosition?: SubtitlePosition;
+  /** 字幕文字颜色(#RRGGBB)。空 = 白色。 */
+  subtitleColor?: string;
+  /** 字幕描边颜色(#RRGGBB)。空 = 不描边(用半透明黑底盒)。 */
+  subtitleStrokeColor?: string;
+  /** 字幕字体文件名(resources/fonts/ 下,如 SmileySans-Oblique.ttf)。空 = 默认思源黑体。 */
+  subtitleFont?: string;
+  /** 每段素材最长秒数(换镜节奏)。默认 4,越小换镜越快。 */
+  maxClipSeconds?: number;
+  /**
+   * 一次出片数量(1~5)。抄 MoneyPrinterTurbo:复用同一份脚本 + 配音,
+   * 只对每条做不同的素材片段组合,平台费按条数 ×N。默认 1。
+   */
+  videoCount?: number;
+  /** 热搜成片专属:每次运行出片条数随机区间 [min,max](主进程在区间内取 N 跑外层循环,
+   *  每条独立选题+写稿+按条计费)。缺省 = 1。详见 renderer VideoCreationInput 同名字段。 */
+  videoCountMin?: number;
+  videoCountMax?: number;
+  /**
+   * v6.x: 所属视频任务 id。传入时,成片输出到【按任务】的文件夹
+   * (视频创作/<id前8位>_<任务名>/<日期>/<批次号>/),详情页顶部「输出目录」稳定指向
+   * 任务总目录(视频创作/<id前8位>_<任务名>/),每次运行在其下按 日期/批次号 分桶
+   * (对齐涨粉任务 getTaskDirPath/getNextBatch 的按任务+批次分目录)。
+   * 缺省(无任务上下文的老调用)退回按日期+批次分桶。
+   */
+  taskId?: string;
+  /** v6.x: 任务标题,派生输出文件夹名用(配合 taskId)。 */
+  taskTitle?: string;
+}
+
+export interface ProgressStep {
+  key: string;
+  label: string;
+  status: 'waiting' | 'running' | 'done' | 'error';
+}
+
+export interface VideoCreationProgress {
+  jobId: string;
+  status: 'running' | 'done' | 'error';
+  steps: ProgressStep[];
+  message?: string;
+  outputPath?: string;
+  error?: string;
+  /** 本次出片累计消耗的 DeepSeek token(写稿 + 搜索词);TTS/ffmpeg 免费不计。 */
+  tokensUsed?: number;
+  /** 本次出片累计 USD 成本(服务端权威 _noobclaw.costUsd 之和);老后端时为 0。 */
+  costUsd?: number;
+  /** 成片输出目录(开跑即确定,供详情页顶部展示)。 */
+  outputDir?: string;
+  /** 本次实际产出的成片条数(批量出片时>1,随终态 done 事件带回供渲染端计数)。 */
+  videoCount?: number;
+  /** 本次最终采用的分镜稿(纯文本)。分镜定下来时发一次,渲染端存进运行记录给用户看。 */
+  storyboardText?: string;
+}
+
+export interface VideoCreationResult {
+  ok: boolean;
+  /** 首条成片路径(兼容老调用 / 单条场景)。 */
+  outputPath?: string;
+  /** 批量出片时的全部成片路径(videoCount>1 时长度>1)。 */
+  outputPaths?: string[];
+  error?: string;
+  /** 用户主动停止(非失败):渲染端据此显示「已停止」而非红色报错。 */
+  aborted?: boolean;
+}
+
+export type ProgressEmitter = (p: VideoCreationProgress) => void;
+
+// v2: 「拆解文案分镜」原是独立一步,但它只是本地纯文本 splitScript()(无 AI、无
+// 耗时),单列一步徒增噪音 → 合并进「脚本」步(脚本生成完顺手拆句,同一步内完成)。
+const STEP_DEFS: { key: string; label: string }[] = [
+  { key: 'script', label: '生成脚本 · 拆解分镜' },
+  { key: 'tts', label: '生成 AI 配音' },
+  { key: 'visuals', label: '准备画面素材' },
+  { key: 'compose', label: '合成视频' },
+  // 5: publish —— 出片完成后,遍历用户勾选的平台调对应 driver(未登录跳过,不杀任务)。
+  //   即使 publishPlatforms 为空也保留这一步:tracker.finish 会自动把所有未完成步骤标 done,
+  //   日志里推「📂 未选发布平台 · 仅存本地」让用户看清楚。
+  { key: 'publish', label: '发布到各大平台' },
+];
+
+export class ProgressTracker {
+  private steps: ProgressStep[];
+  // 累计 token + USD 成本 + 输出目录随每次 emit 带回,渲染端无需自己算。
+  private tokensUsed = 0;
+  private costUsd = 0;
+  private outputDir?: string;
+  // 运行记录落盘:每行 message 同步追加到本地 markdown 文件(跟其他任务的本地记录一致,跟成片放一起)。
+  private logFile?: string;
+  // stepDefs 可定制:stock/ai 用默认 4 步;template 速生传自己的步骤集。
+  constructor(private jobId: string, private emit?: ProgressEmitter, stepDefs: { key: string; label: string }[] = STEP_DEFS) {
+    this.steps = stepDefs.map((s) => ({ ...s, status: 'waiting' as const }));
+  }
+  /** 设运行记录 markdown 文件(写 markdown 表头)。runVideoPipeline 在拿到 runDir 后调一次;失败不影响主流程。 */
+  setLogFile(p: string) {
+    try {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.appendFileSync(p, `# 🎬 视频运行记录\n\n- **开始时间**: ${new Date().toLocaleString('zh-CN', { hour12: false })}\n- **任务**: ${this.jobId}\n\n## 进度日志\n\n`);
+      this.logFile = p;
+    } catch { /* 落盘失败不影响任务 */ }
+  }
+  private send(status: 'running' | 'done' | 'error', message?: string, extra?: Partial<VideoCreationProgress>) {
+    // 心跳消息(以「已等 M:SS」结尾的等待计时)只推给 UI 做原地更新,不写进运行记录 ——
+    //   否则 AI 离线档等 30 分钟会往 markdown 里灌上百条只差几秒的行。约定见 seedanceProvider。
+    if (message && this.logFile && !/\s已等 \d+:\d{2}$/.test(message)) {
+      // 每行做成 markdown 列表项:`- `[时:分:秒]` message`(跟其他任务的本地记录一样是 .md)。
+      try { fs.appendFileSync(this.logFile, `- \`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}]\` ${String(message).replace(/\n/g, ' ')}\n`); } catch { /* 忽略落盘错误 */ }
+    }
+    this.emit?.({
+      jobId: this.jobId,
+      status,
+      steps: this.steps.map((s) => ({ ...s })),
+      message,
+      tokensUsed: this.tokensUsed,
+      costUsd: this.costUsd,
+      outputDir: this.outputDir,
+      ...extra,
+    });
+  }
+  /** 累加本步 token + USD 成本,并随下次 emit 把最新累计值带回去。 */
+  addTokens(n: number, costUsd = 0) {
+    this.tokensUsed += Math.max(0, Number(n) || 0);
+    this.costUsd += Math.max(0, Number(costUsd) || 0);
+  }
+  /** 出片目录开跑即确定,设一次即可,后续每次 emit 都会带上。 */
+  setOutputDir(dir: string) {
+    this.outputDir = dir;
+  }
+  /** 分镜定下来时把分镜稿发给渲染端存档(详情页展示用)。只发一次,不进 markdown 运行记录。 */
+  sendStoryboard(text: string) {
+    if (!text || !text.trim()) return;
+    this.emit?.({
+      jobId: this.jobId,
+      status: 'running',
+      steps: this.steps.map((s) => ({ ...s })),
+      tokensUsed: this.tokensUsed,
+      costUsd: this.costUsd,
+      outputDir: this.outputDir,
+      storyboardText: text,
+    });
+  }
+  start(key: string, message?: string) {
+    const s = this.steps.find((x) => x.key === key);
+    if (s) s.status = 'running';
+    this.send('running', message);
+  }
+  done(key: string, message?: string) {
+    const s = this.steps.find((x) => x.key === key);
+    if (s) s.status = 'done';
+    this.send('running', message);
+  }
+  progress(message: string) {
+    this.send('running', message);
+  }
+  fail(key: string | null, error: string) {
+    if (key) {
+      const s = this.steps.find((x) => x.key === key);
+      if (s) s.status = 'error';
+    }
+    this.send('error', undefined, { error });
+  }
+  /**
+   * 发「完成」终态。
+   * @param aborted 用户点了停止但成片已落地(「成了,只是没发布」)。渲染端据此显示
+   *   「已停止」而不是「生成完成」—— 不带这个标记的话用户点了停止却看到完成 + 计数 +1。
+   */
+  finish(outputPath: string, videoCount = 1, aborted = false) {
+    this.steps.forEach((s) => { if (s.status !== 'done') s.status = 'done'; });
+    this.send('done', undefined, { outputPath, videoCount, ...(aborted ? { aborted: true } : {}) });
+  }
+}
+
+/** 把参考文案拆成逐句分镜。 */
+export function splitScript(script: string): string[] {
+  const raw = (script || '').replace(/\r\n/g, '\n');
+  // 语言自适应:CJK 文本字符密度高(中文约 4.5 字/秒),拉丁文本同样秒数字符多得多。
+  // 阈值/合并按是否含 CJK 切换,避免英文/日文被按中文阈值切得过碎、撞到 40 镜上限被截断。
+  const hasCJK = /[぀-ヿ㐀-鿿가-힯]/.test(raw);
+  const longLimit = hasCJK ? 36 : 110;   // 单镜过长再按逗号细切的阈值
+  const shortLimit = hasCJK ? 4 : 12;    // 过短碎句并入上一镜的阈值
+  const sep = hasCJK ? '，' : ', ';       // 细切后回拼用的分隔符
+
+  // 先按换行 + 句末标点切(英文句号 `. ` / 句末句号也算一刀)
+  const rough = raw
+    .split(/[\n。！？!?；;]+|\.(?=\s|$)/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const scenes: string[] = [];
+  for (const piece of rough) {
+    // 过长的句子再按逗号切,单镜别太挤(中英文逗号 + 顿号都算)
+    if (piece.length > longLimit) {
+      const sub = piece.split(/[,，、]+/).map((s) => s.trim()).filter(Boolean);
+      let buf = '';
+      for (const part of sub) {
+        if ((buf + part).length > longLimit && buf) {
+          scenes.push(buf);
+          buf = part;
+        } else {
+          buf = buf ? `${buf}${sep}${part}` : part;
+        }
+      }
+      if (buf) scenes.push(buf);
+    } else {
+      scenes.push(piece);
+    }
+  }
+
+  // 合并过短碎句到上一镜
+  const merged: string[] = [];
+  for (const s of scenes) {
+    if (s.length < shortLimit && merged.length > 0) {
+      merged[merged.length - 1] += `${sep}${s}`;
+    } else {
+      merged.push(s);
+    }
+  }
+
+  return merged.slice(0, 40); // 安全上限
+}
+
+/** 文件夹名清洗:剔除路径非法字符 + 折叠空白,限长(中文标题照样可用)。 */
+function sanitizeFolderName(s: string): string {
+  return (s || '')
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 40);
+}
+
+/** 本地日期串 年-月-日(对齐 scenario artifactWriter.todayStr)。 */
+function todayStr(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/**
+ * 当天目录里下一个运行批次号(扫已有数字子目录取 max+1)。同一任务同一天每跑一次 +1。
+ * 算法照搬 scenario artifactWriter.getNextBatch,让视频与涨粉任务的批次目录规范一致。
+ */
+function getNextBatch(dayDir: string): number {
+  try {
+    if (!fs.existsSync(dayDir)) return 1;
+    let max = 0;
+    for (const e of fs.readdirSync(dayDir)) {
+      const n = parseInt(e, 10);
+      if (!isNaN(n) && n > max) max = n;
+    }
+    return max + 1;
+  } catch {
+    return 1;
+  }
+}
+
+/**
+ * 成片目录,对齐 scenario 的「任务总目录 + 日期 + 批次号」规范:
+ *   · taskDir(详情页顶部「输出目录」指向它,稳定不随运行变):
+ *       - 有 taskId → 视频创作/<id前8位>_<任务名>/
+ *       - 无 taskId(老调用)→ 视频创作/<年-月-日>/(日期桶充当任务根)
+ *   · runDir(本次运行实际写成片的目录)= taskDir/<年-月-日>/<批次号>/
+ *       同一任务同一天每手动跑一次新建 1/、2/、3/…(无 taskId 时任务根已是日期,不再套一层)。
+ *   一次批量出片(videoCount>1)只调一次 → N 条成片同落一个 <批次号>/,靠文件名 _N 后缀区分。
+ */
+export function resolveOutputDirs(input?: { taskId?: string; taskTitle?: string }): { taskDir: string; runDir: string } {
+  // 根目录用户可在设置页改(默认仍是 文档\NoobClaw\视频创作),每次开跑现读现用。
+  const root = resolveVideoOutputRoot();
+  let taskDir: string;
+  let dayDir: string;
+  if (input?.taskId) {
+    const folder = sanitizeFolderName(`${input.taskId.slice(0, 8)}_${input.taskTitle || ''}`) || input.taskId.slice(0, 8);
+    taskDir = path.join(root, folder);
+    dayDir = path.join(taskDir, todayStr());
+  } else {
+    // 无任务上下文:日期桶既当任务根(UI 显示)又当当天目录,批次号直接挂其下,避免 日期/日期 套娃。
+    taskDir = path.join(root, todayStr());
+    dayDir = taskDir;
+  }
+  const runDir = path.join(dayDir, String(getNextBatch(dayDir)));
+  fs.mkdirSync(runDir, { recursive: true });
+  return { taskDir, runDir };
+}
+
+export function outputFileName(index = 0): string {
+  const t = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  // 批量出片在同一秒内循环写多条 → 时间戳会撞;index>0 时加序号后缀避免覆盖。
+  const suffix = index > 0 ? `_${index + 1}` : '';
+  return `video_${t.getFullYear()}${pad(t.getMonth() + 1)}${pad(t.getDate())}_${pad(t.getHours())}${pad(t.getMinutes())}${pad(t.getSeconds())}${suffix}.mp4`;
+}
+
+/** 主入口:跑完整流水线,返回成片结果。 */
+/**
+ * 出片总入口。在内部实现 runVideoPipeline 外包一层,出片结束(成功/失败)后
+ * 异步 fire-and-forget 上报到后端 user_task_runs(admin 巡检视频创作任务)。
+ *
+ * ⚠️ 上报绝不 await、绝不 throw、绝不阻塞出片(用户硬约束)。这里截一份 emit
+ * 来记录最后一次累计 token / 成本(VideoCreationResult 本身不带),仅用于上报,
+ * 不改变任何对渲染端的行为。
+ */
+/** 用户点「停止」时,signal 被 abort → 在步骤边界抛出,让 pipeline 干净退出。 */
+export function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error('VIDEO_ABORTED:已停止');
+}
+
+// ── 本地混剪(engine='localmix'):扫本地素材文件夹 ──
+// 只扫【顶层】文件(不递归,防用户误选盘根把几万个文件读进来);按扩展名分视频/图片。
+// 向导选文件夹时(sidecar IPC video:scanLocalFolder)和出片时(visuals 分支)共用 —— 出片时
+// 实时重扫,用户往文件夹里加新素材,下次运行自动用上。
+const LOCALMIX_VIDEO_EXTS = new Set(['.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi']);
+const LOCALMIX_IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp']);
+export function scanLocalMediaFolder(dir: string): { videos: string[]; images: string[] } {
+  const out = { videos: [] as string[], images: [] as string[] };
+  try {
+    const d = String(dir || '').trim();
+    if (!d || !fs.existsSync(d) || !fs.statSync(d).isDirectory()) return out;
+    for (const name of fs.readdirSync(d)) {
+      const p = path.join(d, name);
+      try { if (!fs.statSync(p).isFile()) continue; } catch { continue; }
+      const ext = path.extname(name).toLowerCase();
+      if (LOCALMIX_VIDEO_EXTS.has(ext)) out.videos.push(p);
+      else if (LOCALMIX_IMAGE_EXTS.has(ext)) out.images.push(p);
+    }
+    // 排序保证第 0 条按稳定顺序铺(后续条洗牌出不同组合)。
+    out.videos.sort(); out.images.sort();
+  } catch { /* 扫不了当空处理,调用方给用户可读提示 */ }
+  return out;
+}
+
+/** 直接选中的素材文件(localMixFiles)按扩展名分视频/图片;不存在的文件跳过。 */
+export function classifyLocalMediaFiles(paths: string[]): { videos: string[]; images: string[] } {
+  const out = { videos: [] as string[], images: [] as string[] };
+  for (const raw of Array.isArray(paths) ? paths : []) {
+    const p = String(raw || '').trim();
+    if (!p) continue;
+    try { if (!fs.existsSync(p) || !fs.statSync(p).isFile()) continue; } catch { continue; }
+    const ext = path.extname(p).toLowerCase();
+    if (LOCALMIX_VIDEO_EXTS.has(ext)) out.videos.push(p);
+    else if (LOCALMIX_IMAGE_EXTS.has(ext)) out.images.push(p);
+  }
+  return out;
+}
+
+/**
+ * 批量编排:决定一次任务出几条,外层逐条独立跑 generateVideo,聚合成【唯一一次】终态。
+ *   · stock      → N = videoCount(1~100)
+ *   · hotspot    → N = 随机 [videoCountMin, videoCountMax](每条独立选题,pipeline 内部恒 1 条)
+ *   · ai/template→ 1 条(Seedance 逐帧烧钱 / 模板单次)
+ * ⚠️ 必须是【所有 video:generate 入口】的统一编排:main.ts 的 IPC handler 和 sidecar-server 的
+ *    video:generate(scenario 定时/后台任务走这条!)都要调本函数 —— 否则走 sidecar 的任务拿不到
+ *    batch,hotspot/stock 永远只出 1 条(用户实测:设 2 条却只出 1 条就结束)。
+ *    每条都【完整跑完】(本地保存 + 按需发布)才进下一条,中途不提前结束。
+ */
+let _videoBatchBusy = false; // ③ 进程级单飞闸:同一进程同时只跑一条视频流水线
+/**
+ * 谁持有闸门、什么时候拿的、它的中断信号。
+ *
+ * ⚠️【真机 bug】闸门只在 finally 里释放。一旦流水线卡在某个不响应停止的等待上
+ *   (合成超时上限现在按片长算、最长 3 小时),finally 就永远不执行 —— 用户点了停止、
+ *   界面也显示停了,可**之后每个视频任务都被这道闸挡掉**,只能重启 app。
+ *   所以要记住持有者是谁:① 报错时说清被谁占着、占了多久;② 持有者已经被 abort
+ *   且僵住超过 ZOMBIE_TAKEOVER_MS 就允许接管 —— 那时它已经是僵尸,继续挡着只会更糟。
+ */
+let _videoBatchHolder: { taskId: string; startedAt: number; signal?: AbortSignal } | null = null;
+/** 闸门持有令牌:接管后老的持有者 finally 不能再把【别人的】闸门放掉。 */
+let _videoBatchToken = 0;
+/** 被停止的持有者僵住多久算僵尸。正常 abort 几秒内就该收尾,给到 60s 已很宽。 */
+const ZOMBIE_TAKEOVER_MS = 60_000;
+
+export async function generateVideoBatch(
+  input: VideoCreationInput,
+  emit?: ProgressEmitter,
+  signal?: AbortSignal,
+): Promise<VideoCreationResult> {
+  // ③ 已有视频流水线在跑 → 跳过本次(匹配 videoQueue「占用即跳过、不排队」),防两条视频任务并发
+  //    抢同一个 video_publish 窗口 / 抖音 tab 串台(用户实测:要 2 条却出 3 条 + 画面串台)。
+  //    无论从哪条入口(main IPC / sidecar / createAndRun / 调度)进来,都在此唯一汇合点拦住。
+  if (_videoBatchBusy) {
+    const h = _videoBatchHolder;
+    const heldMs = h ? Date.now() - h.startedAt : 0;
+    const heldSec = Math.round(heldMs / 1000);
+    const holderAborted = !!h?.signal?.aborted;
+    // 持有者已被停止、却还僵着不放 → 它已经是僵尸,接管。继续挡下去只会让用户以为
+    //   整个视频功能坏了(真机:停了一个任务后,所有视频任务点了就失败)。
+    // ⚠️ 只在【已 abort】时才接管。没 abort 说明人家真在跑,强行接管会变成两条流水线
+    //    并发抢同一个发布窗口 —— 那正是这道闸当初要防的事(也确实出过两个下载器同时跑)。
+    if (holderAborted && heldMs >= ZOMBIE_TAKEOVER_MS) {
+      console.warn(`[video] 接管僵死闸门:持有者 task=${h?.taskId} 已停止但仍占用 ${heldSec}s`);
+      emit?.({
+        jobId: (input as any).taskId, status: 'running', steps: [],
+        message: `⚠️ 上一个任务已停止但未完全收尾(占用 ${heldSec}s),已强制接管继续`,
+      } as any);
+    } else {
+      const who = h?.taskId ? `任务 ${String(h.taskId).slice(0, 8)}` : '另一个任务';
+      const state = holderAborted ? '已停止,正在收尾' : '运行中';
+      emit?.({
+        jobId: (input as any).taskId, status: 'error', steps: [],
+        message: `已有视频任务在运行,本次跳过(${who} · ${state} · 已 ${heldSec}s;同时只跑一条,避免抢占视频窗口)`,
+        error: 'video_pipeline_busy',
+      } as any);
+      return { ok: false, error: `已有视频任务在运行,本次跳过(${state} · 已 ${heldSec}s)` } as VideoCreationResult;
+    }
+  }
+  _videoBatchBusy = true;
+  const myBatchToken = ++_videoBatchToken;
+  _videoBatchHolder = { taskId: String((input as any).taskId || ''), startedAt: Date.now(), signal };
+  // 运行窗 title 标【当前任务 id + 类型】(req 2);收尾在 finally 清。
+  setCurrentVideoTask((input as any).taskId, videoTypeLabel((input as any).engine));
+  try {
+  const inp = input as VideoCreationInput & { videoCountMin?: number; videoCountMax?: number };
+  const clampCount = (n: unknown, hi: number) => Math.max(1, Math.min(hi, Math.round(Number(n) || 1)));
+  let batch = 1;
+  if (inp.engine === 'stock') {
+    batch = clampCount(inp.videoCount, 100);
+  } else if (inp.engine === 'hotspot' || inp.engine === 'thread') {
+    // 兜底 videoCount:老任务(早期向导只存 videoCount、没存 min/max)也要正确出 N 条 ——
+    //   否则 videoCountMin=undefined → clampCount=1 → batch=1,出现「卡片显示 N 条、实际只跑 1 条」。
+    //   UI 标签(hotspotCountLabel)用 `videoCountMin ?? videoCount` 兜底,执行侧必须对齐同一口径。
+    //   爆帖成片(thread)同口径:每条独立选帖,batch 由 [min,max] 随机。
+    const lo = clampCount(inp.videoCountMin ?? inp.videoCount, 100);
+    const hi = Math.max(lo, clampCount(inp.videoCountMax ?? inp.videoCount, 100));
+    batch = lo + Math.floor(Math.random() * (hi - lo + 1));
+  }
+
+  // 单条:hotspot 恒 videoCount=1(条数完全由 batch 控制);其余原样。generateVideo 自己发终态。
+  if (batch <= 1) {
+    const single = inp.engine === 'hotspot' ? ({ ...inp, videoCount: 1 } as VideoCreationInput) : input;
+    return await generateVideo(single, emit, signal);
+  }
+
+  // 批量:逐条独立 generateVideo(videoCount=1),拦截单条终态转「第 X/N 条」批次进度,最后发唯一终态。
+  // 「本次消耗」要【跨条累计】(否则第 2 条起单条 pipeline 从 0 重新报 → 显示被清空,用户困惑):
+  //   cumTokens/cumCost = 已跑完条的成本之和;每条进度里加上当前条的实时值一起报 → 单调递增不回退。
+  const outputPaths: string[] = [];
+  let success = 0, failed = 0, stopped = false;
+  let cumTokens = 0, cumCost = 0;
+  for (let i = 0; i < batch; i++) {
+    if (signal?.aborted) { stopped = true; break; }
+    let curTokens = 0, curCost = 0;
+    const subEmit: ProgressEmitter = (p: any) => {
+      try {
+        if (typeof p?.tokensUsed === 'number') curTokens = p.tokensUsed;
+        if (typeof p?.costUsd === 'number') curCost = p.costUsd;
+        const merged = { ...(p as object), tokensUsed: cumTokens + curTokens, costUsd: cumCost + curCost };
+        if (p && (p.status === 'done' || p.status === 'error')) {
+          emit?.({ ...merged, status: 'running', batchIndex: i + 1, batchTotal: batch,
+            message: `第 ${i + 1}/${batch} 条${p.status === 'done' ? '已完成 ✅' : '失败,跳过 ⏭️'}` } as any);
+        } else {
+          emit?.({ ...merged, batchIndex: i + 1, batchTotal: batch } as any);
+        }
+      } catch { try { emit?.(p); } catch { /* ignore */ } }
+    };
+    let r: VideoCreationResult | undefined;
+    try {
+      r = await generateVideo({ ...inp, videoCount: 1 } as VideoCreationInput, subEmit, signal);
+    } catch {
+      failed++; cumTokens += curTokens; cumCost += curCost; continue; // 单条异常 → 跳过(已扣的钱仍计入累计)
+    }
+    cumTokens += curTokens; cumCost += curCost; // 把本条成本沉淀进累计,下一条在此基础上继续加
+    // ⚠️ 顺序要紧:先统计再 break。被停止的那一条可能是 `ok:true + aborted:true`
+    //    (「成片已保存,只是没发布」),先 break 会把它的 outputPath 丢掉 →
+    //    汇总变成「成功 0/N · 已停止」、终态 error、videoCount=0,而 mp4 明明在磁盘上
+    //    却在 UI 里完全找不到(单条路径却是 done + 有路径,同语义两种结果)。
+    if (r?.ok) {
+      success++;
+      if (r.outputPath && !outputPaths.includes(r.outputPath)) outputPaths.push(r.outputPath);
+      const rp = (r as any).outputPaths;
+      if (Array.isArray(rp)) for (const p of rp) if (p && !outputPaths.includes(p)) outputPaths.push(p);
+    } else if (!r?.aborted) {
+      failed++; // 被停止不算「失败」,不进 failed 计数
+    }
+    // 单条被用户停止 → 整批收手。字段是 `aborted`(VideoCreationResult 的定义),
+    // 早先这里写的是不存在的 `stopped`,判断恒 false,只靠下一轮循环头的 signal 检查兜住。
+    if (r?.aborted) { stopped = true; break; }
+  }
+  const summary = `批量完成:成功 ${success}/${batch} 条`
+    + (failed ? ` · 跳过 ${failed} 条` : '')
+    + (stopped ? ' · 已停止' : '');
+  emit?.({
+    jobId: (inp as any).taskId, status: success > 0 ? 'done' : 'error', steps: [],
+    message: summary, outputPath: outputPaths[0], videoCount: success,
+    tokensUsed: cumTokens, costUsd: cumCost, // 终态带【全批累计】成本,别让最后一刻被清
+    ...(success > 0 ? {} : { error: stopped ? '已停止' : '全部失败' }),
+  } as any);
+  return { ok: success > 0, outputPath: outputPaths[0], outputPaths, stopped } as unknown as VideoCreationResult;
+  } finally {
+    // ⚠️ 只能放【自己拿的】那道闸。被接管之后老持有者才姗姗来迟地走到这里,
+    //    若无条件置 false,就会把接管者正在用的闸门放掉 → 两条流水线并发。
+    if (_videoBatchToken === myBatchToken) {
+      _videoBatchBusy = false;
+      _videoBatchHolder = null;
+      clearCurrentVideoTask();
+    }
+  }
+}
+
+export async function generateVideo(
+  input: VideoCreationInput,
+  emit?: ProgressEmitter,
+  signal?: AbortSignal,
+): Promise<VideoCreationResult> {
+  const runId = randomUUID();
+  const startedAt = Date.now();
+  let lastTokens = 0;
+  let lastCost = 0;
+  const wrappedEmit: ProgressEmitter | undefined = (p) => {
+    if (typeof p?.tokensUsed === 'number') lastTokens = p.tokensUsed;
+    if (typeof p?.costUsd === 'number') lastCost = p.costUsd;
+    emit?.(p);
+  };
+
+  // 设当前任务中断信号 → 本次出片期间 ffmpegRuntime 所有 runFfmpeg(合成/探测)abort 时自动 SIGKILL。
+  setVideoAbortSignal(signal);
+  let result: VideoCreationResult;
+  try {
+    result = await runVideoPipeline(input, wrappedEmit, signal);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // 用户主动停止 → 标准化为「已停止」结果(渲染端据此显示停止态,不当报错)。
+    result = msg.startsWith('VIDEO_ABORTED')
+      ? { ok: false, error: '已停止', aborted: true }
+      : { ok: false, error: msg };
+  } finally {
+    setVideoAbortSignal(undefined);
+  }
+
+  try {
+    const { scheduleVideoRunReport } = require('../scenario/taskRunReporter');
+    scheduleVideoRunReport({
+      runId,
+      input: { track: input.track, keywords: input.keywords, publishPlatforms: input.publishPlatforms },
+      result,
+      startedAt,
+      finishedAt: Date.now(),
+      tokensUsed: lastTokens,
+      costUsd: lastCost,
+    });
+  } catch { /* non-fatal */ }
+
+  return result;
+}
+
+async function runVideoPipeline(
+  input: VideoCreationInput,
+  emit?: ProgressEmitter,
+  signal?: AbortSignal,
+): Promise<VideoCreationResult> {
+  // engine==='template'(模板速生):AI 现编动效 HTML → 逐帧渲染 → 编码。完全独立的
+  // 流水线(template-pipeline.ts),早分流出去,不与 stock/ai 共用下面的步骤。
+  if (input.engine === 'template') return runTemplatePipeline(input, emit, signal);
+  // engine==='thread'(爆帖成片):Reddit 神帖截图卡 + 游戏录屏背景。同样独立流水线早分流。
+  if (input.engine === 'thread') return runThreadPipeline(input, emit, signal);
+  // engine==='repost'(翻译搬运):源视频 → 转写 → 翻译 → 换配音 → 发布。独立流水线早分流。
+  if (input.engine === 'repost') return runRepostPipeline(input, emit, signal);
+
+  const jobId = `vid_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const tracker = new ProgressTracker(jobId, emit);
+
+  // 前置:ffmpeg 必须可用
+  if (!isFfmpegAvailable()) {
+    const err = 'ffmpeg 不可用(开发机请确保 PATH 上有 ffmpeg;打包版需内置 ffmpeg 资源)';
+    tracker.fail('script', err);
+    return { ok: false, error: err };
+  }
+
+  // 计费:模式一(AI 分镜 + 在线素材)预扣平台基础费(随机 $0.09~$0.18)。
+  // 为什么预扣而不是成片后扣:并发任务可能在本任务跑的过程里把余额扣光,等成片做完
+  // 再扣就成了「视频做出来了、钱却扣不到」= 我们亏。预扣 = 原子锁住这笔费用;成片失败
+  // 再按 chargeId 幂等退回(refundMode1Video)。
+  // 判定口径 = 是否用到在线素材(useStockVideo!==false):只要走在线素材库就收平台费,
+  // 哪怕用户同时上传了自己的本地视频混拼也照收(在线搜索/下载 + AI 搜索词都是真实成本);
+  // 仅当纯本地素材(useStockVideo===false,老任务路径)才不收平台费,只耗已实时扣过的 AI token。
+  // 批量出片(videoCount>1):脚本/配音/素材池复用一次,N 条画面并发合成。计费随条数走
+  // (服务端 /charge 按 videoCount + aiCostUsd 算):平台费向上限靠拢 + AI 费按条数线性叠加,
+  // 在下面 compose 阶段开跑前【一次性】预扣这笔(含全部条数)总费。chargeId/refundOnExit
+  // 跟踪这笔在途预扣,供「全部条目失败 / 异常」时 finally 兜底整笔退回。
+  // engine==='ai'(Seedance 自动成片)的钱在服务端【逐片段】扣(/seedance/create,
+  // 含 markup),且失败自动退款 —— 不再走这里的"平台基础费"预扣,避免重复收费。
+  // 热搜成片(engine==='hotspot')虽然 useStockVideo=false(纯图 Ken Burns),但要【按条计费】:
+  // 主进程外层循环把它拆成 N 条单独 pipeline(各 videoCount=1),每条在这里预扣一份平台基础费
+  // (≈$0.09~0.18),失败那条幂等退回 —— 故 hotspot 也算 mode1。
+  const isMode1 = input.engine !== 'ai' && (input.useStockVideo !== false || input.engine === 'hotspot');
+  let chargeId: string | undefined;
+  let refundOnExit = false;
+
+  // 临时素材目录(配音 + 下载的素材图)
+  const assetDir = fs.mkdtempSync(path.join(videoTempBase(), 'noobclaw-vid-assets-'));
+
+  // 出片目录开跑即确定,emit 一次让详情页顶部立刻能显示「输出目录」。
+  // taskDir = 任务总目录(详情页顶部稳定指向它);destDir = 本次运行 <日期>/<批次号>/(实际写成片)。
+  const { taskDir, runDir } = resolveOutputDirs(input);
+  let destDir = runDir; // 热搜成片选题后会给批次目录加「_标题」后缀(见下),所以用 let
+  tracker.setOutputDir(taskDir);
+  // 运行记录落本地一份 markdown(跟本次成片同目录、跟其他任务的本地记录一致);之后每行 tracker 日志自动追加。
+  tracker.setLogFile(path.join(runDir, '运行记录.md'));
+
+  try {
+    // ── 本地混剪 · 原片直发(uploadOnly):不写稿/不配音/不字幕/不混剪 —— 从素材文件夹
+    //    挑一条原片直接发布;AI 只产发布标题/简介/标签(向导填的「视频介绍」当素材)。
+    //    定时任务反复跑同一文件夹时随机挑片,组合各不相同。计费与本地混剪同口径(mode1 按条)。
+    if (input.engine === 'uploadonly' || (input.engine === 'localmix' && input.uploadOnly)) {
+      throwIfAborted(signal);
+      tracker.start('script', `输出目录:${taskDir}`);
+      tracker.done('script', '⏭ 原片直发:跳过写稿');
+      tracker.done('tts', '⏭ 原片直发:跳过配音/字幕');
+      tracker.start('visuals');
+      const mixDir = String(input.localMixFolder || '').trim();
+      const pickedFiles = Array.isArray(input.localMixFiles) ? input.localMixFiles.filter(Boolean) : [];
+      const media = pickedFiles.length > 0 ? classifyLocalMediaFiles(pickedFiles) : scanLocalMediaFolder(mixDir);
+      if (media.videos.length === 0) {
+        const err = pickedFiles.length > 0
+          ? '选中的素材文件里没有可用视频(文件可能已被移动/删除),请重新选择后重试'
+          : `本地素材文件夹里没有可用视频(${mixDir || '未选择文件夹'}),请检查文件夹后重试`;
+        tracker.fail('visuals', err);
+        return { ok: false, error: err };
+      }
+      const pick = media.videos[Math.floor(Math.random() * media.videos.length)];
+      tracker.done('visuals', `🎬 已选原片:${path.basename(pick)}(文件夹共 ${media.videos.length} 个视频,每次运行随机挑一条)`);
+
+      tracker.start('compose');
+      // 原片直传/原片直发:免平台基础费(用户拍板)——只收 AI 撰写标题/简介/标签的 token
+      // (resolvePublishCaption 内部走 /api/ai 已按量计费),视频本体零处理不收平台费。
+      // 原片拷到本次运行目录(保留原扩展名):交付物与其它任务同构,详情页能点开回看。
+      fs.mkdirSync(destDir, { recursive: true });
+      const outPath = path.join(destDir, `原片直发_${path.basename(pick)}`);
+      fs.copyFileSync(pick, outPath);
+      tracker.done('compose', `📦 原片就绪(未做任何处理)· 📂 输出目录:${destDir}`);
+
+      // ⚠️ 进 publish 前查 abort(同其它引擎):原片已拷到输出目录,当成「成了,只是没发」。
+      if (signal?.aborted) {
+        tracker.progress('⏹ 已停止 · 原片已保存,跳过发布');
+        tracker.finish(outPath, 1, true); // aborted=true → UI 显示「已停止」而非「生成完成」
+        return { ok: true, outputPath: outPath, outputPaths: [outPath], aborted: true } as VideoCreationResult;
+      }
+      tracker.start('publish');
+      const wantPublish = Array.isArray(input.publishPlatforms) && input.publishPlatforms.length > 0;
+      try {
+        const introText = String(input.script || '').trim();
+        // 文案语言:有介绍按介绍语言;没介绍时按发布平台猜(国内平台→中文)——
+        // 之前 fallback 到【文件名】,十六进制文件名被判成英文,发抖音出英文文案(真机实报)。
+        const CN_PLATS = new Set(['douyin', 'xhs', 'shipinhao', 'toutiao', 'kuaishou', 'bilibili']);
+        const uaPlats = Array.isArray(input.publishPlatforms) ? input.publishPlatforms : [];
+        // 语言恒跟用户填的介绍/参考走(向导已必填);老任务空文案才按发布平台兜底。
+        const uaLang = introText ? detectLang(introText) : (uaPlats.some((p) => CN_PLATS.has(p)) || uaPlats.length === 0 ? 'zh' : 'en');
+        const cap = await resolvePublishCaption({
+          wantPublish,
+          summary: introText || path.basename(pick, path.extname(pick)),
+          title: introText ? introText.split(/[。！？\n]/).filter(Boolean)[0]?.slice(0, 40) : undefined,
+          keywords: input.keywords?.length ? input.keywords : undefined,
+          track: input.track || undefined,
+          lang: uaLang,
+          userTitle: input.publishTitle || ((input as any).uaStrictIntro && introText ? (introText.split(/[。！？.!?\n]/).filter(Boolean)[0] || introText).slice(0, 40) : undefined),
+          userCaption: input.publishCaption || ((input as any).uaStrictIntro && introText ? introText : undefined),
+          userTags: input.hashtags,
+          onLog: (m: string) => tracker.progress(m),
+          onCost: (tk, usd) => tracker.addTokens(tk, usd),
+        });
+        const { MATRIX_EDITION } = require('../../matrixEdition');
+        if (MATRIX_EDITION && wantPublish) {
+          const { runMatrixPublishStep } = require('./publishers/runMatrixPublish');
+          await runMatrixPublishStep({
+            platforms: Array.isArray(input.publishPlatforms) ? input.publishPlatforms : [],
+            accounts: (input as any).publishAccounts || {},
+            videoPath: outPath,
+            title: cap.title,
+            description: cap.description,
+            tags: cap.tags,
+            onLog: (msg: string) => tracker.progress(msg),
+            signal,
+          });
+        } else {
+          const { runPublishStep } = require('./publishers/runPublish');
+          await runPublishStep({
+            platforms: Array.isArray(input.publishPlatforms) ? input.publishPlatforms : [],
+            videoPath: outPath,
+            title: cap.title,
+            description: cap.description,
+            tags: cap.tags,
+            onLog: (msg: string) => tracker.progress(msg),
+            signal,
+          });
+        }
+      } catch (e) {
+        tracker.progress(`⚠️ 发布步骤异常:${String((e as Error)?.message || e).slice(0, 120)}`);
+      }
+      tracker.finish(outPath, 1);
+      return { ok: true, outputPath: outPath, outputPaths: [outPath] };
+    }
+
+    // 0. 文案:strict = 逐字用用户文案;ai = DeepSeek 写稿(用户文案作参考)。
+    //    缺省兼容老任务:有 script → strict,无 → ai。
+    throwIfAborted(signal);
+    tracker.start('script', `输出目录:${taskDir}`);
+    // 拉服务端可调配置(prompt 模板 + 各阈值)。拉不到 / 没登录 → 用内置默认,出片照常。
+    const vcfg = await getVideoConfig();
+    // ── 热搜成片(engine==='hotspot'):写稿前先选题 + 联网取材 ──────────────
+    //   从用户勾选的热点源最新 20 条随机 1 条 → Serper /news 取这条热点的最新资料。
+    //   选题失败(源里没条目)→ 直接判错;取材失败(没配 serper key / 无网)→ 仅按标题写,
+    //   不报错。后续完全复用 stock 图片模式的写稿/配图/合成/发布。
+    let hotspotTopic: HotspotTopic | null = null;
+    let hotspotMaterial = '';
+    // 取材平台(抖音/TikTok):用户在向导里选的【最优先】,老任务无此字段才按选中热点标题语言兜底
+    //   (中文→抖音,其他→TikTok)。取材(prefetch)+ 铺镜(visuals)两处统一用它路由,
+    //   不能再各自 detectLang(标题) —— 否则用户选了 TikTok 但热点是中文标题时会被判回抖音。
+    const resolveMaterialPlatform = (): 'douyin' | 'tiktok' => {
+      const sel = (input as any).hotspotMaterialPlatform;
+      if (sel === 'douyin' || sel === 'tiktok') return sel;
+      return String(detectLang(hotspotTopic?.title || '')).toLowerCase().startsWith('zh') ? 'douyin' : 'tiktok';
+    };
+    // 新流程:中文热搜【先上抖音搜】下视频/图文 + 抓真实帖子标题 —— 标题给 AI 写口播稿(替掉 Serper),
+    //   视频/图同时留着后面铺镜(buildDouyinPool / buildDouyinImagePool 直接复用,不再二次下载)。
+    let douyinPrefetch: { mode: 'video' | 'image'; paths: string[]; titles: string[] } | null = null;
+    // 同上,英文/小语种热搜【先上 TikTok 搜】(对称抖音 prefetch,buildTiktokPool/buildTiktokImagePool 复用)。
+    let tiktokPrefetch: { mode: 'video' | 'image'; paths: string[]; titles: string[] } | null = null;
+    if (input.engine === 'hotspot') {
+      const sources = (input.hotspotSources || []).filter(Boolean);
+      if (sources.length === 0) {
+        const err = '热搜成片:未勾选任何热点源';
+        tracker.fail('script', err);
+        return { ok: false, error: err };
+      }
+      throwIfAborted(signal);
+      // 进度里明确列出勾选了哪些榜单平台(对齐用户「想看到选中了哪个平台的热点」诉求)。
+      const HOTSPOT_SRC_LABEL: Record<string, string> = {
+        weibo: '微博热搜', douyin: '抖音热搜', zhihu: '知乎热榜', baidu: '百度热搜',
+        bilibili: 'B站热搜', xueqiu: '雪球热门股', web3: 'Web3 资讯', tech: '科技/AI',
+      };
+      const srcNames = sources.map((s) => HOTSPOT_SRC_LABEL[s] || s).join('、');
+      const trackName = (input.hotspotTrackName || input.hotspotTrack || '').trim();
+      tracker.progress(`🔥 已勾选热点源:${srcNames}${input.hotspotTrack ? `(按赛道筛选:${trackName})` : ''} —— 正在从这些榜单最新条目里随机选题…`);
+      // 按任务读出已用过的热点 id 传给后端排除:一次跑 N 条(主进程外层循环逐条调本 pipeline)
+      //   每条都排掉前面已选的 → 各不相同;跨次运行也不会重复同一热点。
+      //   ⚠️ 不在这里 markHotspotUsed —— 改到【发布后、≥1 平台成功(或仅存本地已出片)】才记一笔
+      //   (用户要求:只有上传成功才算用过;发布全失败的选题下次还能重试)。见下方 publish 段。
+      const usedIds = getUsedHotspots(input.taskId || '');
+      hotspotTopic = await pickHotspotTopic(sources, usedIds, 20, input.hotspotTrack || '', signal);
+      if (!hotspotTopic) {
+        const err = '热搜成片:所选热点源暂无可用条目(稍后热榜刷新再试)';
+        tracker.fail('script', err);
+        return { ok: false, error: err };
+      }
+      if (hotspotTopic.trackMiss) {
+        tracker.progress(`⚠️ 所选赛道「${trackName}」本轮暂无相关热点,已回退全量选题(下轮榜单更新后会再按赛道筛)`);
+      }
+      const pickedSrc = HOTSPOT_SRC_LABEL[hotspotTopic.source] || hotspotTopic.source || '未知来源';
+      tracker.progress(`📌 本次选中【${pickedSrc}】的热点:「${hotspotTopic.title}」`);
+      // 批次目录加「_热搜标题」后缀,方便区分(1_众星悼念… / 2_…)。此刻还没往 destDir 写任何文件 →
+      //   改名安全;getNextBatch 用 parseInt 取前导数字,带后缀也能正确续号、不重号。失败则照用原目录。
+      try {
+        const titleSuffix = sanitizeFolderName(hotspotTopic.title).slice(0, 40);
+        if (titleSuffix) {
+          const newDir = path.join(path.dirname(destDir), `${path.basename(destDir)}_${titleSuffix}`);
+          if (newDir !== destDir && !fs.existsSync(newDir)) {
+            fs.renameSync(destDir, newDir);
+            destDir = newDir;
+          }
+        }
+      } catch { /* 改名失败不影响出片 */ }
+      throwIfAborted(signal);
+      // 【新流程,不再 Serper 联网取材】中文热搜直接上抖音搜:下视频/图文 + 抓真实帖子标题,
+      //   拿这些抖音标题 + 热搜标题给 AI 写口播稿(很真实、贴热点);素材同时留着后面铺镜。
+      //   非中文(TikTok 路,WIP)/ 抖音没结果 → 没标题 → AI 仅按热搜标题写,绝不回 Serper。
+      // 走抖音还是 TikTok 取材,按【用户在向导选的取材平台】,不再按标题语言(见 resolveMaterialPlatform)。
+      if (resolveMaterialPlatform() === 'douyin') {
+        const dyMode: 'video' | 'image' = input.hotspotMaterialSource === 'douyin' ? 'video' : 'image';
+        const want = dyMode === 'video'
+          ? Math.max(6, Math.min(15, Math.ceil((input.targetSeconds ?? 60) / 6)))
+          : Math.max(10, Math.min(30, Math.ceil((input.targetSeconds ?? 60) / 3)));
+        tracker.progress(`🎬 上抖音搜「${hotspotTopic.title}」,下${dyMode === 'video' ? '视频' : '图文'} + 抓标题…`);
+        const dy = await fetchDouyinClips([hotspotTopic.title], want, assetDir, (m) => tracker.progress(m), signal, dyMode, (input as any).hotspotMaterialAccountId);
+        douyinPrefetch = { mode: dyMode, paths: dy.paths, titles: dy.titles };
+        if (dy.titles.length > 0) {
+          hotspotMaterial = `抖音上关于「${hotspotTopic.title}」的热门帖子标题(供你了解大家在聊什么、按真实角度写,别照抄、别张冠李戴):\n`
+            + dy.titles.slice(0, 12).map((t, i) => `${i + 1}. ${t}`).join('\n');
+          tracker.progress(`📝 拿到 ${dy.titles.length} 个抖音标题 + ${dy.paths.length} 个素材,AI 据此 + 热搜标题写口播`);
+        } else {
+          tracker.progress('⚠️ 抖音没抓到标题(没登录/没结果),AI 仅按热搜标题写');
+        }
+      } else {
+        // 非中文热搜:上 TikTok 搜(对称抖音)——下视频/图集 + 抓真实帖子标题,标题给 AI 写口播稿。
+        const tkMode: 'video' | 'image' = input.hotspotMaterialSource === 'douyin' ? 'video' : 'image';
+        const want = tkMode === 'video'
+          ? Math.max(6, Math.min(15, Math.ceil((input.targetSeconds ?? 60) / 6)))
+          : Math.max(10, Math.min(30, Math.ceil((input.targetSeconds ?? 60) / 3)));
+        tracker.progress(`🎬 上 TikTok 搜「${hotspotTopic.title}」,下${tkMode === 'video' ? '视频' : '图集'} + 抓标题…`);
+        const tk = await fetchTiktokClips([hotspotTopic.title], want, assetDir, (m) => tracker.progress(m), signal, tkMode, (input as any).hotspotMaterialAccountId);
+        tiktokPrefetch = { mode: tkMode, paths: tk.paths, titles: tk.titles };
+        if (tk.titles.length > 0) {
+          hotspotMaterial = `TikTok 上关于「${hotspotTopic.title}」的热门帖子标题(供你了解大家在聊什么、按真实角度写,别照抄、别张冠李戴):\n`
+            + tk.titles.slice(0, 12).map((t, i) => `${i + 1}. ${t}`).join('\n');
+          tracker.progress(`📝 拿到 ${tk.titles.length} 个 TikTok 标题 + ${tk.paths.length} 个素材,AI 据此 + 热搜标题写口播`);
+        } else {
+          tracker.progress('⚠️ TikTok 没抓到标题(没登录/没结果/未开 VPN),AI 仅按热搜标题写');
+        }
+      }
+    }
+
+    const userText = (input.script || '').trim();
+    // 热搜成片恒为 AI 写稿(用户不填稿)。
+    // 用户在向导里显式选过就听用户的;没选才自动判定。
+    // 🚨 原来的自动判定是「文案框非空 = 完整脚本」—— 用户敲一句想法(「讲讲比特币减半」)
+    //   也会被当成脚本去逐字解析成分镜,于是整条片子就只有那一句话。用户要的是:
+    //   【详细脚本→不许改写,只做结构化】/【只是想法→才让 AI 写稿】。所以按内容判。
+    const scriptMode: 'strict' | 'ai' = input.engine === 'hotspot'
+      ? 'ai'
+      : (input.scriptMode || (looksLikeFullScript(userText) ? 'strict' : 'ai'));
+    // 内容语言:口播稿 + 素材搜索词都用它。用户在向导显式选了创作语言(scriptLang)且由 AI
+    // 写稿时用它;strict 逐字朗读模式下稿子就是用户原文,语言探测原文才对(选了语言也不生效,
+    // 避免「英文语言 + 中文原稿」错配)。无显式选择维持自动:有视频文案就按文案语言走,再按
+    // 关键词语言,热搜成片按选中热点标题的语言。空白时退化为中文。
+    const scriptLangSel = String(input.scriptLang || '').trim();
+    const contentLang: ContentLang = (scriptLangSel && scriptLangSel !== 'auto' && scriptMode === 'ai')
+      ? (scriptLangSel as ContentLang)
+      : detectLang(userText || (input.keywords || []).join(' ') || (hotspotTopic?.title || ''));
+    // 本任务【写稿 + 搜索词】已扣的权威 USD 之和(含 reasoner ×3),供下面平台费预扣时
+    // 按 videoCount 让服务端补收剩余 (count-1) 份 AI 费。AI 只调一次,各步累加进来。
+    let aiCostUsd = 0;
+    // 热搜成片计费诊断量:由抖音视频/图文池(buildDouyinPool / buildDouyinImagePool)填,charge 时读。
+    let hotspotImageCount = 0;
+    const hotspotUsedCloud = false; // 配图已不走 Serper 云端代下(抖音/图文直连下载)→ 恒 false
+    // 抖音混剪模式:画面是抖音视频(底部要盖黑条遮原字幕)。由下面素材分配那步置位,composeOne 读。
+    let hotspotDouyinMode = false;
+    let script = userText;
+    if (scriptMode === 'ai') {
+      const isHotspot = input.engine === 'hotspot';
+      // 电影级(ai)不带赛道/关键词,但也不需要 topic:它的想法是必填的 → userText 非空 →
+      //   下面 referenceScript 有值 → generateScript 走「参考文案就是内容主题」那条 user
+      //   message,整条不引用 topic。只有【没有任何文案】时 topic 才会被用到。
+      const topic = isHotspot && hotspotTopic
+        ? hotspotTopic.title
+        : ((input.keywords || []).filter(Boolean).join('、') || input.track || '生活方式');
+      tracker.progress(isHotspot
+        ? `AI 正在紧贴热点资料撰写口播（目标约 ${input.targetSeconds ?? 45}s）…`
+        : (userText
+          ? `AI 正在参考你的文案撰写旁白（目标约 ${input.targetSeconds ?? 45}s）…`
+          : `AI 正在撰写旁白脚本（目标约 ${input.targetSeconds ?? 45}s）…`));
+      try {
+        const r = await generateScript({
+          topic,
+          persona: input.persona,
+          // 热搜成片不绑赛道/关键词(题材由热点资料决定);其它模式照常传。
+          track: isHotspot ? undefined : input.track,
+          keywords: isHotspot ? undefined : input.keywords,
+          targetSeconds: input.targetSeconds ?? 45,
+          referenceScript: userText || undefined,
+          material: isHotspot ? (hotspotMaterial || undefined) : undefined,
+          lang: contentLang,
+        }, vcfg.scriptSystemTemplate);
+        script = r.script;
+        aiCostUsd += r.costUsd;
+        tracker.addTokens(r.tokens, r.costUsd);
+      } catch (e) {
+        const err = e instanceof Error ? e.message : String(e);
+        tracker.fail('script', `AI 写脚本失败:${err.slice(0, 200)}`);
+        return { ok: false, error: err.slice(0, 300) };
+      }
+      // 把 AI 写的完整口播文案打到日志里(用户点详情页能看到 AI 到底写了啥)。
+      // 注意:不在这里 done('script') —— 拆句已并入本步,拆完再 done。
+      tracker.progress(`📝 口播文案(约 ${script.length} 字):${script}`);
+    } else {
+      // strict:严格逐字用用户文案。空文案直接判错(理论上客户端已挡)。
+      if (!script) {
+        const err = '严格模式下视频文案不能为空';
+        tracker.fail('script', err);
+        return { ok: false, error: err };
+      }
+      tracker.progress(`📝 视频文案(约 ${script.length} 字 ≈ ${Math.round(script.length / 4.5)}s):${script}`);
+    }
+
+    // ── 电影级(engine='ai')分镜表 ──────────────────────────────────────────
+    //  老链路把整篇文档 splitScript 按标点切句,于是脚本里的表头/景别运镜/B-roll 清单/
+    //  拍摄准备全被当台词念出来,而用户写好的【画面内容】那一栏反被丢弃 —— 成片必然驴唇
+    //  不对马嘴。新链路先把脚本解析成结构化分镜:narration 只进 TTS、visual 只进图像模型、
+    //  motion 只进视频模型。构建失败 → aiShots 留 null,整段降级回老链路(绝不阻塞出片)。
+    let aiShots: StoryShot[] | null = null;
+    if (input.engine === 'ai' && input.useStoryboardTable !== false
+        && Array.isArray(input.storyboardShots) && input.storyboardShots.length > 0) {
+      // 用户已在分镜表界面确认过 → 直接用,不再跑解析/派生(省一次 AI 调用,且用户改过的内容原样生效)。
+      aiShots = input.storyboardShots;
+      tracker.progress(`🎬 使用你确认过的分镜表(${aiShots.length} 镜)`);
+    } else if (input.engine === 'ai' && input.useStoryboardTable !== false) {
+      // strict = 用户粘了脚本(可能是完整分镜脚本)→ 解析;ai = 稿子是 AI 写的口播 → 派生分镜。
+      const isUserScript = scriptMode === 'strict';
+      tracker.progress(isUserScript ? '🎬 AI 正在解析你的脚本、分拣口播与画面…' : '🎬 正在为口播稿设计分镜…');
+      // 🚨 分镜【必须过 LLM,且不兜底】(用户 2026-08-04 二次拍板)。
+      //   当天早些时候试过「有脚本就纯本地正则(formatScriptToShots)」,栽在真实输入上:
+      //   用户粘的是 AI 生成的分镜表 —— 镜号是【孤立一行数字】、字段名【独占一行不带冒号】
+      //   (「口播旁白」换行才是内容),正则的两条判据(镜头号要带「镜头/场景」前缀、字段要
+      //   同行带冒号)一条都不中 → 全篇落到「普通行=台词」,只能靠空行分段 → 4224 字切出
+      //   2 镜、每镜几千字被 min(10) 压成 10 秒,连「景别运镜」「音乐音效」都当口播念,
+      //   最后照样扣了 58 万积分出一条 20 秒废片。
+      //   「哪几行是口播、哪几行是给摄影师看的」这件事正是 LLM 的活(PARSE_SYSTEM 的 A/B/C
+      //   分拣),正则只能靠关键词猜,猜错还静默。成本上也没什么好省的:过一次 LLM 几分钱,
+      //   一条废片 ¥3+ 的采购成本 —— 所以失败就【整条任务失败】,绝不降级出废片。
+      let sbError: string | null = null;
+      try {
+        const sbInput = {
+          lang: contentLang,
+          targetSeconds: input.targetSeconds,
+          // 赛道/人设只作画面调性参考,不决定题材(有脚本时更不该干扰)。
+          styleHint: isUserScript ? undefined : [input.track, input.persona].filter(Boolean).join('、') || undefined,
+          signal,
+        };
+        // strict = 用户粘了脚本(可能是完整分镜表)→ parseStoryboardScript 做分拣;
+        // ai     = 稿子是 AI 写的口播 → deriveStoryboard 设计画面。
+        const sb = isUserScript
+          ? await parseStoryboardScript(script, sbInput)
+          : await deriveStoryboard(script, sbInput);
+        if (sb && sb.shots.length > 0) {
+          tracker.addTokens(sb.tokens, sb.costUsd);
+          aiCostUsd += sb.costUsd;
+          for (const w of sb.warnings) tracker.progress(`⚠️ ${w}`);
+          // 逐字保真复核:口播必须忠于原文(营销文案/热点事实不能被 AI 改写)。
+          //   注:这是【子序列】比对,分母是 narration 长度 —— 原文里有多少制作说明都不影响,
+          //   只要念出来的字是从原文逐字抄的就是 1。低于阈值 = AI 真的润色了。
+          if (sb.fidelity < 0.85) {
+            sbError = `口播逐字复核仅 ${(sb.fidelity * 100).toFixed(0)}% —— AI 改写了你的原文`;
+          } else {
+            aiShots = sb.shots;
+          }
+        } else {
+          sbError = 'AI 没能从这份稿子里拆出可用分镜';
+        }
+      } catch (e) {
+        sbError = `分镜解析异常:${String((e as any)?.message || e).slice(0, 140)}`;
+      }
+      // 合理性闸门:LLM 也会偷懒,把一大段口播塞进一镜(PARSE_SYSTEM 要求每镜 4~12 秒)。
+      //   一镜口播超过 25 秒的量 = 根本没按叙事切镜,继续跑只会得到「一张图慢慢动」+ 音画对不上,
+      //   而且钱是照扣的。宁可这里失败让用户重来,也不烧着钱出废片。
+      if (!sbError && aiShots) {
+        const cps = /^(zh|ja|ko)/.test(String(contentLang)) ? 4.5 : 2.2;
+        const tooLong = aiShots.filter((s) => s.narration.trim().length > cps * 25).length;
+        if (tooLong > 0) {
+          sbError = `有 ${tooLong} 个分镜的口播长到一镜念不完(每镜应 4~12 秒)—— 分镜没切开`;
+          aiShots = null;
+        }
+      }
+      if (sbError) {
+        const err = `分镜失败:${sbError}。已中止,未产生视频生成费用 —— 请调整脚本后重试`;
+        tracker.fail('script', err);
+        return { ok: false, error: err };
+      }
+    }
+
+    // 拆句。有分镜表 → 直接用每镜的 narration(口播与画面已分家);否则走老的本地标点切分。
+    let sentences: string[];
+    if (aiShots) {
+      // 有旁白模式下丢掉无口播的镜:sentences / audios / sceneDurations / clipResults 全靠
+      //   【下标对齐】,留着空 narration 会让 TTS 那步产出空音频并错位。纯画面模式(关旁白)
+      //   不受影响 —— 那条路不按 sentences 走。
+      const narrated = !(input.engine === 'ai' && input.narrationEnabled === false);
+      if (narrated) {
+        const before = aiShots.length;
+        aiShots = aiShots.filter((s) => s.narration.trim());
+        if (aiShots.length < before) {
+          tracker.progress(`分镜表:跳过 ${before - aiShots.length} 个无口播镜(有旁白模式下画面需跟着口播走)`);
+        }
+      }
+      if (aiShots.length === 0) {
+        aiShots = null;
+        sentences = splitScript(script);
+      } else {
+        sentences = aiShots.map((s) => s.narration);
+        const totalSec = Math.round(aiShots.reduce((a, s) => a + s.seconds, 0));
+        tracker.progress(`🎬 分镜表就绪:${aiShots.length} 镜 · 预计 ${totalSec} 秒`);
+      }
+    } else {
+      sentences = splitScript(script);
+    }
+    if (sentences.length === 0) {
+      const err = '文案为空或无法拆出有效分镜';
+      tracker.fail('script', err);
+      return { ok: false, error: err };
+    }
+    // 老链路的「大分镜合并 + 45s 硬截」只在【没有分镜表】时才跑:
+    //   · 合并成 8–12s 长镜是为了省 Seedance 的钱,但观感就是「一张图慢慢动十秒」,
+    //     跟分镜表按叙事切镜是相反的。
+    //   · 45s 硬截是成本兜底,而分镜表模式下条数与是否生成视频由用户在分镜表上定,
+    //     不该再拿一个写死的秒数把用户 4 分钟的脚本砍掉 6/7。
+    if (input.engine === 'ai' && !aiShots) {
+      sentences = mergeSentencesForAi(sentences);
+      // 硬上限 45s:targetSeconds 只是给 AI 的提示,AI 可能写超 → 这里按字数估时长(CJK ~4.5
+      // 字/秒、拉丁 ~2.2)累加截断,保证纯 AI 成片【实际】不超 45s,杜绝写超长稿烧钱。
+      const AI_MAX_SEC = 45;
+      const cps = /[぀-ヿ㐀-鿿가-힯]/.test(sentences.join('')) ? 4.5 : 2.2;
+      const maxChars = Math.round(AI_MAX_SEC * cps);
+      let acc = 0;
+      const capped: string[] = [];
+      for (const s of sentences) { if (acc >= maxChars) break; capped.push(s); acc += s.length; }
+      if (capped.length > 0 && capped.length < sentences.length) {
+        tracker.progress(`✂️ 纯 AI 成片时长上限 ${AI_MAX_SEC}s:超出部分已截断(保留 ${capped.length} 段)`);
+        sentences = capped;
+      }
+      tracker.progress(`🎬 AI 大分镜:合并为 ${sentences.length} 段(每段约 8–12 秒,更连贯)`);
+    }
+
+    // 文案本地留一份(txt):全文 + 分镜,放成片输出目录,方便用户复用/二改/存档。
+    try {
+      const txt = [
+        `# ${input.taskTitle || '视频文案'}`,
+        `生成时间: ${new Date().toLocaleString()}`,
+        ...(hotspotTopic ? [`热搜标题: ${hotspotTopic.title}`] : []),
+        '',
+        // 写稿参考的真实抖音帖子标题(新流程:替掉 Serper)—— 留档方便核对 AI 是不是贴着热点写。
+        ...(douyinPrefetch && douyinPrefetch.titles.length > 0 ? [
+          `【写稿参考的抖音标题 ${douyinPrefetch.titles.length} 条】`,
+          ...douyinPrefetch.titles.map((t, i) => `${i + 1}. ${t}`),
+          '',
+        ] : []),
+        // 英文/小语种:写稿参考的真实 TikTok 帖子标题(对称抖音)。
+        ...(tiktokPrefetch && tiktokPrefetch.titles.length > 0 ? [
+          `【写稿参考的 TikTok 标题 ${tiktokPrefetch.titles.length} 条】`,
+          ...tiktokPrefetch.titles.map((t, i) => `${i + 1}. ${t}`),
+          '',
+        ] : []),
+        '【完整口播文案】',
+        script,
+        '',
+        `【分镜 ${sentences.length} 句】`,
+        ...sentences.map((s, i) => `${i + 1}. ${s}`),
+      ].join('\n');
+      fs.writeFileSync(path.join(destDir, '文案.txt'), txt, 'utf8');
+      // 分镜表另存一份(电影级):画面/运动/花字/配乐逐镜留档,方便用户核对与二改。
+      if (aiShots) {
+        fs.writeFileSync(
+          path.join(destDir, '分镜表.txt'),
+          storyboardToText(aiShots, input.taskTitle || '分镜表'),
+          'utf8',
+        );
+      }
+    } catch { /* 写文案 txt 失败不影响出片 */ }
+    // 分镜稿回传给渲染端存进运行记录 —— 详情页要能直接看到「这次到底怎么切的」,
+    //   不用去翻成片目录里的分镜表.txt。分镜是最贵也最容易切错的一步,必须可见。
+    if (aiShots) {
+      try { tracker.sendStoryboard(storyboardToText(aiShots, input.taskTitle || '分镜表')); } catch { /* 展示用,失败不影响出片 */ }
+    }
+    tracker.done('script', `脚本约 ${script.length} 字,拆出 ${sentences.length} 个分镜`);
+
+    // 2. 逐句配音。同时收集 edge-tts 词边界字幕 cue,按各句在总时间轴上的累计起点
+    //    偏移后合并成全局 cue(离线、精确,抄 MoneyPrinterTurbo);拿不到就让 compose 估算。
+    // v6.x: 纯画面模式(仅 Seedance 可开)— 跳过 TTS、不烧字幕,镜头时长按分镜稿
+    //   字数估算(5~10s,对 Seedance 片段硬限 [4,12] 友好)。其它模式恒为有旁白。
+    // ⚠️【电影级不再本地配音】Seedance 1.5-pro 开 generate_audio 后,人声、口型、环境音、
+    //   BGM 是和画面一起生成的 —— 毫秒级音画同步、口型对得上,这是本地 TTS 后期贴上去
+    //   永远做不到的。所以电影级一律跳过本地 TTS(顺带省掉一整笔配音费)。
+    //   台词不再走 TTS,而是写进每镜的 prompt 交给 Seedance 念(见 buildMotionPrompt)。
+    const aiNativeAudio = input.engine === 'ai';
+    const wantNarration = !aiNativeAudio && !(input.engine === 'ai' && input.narrationEnabled === false);
+    // 哪些镜用的是【自己生成的】片段(不是借邻镜的)。
+    // ⚠️ 原生音频下这个区分是必须的:片段自带音轨,借来的片段会把邻镜的台词【再念一遍】,
+    //    而本镜那句彻底消失 —— 画面上还看不出异常,只有听才发现。以前音频是我们自己配的,
+    //    借片段只影响画面贴题度,所以无所谓;现在不行了。
+    // ⚠️ 必须声明在【函数体这一层】,不能放进 engine==='ai' 那个分支块里:填它的是那个分支,
+    //    但读它的是后面 compose 阶段的原生音轨判断(在分支外)—— 放块里 = 读的地方根本看不见它。
+    const aiOwnClip: boolean[] = [];
+    // 每镜时长来源:有旁白 → 各句真实配音时长;纯画面 → 分镜稿字数估算。下游(Seedance
+    //   生成 / 本地拼接 / compose)统一读 sceneDurations,不再直接摸 audios[i].durationSec。
+    const sceneDurations: number[] = [];
+    throwIfAborted(signal);
+    tracker.start('tts', wantNarration ? `🎤 配音:${voiceProviderLabel(input.voice || getTtsVoice())} · 音色 ${input.voice || getTtsVoice()}` : undefined);
+    const audios: { audioPath: string; durationSec: number }[] = [];
+    const subtitleCues: SubtitleCue[] = [];
+    if (wantNarration) {
+      // Voice fallback —— 句级 sticky:edge-tts 2026-04 起上游【按 voice 间歇性拒发音频】
+      //   (rany2/edge-tts#473,单次请求随机失败)。每句独立配,某句 5 次重试仍败 → 【只对这句】
+      //   顺着同语种同性别 voiceChain 换备用音色重配,成功的句子全部保留;换成功后【粘住】该音色,
+      //   后续句优先沿用 → 整片音色基本统一,只在被迫切换的那一两句有同性别同语种的细微差异。
+      //   仅当某一句把链上所有 voice 都试败,才整体失败退费。fallback 表见 tts.ts getVoiceFallbacks。
+      //
+      //   ⚠️ 为何不再「整片重做」(7118575 旧逻辑):那版任意一句失败就丢弃已成功句、切 voice 从
+      //   第 0 句重配全部。句子越多,「整片至少一句撞上间歇性拒发」概率越高 → 22 句长文案几乎
+      //   必然触发整片重来 → 三个 voice 轮完耗尽彻底失败。句级 fallback 把失败隔离到单句,救场率高。
+      const primary = input.voice || getTtsVoice();
+      const voiceChain = getVoiceFallbacks(primary);
+      // 本步配音累计实扣(豆包);收尾时报个总数,方便和账单逐条对账。
+      let ttsTokens = 0;
+
+      // ── 「一口气」优先路径:整段只发 1 次 edge-tts 请求,再按 cue 时间戳切回每句 ──
+      //   请求数 N→1,从根上躲过 edge-tts「按 voice 间歇拒发」(N 句里中任一即失败 vs 单次)。
+      //   整段合成也带 voice fallback(失败换音色重合,仍 1 次/音色)。切句对齐见 ttsAlign.ts:
+      //   按【去标点字符流】把每句锚到 cue 真实时间戳,不累积误差;对不齐 → 回退下面的逐句路径。
+      //   字幕直接用整段 cue(全局时间轴,比逐句拼接更准)。下游 audios/sceneDurations/subtitleCues
+      //   形状与逐句路径完全一致 —— 分镜/compose 无感知。
+      let wholeDone = false;
+      // 豆包也走整段:synthesizeWhole 对豆包音色走火山【异步长文本】接口(开 enable_timestamp)
+      //   → 回逐字时间戳,精度不输 edge 词边界。于是「一次合成 + 按真实时间戳切句」对两家都成立:
+      //   韵律没有句间接缝,字幕落点是真时间而不是按字数估。
+      // ⚠️【别再按长度分流】以前只有 >1024 字节才走异步接口,而在线同步接口**不支持时间戳**。
+      //    45 秒视频的口播才 200 来字 ≈ 600 字节,永远够不到那条线 → 永远拿不到时间戳 →
+      //    整段必失败、每次回退逐句。更糟的是同步那一发**已经合成并按字符扣过钱了**,
+      //    回退逐句等于同一段口播付两遍。现在 synthesizeWhole 传 needTimestamps,
+      //    后端无视长度直接走异步,整段这条路才真的通。
+      if (isDoubaoVoice(primary)) {
+        tracker.progress('🎙️ 豆包真人音色:整段一次合成(长文本接口带时间戳,切句和字幕用真实时间)');
+      }
+      try {
+        {
+        const masterMp3 = path.join(assetDir, 'narr_master.mp3');
+        let whole: Awaited<ReturnType<typeof synthesizeWhole>> | null = null;
+        let usedWholeVoice = voiceChain[0];
+        for (let vi = 0; vi < voiceChain.length; vi++) {
+          const v = voiceChain[vi];
+          throwIfAborted(signal);
+          // ⚠️ 这段原来全程无日志:synthesizeWhole 内部 60s×5 重试 × 多个备用音色 → 连不上微软 TTS 时
+          //   会静默 grind 十几分钟,UI 看着像「卡死无报错」。这里每个音色尝试前后都打日志 + 抛出 TTS 错因。
+          tracker.progress(`配音合成中(${voiceProviderLabel(v)} · 音色 ${v}${voiceChain.length > 1 ? ` · ${vi + 1}/${voiceChain.length}` : ''})… 网络慢会重试,请稍候`);
+          // ⚠️ signal 必须传:synthesizeWhole 内部 60s × 5 次重试,不传的话点停止要在
+          //    这一个音色上磨到 5 分钟,只有换音色时才会碰到上面那句 throwIfAborted。
+          const w = await synthesizeWhole(sentences.join('\n'), masterMp3, v, input.voiceRate, { signal, onProgress: (m) => tracker.progress(m) });
+          if (w.ok) { whole = w; usedWholeVoice = v; break; }
+          const reason = getLastTtsError();
+          tracker.progress(`音色 ${v} 整段合成未成功${reason ? `(${reason.slice(0, 110)})` : ''}${vi < voiceChain.length - 1 ? ',换下一个音色…' : ''}`);
+        }
+        if (whole) {
+          const spans = alignSentencesToCues(sentences, whole.rawCues, whole.durationSec);
+          if (spans && spans.length === sentences.length) {
+            const cutAudios: { audioPath: string; durationSec: number }[] = [];
+            let cutOk = true;
+            for (let i = 0; i < spans.length; i++) {
+              throwIfAborted(signal);
+              const outMp3 = path.join(assetDir, `narr_${String(i).padStart(3, '0')}.mp3`);
+              const r = await runFfmpeg([
+                '-y', '-i', masterMp3,
+                '-ss', spans[i].start.toFixed(3), '-to', spans[i].end.toFixed(3),
+                '-c:a', 'libmp3lame', '-q:a', '4', outMp3,
+              ], { timeoutMs: 30_000, signal });
+              if (!r.ok || !fs.existsSync(outMp3)) { cutOk = false; break; }
+              cutAudios.push({ audioPath: outMp3, durationSec: Math.max(0.3, spans[i].end - spans[i].start) });
+            }
+            if (cutOk) {
+              for (const a of cutAudios) { audios.push(a); sceneDurations.push(a.durationSec); }
+              // 整段 cue 本就是全局时间轴,group 成短语后直接用(无逐句累计误差)。
+              for (const c of groupWordCues(whole.rawCues)) {
+                subtitleCues.push({ text: c.text, start: c.start, end: c.end });
+              }
+              wholeDone = true;
+              // 豆包整段是按字符实扣的 —— 不计进来,账单里有扣费、任务页却是 0。
+              //   Edge 免费,chargedTokens 为空,这段自然跳过。
+              if (whole.chargedTokens && whole.chargedTokens > 0) {
+                tracker.addTokens(whole.chargedTokens, whole.costUsd || whole.chargedTokens / 1_000_000);
+                ttsTokens += whole.chargedTokens;
+              }
+              const vTag = usedWholeVoice !== voiceChain[0] ? `,备用音色 ${usedWholeVoice}` : '';
+              const costTag = whole.chargedTokens && whole.chargedTokens > 0
+                ? ` · ${sentences.reduce((a, x) => a + x.length, 0)} 字,扣 ${whole.chargedTokens.toLocaleString()} 积分`
+                : ' · Edge 免费音色,不计费';
+              tracker.done('tts', `配音完成(整段 1 次合成 + 按时间戳切 ${sentences.length} 段${vTag})${costTag}`);
+            }
+          }
+        }
+        if (!wholeDone) tracker.progress('整段配音不可用(合成失败/切句对不齐),回退逐句合成…');
+        }
+      } catch (e) {
+        if (signal?.aborted) throw e;
+        tracker.progress('整段配音异常,回退逐句合成…');
+      }
+
+      // ── 逐句 sticky fallback(整段路径不可用时;成功句保留、被拒就地换音色) ──
+      if (!wholeDone) {
+      let stickyVoice = voiceChain[0];
+      let timelineOffset = 0;
+      let synthCount = 0;
+      let failIdx = -1;
+      let lastReason = '';
+
+      for (let i = 0; i < sentences.length; i++) {
+        throwIfAborted(signal);
+        const outMp3 = path.join(assetDir, `narr_${String(i).padStart(3, '0')}.mp3`);
+        // 先试粘住的音色,再按 chain 顺序试其余(去重)。同性别同语种,切换不突兀。
+        const tryOrder = [stickyVoice, ...voiceChain.filter((v) => v !== stickyVoice)];
+        let got: Awaited<ReturnType<typeof synthesize>> | null = null;
+        let usedVoice = stickyVoice;
+        for (const v of tryOrder) {
+          // ⚠️ signal 必须传:synthesize 内部有 voiceChain × 最多 5 次重试 × 单次最长 60s,
+          //    不传的话点了停止要磨数分钟才走到下一句的 throwIfAborted。
+          const r = await synthesize(sentences[i], outMp3, v, input.voiceRate, { signal });
+          if (r.synthesized) {
+            got = r; usedVoice = v;
+            // 豆包按字符实扣 —— 计进「本次消耗」并逐句报出来,否则用户在账单里看到
+            //   一串扣费、任务页却一分不含,只能怀疑是不是重复扣了。Edge 免费恒为 0。
+            if (r.chargedTokens && r.chargedTokens > 0) {
+              tracker.addTokens(r.chargedTokens, r.costUsd || r.chargedTokens / 1_000_000);
+              ttsTokens += r.chargedTokens;
+              tracker.progress(`   第 ${i + 1} 句配音 ${sentences[i].length} 字 · 扣 ${r.chargedTokens.toLocaleString()} 积分`);
+            }
+            break;
+          }
+          lastReason = getLastTtsError() || lastReason;
+        }
+        if (!got) { failIdx = i; break; }
+        if (usedVoice !== stickyVoice) {
+          stickyVoice = usedVoice; // 粘住:后续句先试它,音色保持连续
+          tracker.progress(`第 ${i + 1} 句主音色被拒,已切备用音色 ${usedVoice} 继续(已配好的句保留)`);
+        }
+        audios.push({ audioPath: got.audioPath, durationSec: got.durationSec });
+        sceneDurations.push(got.durationSec);
+        if (got.cues && got.cues.length > 0) {
+          for (const c of got.cues) {
+            subtitleCues.push({ text: c.text, start: c.start + timelineOffset, end: c.end + timelineOffset });
+          }
+        }
+        timelineOffset += got.durationSec;
+        synthCount++;
+        const altTag = stickyVoice !== voiceChain[0] ? ` · 备用音色 ${stickyVoice}` : '';
+        tracker.progress(`配音 ${i + 1}/${sentences.length}${altTag}`);
+      }
+
+      if (failIdx >= 0) {
+        // ⚠️ 先分辨「用户停止」:abort 时 synthesize 的重试循环 break → 落静音兜底 →
+        //    synthesized:false → 走到这里会被报成「配音失败…请检查网络/代理」,用户点了停止
+        //    却看到一条网络报错,还以为出 bug 了。交给 throwIfAborted 统一成「已停止」。
+        throwIfAborted(signal);
+        // 硬约束:必须有真人配音。某句把所有 voice 都试败 → 终止出片,平台基础费由 finally 退回。
+        const triedMsg = voiceChain.length > 1
+          ? ` · 已对该句尝试全部 ${voiceChain.length} 个备用音色,均合成失败`
+          : '';
+        // 报错要分供应商:豆包失败说微软限流是误导,用户会照着错方向排查半天。
+        //   豆包失败【不会】悄悄换成 Edge 出片 —— 换掉的是用户选的声音,那条片子他不会要。
+        const isDb = isDoubaoVoice(stickyVoice || voiceChain[0]);
+        const err = `配音失败:第 ${failIdx + 1}/${sentences.length} 句无法合成语音${triedMsg}`
+          + (lastReason ? `(${lastReason.slice(0, 160)})` : '')
+          + '。已终止出片,不会生成无配音、或换了音色的视频;平台基础费将自动退回。'
+          + (isDb
+            ? '当前用的是豆包真人音色。常见原因:豆包语音服务未配置/额度不足,或上游临时不可用。'
+              + '需要立刻出片的话,可在向导里改用 Edge 免费音色重试。'
+            : '常见原因:网络无法访问微软在线 TTS 接口,或当前为微软上游限流期(2026-04 起已知问题),请检查网络/代理后重试。');
+        tracker.fail('tts', err);
+        return { ok: false, error: err };
+      }
+      tracker.done('tts', `配音完成(${synthCount} 句全部真人语音${stickyVoice !== voiceChain[0] ? `,含备用音色 ${stickyVoice}` : ''})`
+        + (ttsTokens > 0 ? ` · 共 ${sentences.reduce((a, x) => a + x.length, 0)} 字,合计扣 ${ttsTokens.toLocaleString()} 积分` : ' · Edge 免费音色,不计费'));
+      } // end if (!wholeDone) — 逐句 fallback
+    } else {
+      // 纯画面:分镜表标了时长就用它(用户/解析器定的镜头节奏);没有才退回按字数估。
+      //   ⚠️ 无旁白时字数恒为 0,纯按字数估会让每一镜都卡在下限 5s、节奏全平。
+      for (let i = 0; i < sentences.length; i++) {
+        const fromTable = aiShots?.[i]?.seconds;
+        sceneDurations.push(fromTable && fromTable > 0
+          ? Math.max(4, Math.min(12, Math.round(fromTable)))
+          : Math.max(5, Math.min(10, Math.ceil((sentences[i] || '').length / 4.5))));
+      }
+      tracker.done('tts', `纯画面模式 · 跳过配音,按分镜稿定时长(${sentences.length} 镜)`);
+    }
+
+    // 3. 画面:在线素材库(可叠加用户本地素材混拼);纯本地(老任务)走循环拼接。
+    throwIfAborted(signal);
+    tracker.start('visuals');
+
+    // 用户上传的本地视频素材(已在 UI 限制格式 + 大小,这里再 existsSync 兜底)。
+    const localVideos = (input.localVideos || []).filter((p) => p && fs.existsSync(p));
+    // 是否用在线素材库:在线模式(useStockVideo!==false)即走在线 + 本地混拼;
+    // 仅当明确关闭在线(纯本地,老任务路径)才完全离线循环拼本地素材。
+    const usesStock = input.useStockVideo !== false;
+    const maxClip = input.maxClipSeconds && input.maxClipSeconds > 0 ? input.maxClipSeconds : 4;
+    // 一次出片条数(1~5)。抄 MPT:脚本/配音/素材池只做一次,每条只换片段组合。
+    // AI 自动成片(Seedance)逐片段真金白银生成,批量没意义且翻倍烧钱 → 强制单条。
+    // 热搜成片(含抖音混剪):每条必须是【不同热点】(主进程外层循环逐条独立选题),所以单个
+    //   pipeline 恒出 1 条 —— 绝不在这里用 composeOne 复用同一热点的脚本/素材多出几条。
+    const videoCount = (input.engine === 'ai' || input.engine === 'hotspot')
+      ? 1
+      : Math.max(1, Math.min(5, Math.round(input.videoCount ?? 1)));
+
+    // Fisher–Yates 洗牌(不改原数组),用于批量出片时让每条的片段组合各不相同。
+    const shuffled = <T,>(arr: T[]): T[] => {
+      const a = [...arr];
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    };
+
+    // 画面分配器:给定第几条视频(0-based),产出该条的 { sceneClips, imagePool }。
+    // 第 0 条按原顺序;后续条把素材池打乱再分配 → 同脚本/配音、不同画面。
+    let assignVisuals: (videoIdx: number) => { sceneClips: string[][]; imagePool: string[]; imageByScene?: Map<number, string> };
+  let douyinClips: string[] = []; // 抖音混剪模式下载到本地的视频路径(空 = 没取到,落回图片配图)
+  let douyinImages: string[] = []; // 抖音图文模式下载到本地的图片路径(空 = 没取到,落回 Serper 配图)
+  // 抖音【分段铺镜】池(buildDouyinPool):每镜中文词→逐词搜→按段铺,画面跟每镜内容走。null=没取到。
+  let douyinPool: { assign: (videoIdx: number) => string[][]; imageByScene: Map<number, string> } | null = null;
+  let douyinImgPool: { imageBySceneFor: (videoIdx: number) => Map<number, string>; imagePool: string[] } | null = null; // 抖音分段图文池
+  // TikTok 池(英文/小语种话题,对称抖音):buildTiktokPool 视频混剪 / buildTiktokImagePool 图集图。null=没取到。
+  let tiktokPool: { assign: (videoIdx: number) => string[][]; imageByScene: Map<number, string> } | null = null;
+  let tiktokImgPool: { imageBySceneFor: (videoIdx: number) => Map<number, string>; imagePool: string[] } | null = null;
+
+    if (input.engine === 'ai') {
+      // ── AI 自动成片(Seedance):逐镜生成视频片段,参考图(≤2)统一风格 ──
+      // 服务端逐片段计费(时长×分辨率)+ 失败自动退款。失败镜降级:就近复用成功片段,
+      // 再不行用参考图静帧;一条都没成则整任务失败(钱已被服务端退回)。
+      const refImagesAi = (input.referenceImages || []).filter((p) => p && fs.existsSync(p)).slice(0, 2);
+      // 首尾帧串接开关。true = 分镜脚本【直接喂 Seedance】,全程不出任何图:
+      //   第 1 镜文生视频(画面描述写进 prompt),第 2..N 镜首帧 = 上一镜末帧。
+      // ⚠️ 出图与否、Seedance 怎么调,【必须由这一个判据决定】。两处各自判断正是上一版的
+      //   bug 成因:出图那边不知道下游会串接,结果出满 6 张只用 1 张,白烧钱还白等一两分钟。
+      //   用户传了参考图时才不串接(火山那边首尾帧与参考图互斥,参考图是更强的人设锚),
+      //   那条路仍走「逐镜出首帧 → 图生视频」的老行为。
+      const chainFrames = refImagesAi.length === 0;
+      // 档位/分辨率不在客户端定:透传(可能 undefined)→ 服务端 seedance create 端点决定。
+      const resolution = input.seedanceResolution;
+      // 每镜时长:Seedance 单镜上限 12s(1.x/lite)→ clamp 到 [4,12]。
+      const clampDur = (i: number) => Math.max(4, Math.min(12, Math.ceil(sceneDurations[i])));
+      // 有分镜表 → 图和视频各用各的 prompt(buildFramePrompt / buildMotionPrompt);
+      //   没有 → 降级回老的单 prompt(buildSeedancePrompt),行为与改造前一致。
+      const aiScenes = aiShots
+        ? aiShots.map((shot, i) => ({
+            prompt: buildMotionPrompt(shot, {
+              shotIndex: i,
+              durationSec: clampDur(i),
+              // 有没有首帧,决定 prompt 要不要带画面描述:
+              //   · 串接模式:第 1 镜是【文生视频】(没有任何图)→ 必须把画面写进 prompt,
+              //     否则模型不知道要画什么;第 2 镜起首帧 = 上一镜末帧 → 只写运动
+              //     (i2v 复述画面会导致主体漂移,这是 Seedance 社区共识)。
+              //   · 非串接(用户传了参考图 / 老链路):每镜都有故事板首帧 → 一律只写运动。
+              hasKeyframe: chainFrames ? i > 0 : true,
+              // ⚠️ 尾帧图目前【没有生成】(故事板只出首帧),所以这里必须是 false。
+              //   置 true 会让 prompt 写成「从首帧自然过渡到尾帧画面」,而模型根本收不到尾帧 →
+              //   等于给它一个不存在的目标。首尾帧(flf2v)要等故事板支持出两张图再打开。
+              hasLastFrame: false,
+              styleLock: DEFAULT_STYLE_LOCK,
+              lang: contentLang,
+              // 原生音频:台词交给 Seedance 念(本地已不再配音)。
+              nativeAudio: true,
+              dialogue: shot.narration,
+            }),
+            durationSec: clampDur(i),
+          }))
+        : sentences.map((s, i) => ({
+            prompt: buildSeedancePrompt(s, {
+              // 有参考文案时不把赛道当画面风格(避免给跨领域参考文案的画面带原赛道倾向);
+              // 画面内容本就贴合口播句子(=参考文案内容),这里只去掉"风格贴合美食"的干扰。
+              track: userText ? undefined : input.track, persona: input.persona,
+              lang: contentLang, isI2V: refImagesAi.length > 0, shotIndex: i,
+            }),
+            durationSec: clampDur(i),
+          }));
+      // 每镜首帧的落盘路径(按 shot 索引对齐,没出图为 '')。没勾「要动」的镜直接用它当
+      //   静帧走 Ken Burns —— 这是成本的关键杠杆:一张图几毛,一个 4.5s 的 Seedance 镜要几块。
+      const keyframePaths: string[] = new Array(aiScenes.length).fill('');
+      // ── 故事板模式:先用 Seedream 组图出每镜【首帧】(同角色/画风),再图生视频(i2v,更稳)──
+      //   首帧也存一份到本次输出目录的「故事板」文件夹(用户要的本地存档)。
+      //   故事板失败/未配置 → 退化为纯文生视频(不挂首帧),不阻塞。
+      //
+      // ⚠️【串接模式一张图都不出】第 1 镜走文生视频(画面描述直接进 prompt —— buildMotionPrompt
+      //    在无首帧时本来就会带上 visualFirst),第 2..N 镜用上一镜的末帧。整条链路不需要任何
+      //    故事板图,连「视觉锚」那次 LLM 调用也一起省掉 —— 它的产出只喂给图像模型,不出图就是白烧。
+      //    真机实测过反例:出了 6 张只用 1 张,白花钱还白等一两分钟。
+      if (!chainFrames) try {
+        // 视觉锚生成(纯 AI 模式专用,有参考图时跳过 —— 用户参考图本身就是最强锚)。
+        //   把 character 字段从「persona · track」两词拼接(导致 Seedream 出套路图,如「亚洲女性看
+        //   手机」)升级为【LLM 5 字段结构化视觉描述】(shot_type / subject / environment /
+        //   lighting / style)。这是抄市面 image2 主流做法(Higgsfield 6 要素 + MoneyPrinterTurbo
+        //   verbatim prompt 思路),让第 1 帧锚的方向具体到「东京涩谷木质装潢咖啡馆,午后暖琥珀
+        //   侧光,35mm Kodak Portra 400」,后续每镜跟着这个 anchor 走质量就稳。
+        //   失败兜底:返回 null 时降级到老的 persona+track 拼接(绝不阻塞出片)。
+        let anchorCharacter = [input.persona, input.track].filter(Boolean).join(' · ');
+        if (refImagesAi.length === 0) {
+          tracker.progress('🎯 生成视觉锚(LLM 5 字段结构化描述,锁电影感)…');
+          const anchor = await generateStoryboardAnchor({
+            script, persona: input.persona, track: input.track, lang: contentLang,
+          });
+          if (anchor) {
+            anchorCharacter = anchor.character;
+            tracker.addTokens(anchor.tokens, anchor.costUsd);
+            tracker.progress(`✅ 视觉锚就绪 · ${anchor.fields.shot_type} · ${anchor.fields.style.slice(0, 30)}…`);
+          } else {
+            tracker.progress('⚠️ 视觉锚生成失败,降级到 persona+track');
+          }
+        }
+
+        // 走到这里必然是【非串接】(整块被 `if (!chainFrames)` 包着):用户传了参考图,
+        //   或是老链路。这种情况才逐镜出首帧图。串接模式一张都不出,见上面的说明。
+        const wantKeyframes = aiScenes.length;
+        tracker.progress(`🎨 生成故事板首帧(逐张出 ${wantKeyframes} 张,保持角色一致)…`);
+        // ⚠️ 喂给【图像模型】的必须是画面描述,不是 aiScenes[].prompt(那是给视频模型的运动
+        //   描述:"运动:镜头缓慢推近…不要剪切、不要画面闪烁")。老代码两处共用一个 prompt,
+        //   图像模型完全不知道要画什么 —— 这是首帧画错、整片跑偏的根因。
+        //   有分镜表 → buildFramePrompt(只写画面);没有 → 只能退回老行为(单 prompt 共用)。
+        const framePrompts = aiShots
+          ? aiShots.map((shot) => buildFramePrompt(shot, {
+              lang: contentLang,
+              styleLock: DEFAULT_STYLE_LOCK,
+              aspect: input.aspect,
+            }))
+          : aiScenes.map((sc) => sc.prompt);
+        // 逐张生成:每张独立短请求(绕开 Cloudflare 100s/HTTP524),并逐张回进度。
+        const storyboard = await generateStoryboard(
+          {
+            shots: framePrompts.slice(0, wantKeyframes),
+            character: anchorCharacter,
+            count: wantKeyframes,
+            aspect: input.aspect,
+            // 图表/文字卡/Logo 这类镜必须允许画面内出现文字,否则出来是空白板。
+            allowText: aiShots ? aiShots.slice(0, wantKeyframes).map((s) => shotAllowsText(s.type)) : undefined,
+            // 出图是分钟级的一步,不接 signal 的话点停止要干等它跑完。
+            signal,
+            // 组图一次出一整批,中途没有逐张进度 —— 批次级的话由它来说,否则计数器
+            //   会在整批生成的一两分钟里停着不动,看着像卡死。
+            onNote: (m) => tracker.progress(m),
+          },
+          (done, total) => { if (done < total && done > 0) tracker.progress(`🎨 故事板已出 ${done}/${total} 张`); },
+        );
+        const keyframes = storyboard.images; // 按 shot 索引对齐,失败位为 ''
+        const okFrames = keyframes.filter((s) => s).length;
+        // 故事板首帧也是真金白银(Seedream 按张扣)—— 计入「本次消耗」,
+        // 否则进度里图扣了费、总额却只剩 DeepSeek 写稿那几百,严重对不上。
+        if (storyboard.chargedTokens > 0) {
+          // 用服务端回的权威 costUsd;老后端没回才退回 tokens/1e6(那是 $1/M 的假设,会少算 1/3)。
+          tracker.addTokens(storyboard.chargedTokens, storyboard.costUsd || storyboard.chargedTokens / 1_000_000);
+        }
+        if (okFrames > 0) {
+          const sbDir = path.join(destDir, '故事板');
+          try { fs.mkdirSync(sbDir, { recursive: true }); } catch { /* ignore */ }
+          keyframes.forEach((dataUrl, i) => {
+            if (!dataUrl) return; // 该镜没出图 → 不挂首帧,下游自动退化为文生视频
+            if (i < aiScenes.length) (aiScenes[i] as SeedanceSceneSpec).keyframeDataUrl = dataUrl;
+            try {
+              const m = /^data:(image\/\w+);base64,(.+)$/.exec(dataUrl);
+              if (m) {
+                const ext = m[1] === 'image/png' ? 'png' : m[1] === 'image/webp' ? 'webp' : 'jpg';
+                const p = path.join(sbDir, `镜${i + 1}.${ext}`);
+                fs.writeFileSync(p, Buffer.from(m[2], 'base64'));
+                // 落盘路径留着:没勾「要动」的镜直接拿它当静帧走 Ken Burns,不烧 Seedance 的钱。
+                keyframePaths[i] = p;
+              }
+            } catch { /* 单张存盘失败不影响 */ }
+          });
+          tracker.progress(`🎨 故事板已生成 ${okFrames}/${wantKeyframes} 张首帧(已存「故事板」文件夹),转图生视频…`);
+          // 失败的镜显式报出来 —— 老实现是静默降级成文生视频,用户只看到「7/12 张」,
+          //   却不知道剩下 5 镜的画风会完全跑到另一个世界去(钱还照花)。
+          if (storyboard.failedIndices.length > 0) {
+            const list = storyboard.failedIndices.slice(0, 12).map((i) => i + 1).join('、');
+            tracker.progress(`⚠️ 第 ${list} 镜首帧未出图,这些镜将退化为文生视频,画面可能与其它镜不统一`);
+          }
+        } else {
+          // 把服务端真实失败原因显示出来(否则只剩通用「未生成」,没法排查 Seedream 端报错)。
+          tracker.progress(`🎨 故事板未生成${storyboard.error ? `(${storyboard.error})` : ''},退化为文生视频…`);
+        }
+      } catch (e) { tracker.progress(`🎨 故事板异常(${String((e as any)?.message || e).slice(0, 120)}),退化为文生视频…`); }
+      // ── 只给【勾了「要动」的镜】生成视频 ──────────────────────────────────────
+      //  Seedance 一个 4.5s 的镜要几块钱,而一张首帧图几毛 —— 差两个数量级。默认 animate=false,
+      //  没勾的镜直接拿首帧走 Ken Burns(compose 的 zoompan),观感上是「图在动」而不是死图。
+      //  没有分镜表时(降级路径)维持老行为:所有镜都生成视频。
+      //  ⚠️ animate 只认【用户意图】,不因为「这镜没出首帧」就自动改成生成视频 ——
+      //     那样一旦故事板整体失败,40 镜的长片会静默变成 40 次 Seedance 调用(几百块)。
+      //     老链路有 45s 硬截兜着,现在上限解除了,这个口子必须堵死。
+      //     没出首帧的镜改为【借邻镜首帧】(免费),见下面 assignVisuals。
+      // ⚠️ `!== false` 不是 `=== true`:电影级默认每一镜都生成视频。
+      //   老任务里存的 storyboardShots 可能带着 animate:false(那一版把默认改反了),
+      //   用 === true 会让它们重跑时整片退化成静图幻灯片 —— 那不是电影级。
+      //   只有【显式】标 false 的镜(纯静态展示)才不生成。
+      const animateFlags: boolean[] = aiShots
+        ? aiShots.map((s) => s.animate !== false)
+        : aiScenes.map(() => true);
+      const animateIdx: number[] = [];
+      animateFlags.forEach((on, i) => { if (on) animateIdx.push(i); });
+      const stillCount = aiScenes.length - animateIdx.length;
+      if (stillCount > 0) {
+        tracker.progress(`🖼️ ${stillCount} 镜为静态展示镜,用首帧 + 运镜(不生成视频)`);
+      }
+      // 既没有任何首帧、又一镜都没勾生成视频 → 后面无论如何拼不出画面。在【花钱之前】直接失败,
+      //   而不是硬着头皮跑完再交一条黑屏片。
+      if (keyframePaths.filter(Boolean).length === 0 && animateIdx.length === 0) {
+        const err = '故事板首帧一张都没生成,且没有任何镜勾选「生成视频」,无法出片。请稍后重试或在分镜里勾选要生成视频的镜。';
+        tracker.fail('visuals', err);
+        return { ok: false, error: err };
+      }
+      // 一镜都不用生成 → 跳过 Seedance,直接进静帧分配(避免空数组调用把服务端打出 400)。
+      const clipResults: SeedanceClipResult[] = Array.from(
+        { length: aiScenes.length },
+        (): SeedanceClipResult => ({ path: null }),
+      );
+      if (animateIdx.length > 0) {
+      tracker.progress(`🎬 AI 自动成片:逐镜生成 ${animateIdx.length} 个片段${resolution ? `(${resolution})` : ''}${refImagesAi.length ? ` · ${refImagesAi.length} 张参考图统一风格` : ''}…`);
+      const generated = await generateSeedanceClips({
+        scenes: animateIdx.map((i) => aiScenes[i]),
+        referenceImages: refImagesAi,
+        // 首尾帧串接:上一镜末帧当下一镜首帧,跨镜人物/光影/画风物理连续。
+        // ⚠️ 用户自带参考图时【不串接】—— 火山那边首尾帧和参考图互斥,用户的参考图
+        //    是更强的人设锚,优先保它。
+        chainFrames,
+        resolution,
+        tier: input.seedanceModel,
+        ratio: aspectToSeedanceRatio(input.aspect),
+        destDir: assetDir,
+        // 每镜【真成功落盘】时 seedanceProvider 会带 chargedTokens 调回来 → 立即累加进
+        //   「上次消耗」,UI 实时跟进度日志同步涨。失败镜不带 charged,所以语义还是
+        //   「只计成功镜」(原 generateSeedanceClips 返回后再 reduce 累加的做法跟用户
+        //   逐镜「已扣 X 积分」日志严重对不上 —— 任务跑完前顶部一直是 0)。
+        //   costUsd 按 1 USDT=1M tokens 折算(= 积分/1e6)供 $ 展示。
+        onProgress: (m, charged, usd) => {
+          // 用服务端回的权威 costUsd;老后端没回才退回 tokens/1e6($1/M 的假设,会少算 1/3)。
+          if (charged && charged > 0) tracker.addTokens(charged, usd || charged / 1_000_000);
+          tracker.progress(m);
+        },
+        signal,
+      });
+      // 结果按【子集下标】回来 → 映射回全量下标,否则后面 sceneClips/sceneDurations 全错位。
+      generated.forEach((r, k) => { clipResults[animateIdx[k]] = r; });
+      }
+      const okCount = clipResults.filter((r) => r.path).length;
+      // 全片没有任何可用画面(视频没出 + 首帧也没出)才算失败;只要有首帧就还能出片。
+      const stillOk = keyframePaths.filter(Boolean).length;
+      if (okCount === 0 && stillOk === 0) {
+        // 原始 sample(如 "fetch failed")只打到 console 供排查,不展示给用户;
+        // 用户面只给通用文案(退费由服务端按计费政策处理:有 token 输出不退、0 输出才退,不在文案里承诺)。
+        const sample = clipResults.find((r) => r.error)?.error || '';
+        if (sample) { try { console.error('[seedance] all shots failed, sample error:', sample); } catch { /* ignore */ } }
+        const err = 'AI 自动成片暂时没出片,请稍后重试。';
+        tracker.fail('visuals', err);
+        return { ok: false, error: err };
+      }
+      /** 就近借一张已出图的首帧(左右由近及远);都没有返回 ''。 */
+      const nearestKeyframe = (i: number): string => {
+        for (let d = 1; d < keyframePaths.length; d++) {
+          if (keyframePaths[i - d]) return keyframePaths[i - d];
+          if (keyframePaths[i + d]) return keyframePaths[i + d];
+        }
+        return '';
+      };
+      assignVisuals = () => {
+        const imageByScene = new Map<number, string>();
+        const sceneClips = clipResults.map((r, i) => {
+          if (r.path) { aiOwnClip[i] = true; return [r.path]; }
+          // 没生成视频的镜(以及生成失败的镜):优先用【本镜自己的首帧】走 Ken Burns ——
+          //   比借邻镜的片段贴题得多(邻镜画的是别的内容)。
+          if (keyframePaths[i]) { imageByScene.set(i, keyframePaths[i]); return []; }
+          // 本镜没出图 → 先借邻镜首帧(免费),再考虑借邻镜片段。
+          const nk = nearestKeyframe(i);
+          if (nk) { imageByScene.set(i, nk); return []; }
+          const near = findNearestClip(clipResults, i);
+          if (near) return [near];
+          // 全都没有(极端)→ 用参考图静帧兜底。
+          if (refImagesAi.length > 0) imageByScene.set(i, refImagesAi[i % refImagesAi.length]);
+          return [];
+        });
+        return { sceneClips, imagePool: refImagesAi, imageByScene };
+      };
+      // AI 生成的片段本地留一份:assetDir 是临时目录(结尾会清掉),拷到成片输出目录的
+      // 「素材」子文件夹,供用户复用/二剪/排查(对齐"成片+文案+素材"一起留档)。
+      try {
+        const matDir = path.join(destDir, '素材');
+        fs.mkdirSync(matDir, { recursive: true });
+        let saved = 0;
+        clipResults.forEach((r, i) => {
+          if (r.path && fs.existsSync(r.path)) {
+            try { fs.copyFileSync(r.path, path.join(matDir, `第${i + 1}镜_${path.basename(r.path)}`)); saved++; } catch { /* 单个拷贝失败忽略 */ }
+          }
+        });
+        if (saved > 0) tracker.progress(`📁 已在「素材」子目录留存 ${saved} 个 AI 片段(可复用/二剪)`);
+      } catch { /* 留存失败不影响出片 */ }
+      // 不向用户暴露「X/Y 镜 + 其余就近降级」(失败镜回退是内部兜底,用户不需要知道)。
+      tracker.done('visuals', `🎬 AI 画面就绪(${aiScenes.length} 镜)`);
+    } else if (input.engine === 'localmix') {
+      // ── 本地混剪:出片时实时扫素材文件夹 —— 视频按换镜节奏循环拼接(智能剪辑),
+      //    图片逐镜 Ken Burns 合成(imageByScene,复用抖音图文的合成路径)。
+      //    纯本地素材零下载零搜索词;文件夹空/不存在 → 本条失败并给可读原因。
+      const mixDir = String(input.localMixFolder || '').trim();
+      const lmFiles = Array.isArray(input.localMixFiles) ? input.localMixFiles.filter(Boolean) : [];
+      const media = lmFiles.length > 0 ? classifyLocalMediaFiles(lmFiles) : scanLocalMediaFolder(mixDir);
+      const wantImages = input.localMixMediaType === 'image';
+      if (wantImages && media.images.length > 0) {
+        const imgs = media.images;
+        tracker.progress(`使用本地图片素材 ${imgs.length} 张,逐镜缓慢运镜合成…`);
+        assignVisuals = () => {
+          // 每次都洗牌:本引擎 batch 恒 1 条(videoIdx 恒 0),定时任务反复跑同一文件夹,
+          // 不洗牌会每天铺出一模一样的组合(strict 文案下=重复视频,易被平台判重)。
+          const pool = shuffled(imgs);
+          const imageByScene = new Map<number, string>();
+          sentences.forEach((_, i) => imageByScene.set(i, pool[i % pool.length]));
+          return { sceneClips: sentences.map(() => [] as string[]), imagePool: pool, imageByScene };
+        };
+        tracker.done('visuals', `🖼️ 画面就绪(本地图片 ${imgs.length} 张 · 缓慢运镜)`);
+      } else if (!wantImages && media.videos.length > 0) {
+        const vids = media.videos;
+        tracker.progress(`使用本地视频素材 ${vids.length} 个,按换镜节奏循环混剪…`);
+        assignVisuals = () => {
+          // 每次都洗牌(理由同上:batch 恒 1,靠洗牌让定时重复跑的每条组合各不相同)。
+          const pool = shuffled(vids);
+          let cur = 0;
+          const sceneClips = sentences.map((_, i) => {
+            const dur = Math.max(1.2, sceneDurations[i]);
+            const want = Math.max(1, Math.min(8, Math.ceil(dur / maxClip)));
+            const clips: string[] = [];
+            for (let k = 0; k < want; k++) clips.push(pool[cur++ % pool.length]);
+            return clips;
+          });
+          return { sceneClips, imagePool: [] };
+        };
+        tracker.done('visuals', `🎬 画面就绪(本地视频 ${vids.length} 个 · 换镜混剪)`);
+      } else {
+        const err = lmFiles.length > 0
+          ? (wantImages
+            ? '选中的素材文件里没有可用图片(文件可能已被移动/删除),请重新选择后重试'
+            : '选中的素材文件里没有可用视频(文件可能已被移动/删除),请重新选择后重试')
+          : (wantImages
+            ? `本地素材文件夹里没有可用图片(${mixDir || '未选择文件夹'}),请检查文件夹后重试`
+            : `本地素材文件夹里没有可用视频(${mixDir || '未选择文件夹'}),请检查文件夹后重试`);
+        tracker.fail('visuals', err);
+        return { ok: false, error: err };
+      }
+    } else if (!usesStock && localVideos.length > 0) {
+      // 纯本地素材:不搜在线、不花 DeepSeek 搜索词钱,按换镜节奏循环拼接,素材少就复用。
+      tracker.progress(`使用本地视频素材 ${localVideos.length} 个,按换镜节奏循环拼接…`);
+      assignVisuals = (videoIdx: number) => {
+        // 每条错开起始游标 → 同样的本地素材排出不同组合。
+        let localCursor = videoIdx;
+        const sceneClips = sentences.map((_, i) => {
+          const dur = Math.max(1.2, sceneDurations[i]);
+          const want = Math.max(1, Math.min(8, Math.ceil(dur / maxClip)));
+          const clips: string[] = [];
+          for (let k = 0; k < want; k++) clips.push(localVideos[localCursor++ % localVideos.length]);
+          return clips;
+        });
+        return { sceneClips, imagePool: [] };
+      };
+      tracker.done('visuals', `画面就绪(本地素材 ${localVideos.length} 个${videoCount > 1 ? ` · ${videoCount} 条各不同组合` : ''})`);
+    } else if (input.engine === 'hotspot' && input.hotspotMaterialSource === 'douyin'
+               && resolveMaterialPlatform() === 'douyin'
+               && (douyinPool = await buildDouyinPool())) {
+      // 中文话题 + 选「视频混剪」:抖音混剪 —— 只按热搜标题搜、切片铺镜(见 buildDouyinPool,用户要求不 AI
+      //   拆词)。取不到 → 短路落下面抖音图文 / 文字卡。非中文话题应走 TikTok(待做)。
+      hotspotDouyinMode = true;
+      assignVisuals = (videoIdx: number) => ({ sceneClips: douyinPool!.assign(videoIdx), imagePool: [] });
+      tracker.done('visuals', '🎬 抖音混剪就绪(按热搜标题搜 · 底部黑条盖原字幕)');
+    } else if (input.engine === 'hotspot'
+               && resolveMaterialPlatform() === 'douyin'
+               && (douyinImgPool = await buildDouyinImagePool())) {
+      // 中文话题:选了图片配图、或选了视频混剪但视频没取到 → 抖音图文(只按热搜标题搜,见
+      //   buildDouyinImagePool)。复用 hotspotDouyinMode=true:字幕走中下 lower;图镜
+      //   hasVideo=false 不触发模糊盖条(图不需盖原字幕)。
+      hotspotDouyinMode = true;
+      assignVisuals = (videoIdx: number) => ({
+        sceneClips: sentences.map(() => [] as string[]),
+        imagePool: douyinImgPool!.imagePool,
+        imageByScene: douyinImgPool!.imageBySceneFor(videoIdx),
+      });
+      tracker.done('visuals', '🖼️ 抖音图文就绪(按热搜标题搜 · 图片缓慢运镜)');
+    } else if (input.engine === 'hotspot' && input.hotspotMaterialSource === 'douyin'
+               && resolveMaterialPlatform() === 'tiktok'
+               && (tiktokPool = await buildTiktokPool())) {
+      // 英文/小语种话题 + 选「视频混剪」:TikTok 混剪 —— 只按热搜标题搜、切片铺镜(对称抖音 buildDouyinPool)。
+      //   取不到 → 短路落下面 TikTok 图集 / 文字卡。中文话题应走上面抖音。
+      hotspotDouyinMode = true; // 复用「平台混剪模式」:视频底部黑条盖原字幕 + 字幕走中下 lower
+      assignVisuals = (videoIdx: number) => ({ sceneClips: tiktokPool!.assign(videoIdx), imagePool: [] });
+      tracker.done('visuals', '🎬 TikTok 混剪就绪(按热搜标题搜 · 底部黑条盖原字幕)');
+    } else if (input.engine === 'hotspot'
+               && resolveMaterialPlatform() === 'tiktok'
+               && (tiktokImgPool = await buildTiktokImagePool())) {
+      // 英文/小语种话题:选了图片配图、或选了视频混剪但视频没取到 → TikTok 图集图(Ken Burns,对称抖音图文)。
+      hotspotDouyinMode = true;
+      assignVisuals = (videoIdx: number) => ({
+        sceneClips: sentences.map(() => [] as string[]),
+        imagePool: tiktokImgPool!.imagePool,
+        imageByScene: tiktokImgPool!.imageBySceneFor(videoIdx),
+      });
+      tracker.done('visuals', '🖼️ TikTok 图集就绪(按热搜标题搜 · 图片缓慢运镜)');
+    } else if (input.engine === 'hotspot') {
+      // 热搜成片【不再用 Serper 配图】(用户决策 2026-06:中文→抖音,英文/小语种→TikTok)。
+      //   走到这 = 中文话题抖音视频+图文都没取到,或英文/小语种话题 TikTok 视频+图集也没取到(没登录/没源/未开 VPN)。
+      //   暂无素材 → assignVisuals 返回空 → compose 落「纯色文字卡」兜底(绝不再下 Serper 谷歌杂图)。
+      tracker.progress('⚠️ 未取到平台素材(中文走抖音 / 英文走 TikTok)→ 本条用文字卡兜底');
+      assignVisuals = () => ({ sceneClips: sentences.map(() => [] as string[]), imagePool: [] });
+    } else {
+      // 在线素材库(若有本地上传则混拼:本地片段优先露出 + 在线空镜补满)→ Pexels 素材库。
+      // 素材池只建一次,assign(shuffle) 供每条按需取片段。
+      const pool = await buildStockPool();
+      assignVisuals = (videoIdx: number) => ({
+        sceneClips: pool.assign(videoIdx > 0),
+        imagePool: pool.imagePool,
+        imageByScene: pool.imageBySceneFor ? pool.imageBySceneFor(videoIdx) : pool.imageByScene,
+      });
+    }
+
+    // 在线素材库分支:AI 搜索词 → 逐词拉视频 → 图片补位 → 返回 { assign, imagePool }。
+    // 抽成闭包是为了让本地上传时整段跳过(省时间 + 省 DeepSeek token);
+    // assign(shuffle) 可被批量出片重复调用,每次用 fresh usedVideo 集分配。
+    async function buildStockPool(): Promise<{ assign: (shuffle: boolean) => string[][]; imagePool: string[]; imageByScene: Map<number, string>; imageBySceneFor?: (videoIdx: number) => Map<number, string> }> {
+    // 3a. 让 DeepSeek 给每个分镜配 1-3 个英文搜索词(画面跟着内容走)
+    tracker.progress('AI 规划每镜画面关键词…');
+    // A:把整条视频的主题/赛道/人设/关键词当语境喂给映射模型,让每镜的词锁定选题。
+    //   但【有参考文案时】:口播已按参考文案写(可能跟原赛道不同领域,如美食赛道+spacex 文案),
+    //   搜索词语境也不能再用原赛道/关键词,否则画面跟着美食走、跟实际口播打架 —— 改成纯按
+    //   实际口播句子(sentences)配词。
+    const usingReference = !!userText;
+    const termsTopic = usingReference ? '' : ((input.keywords || []).filter(Boolean).join('、') || input.track || '');
+    const termsResult = await generateSearchTerms(sentences, usingReference ? [] : (input.keywords || []), vcfg.termsSystemPrompt, {
+      topic: termsTopic,
+      persona: input.persona,
+      track: usingReference ? undefined : input.track,
+      keywords: usingReference ? undefined : input.keywords,
+      lang: contentLang,  // 让人物镜头按内容语言加地区人种倾向(中文→asian),免得搜出全是老外
+    });
+    const perSceneTerms = termsResult.terms.map((arr) => (arr || []).map((s) => s.toLowerCase()));
+    aiCostUsd += termsResult.costUsd;
+    tracker.addTokens(termsResult.tokens, termsResult.costUsd);
+
+    // 要去搜的词集:每镜首词优先(保证每个分镜的主画面词一定被搜到),再补其余词。
+    const primaryTerms = Array.from(new Set(perSceneTerms.map((t) => t[0]).filter(Boolean)));
+    const extraTerms = Array.from(new Set(perSceneTerms.flat().filter(Boolean)))
+      .filter((t) => !primaryTerms.includes(t));
+    // C:有效上限至少容得下【所有去重首词】(否则首词被砍的镜只能借全局 → 跑题),
+    // 再封个硬顶 24 防极端长稿逐词搜请求过多;config 的 maxSearchTerms 作下限基线。
+    const HARD_TERM_CAP = 24;
+    const effectiveTermCap = Math.max(vcfg.maxSearchTerms, Math.min(primaryTerms.length, HARD_TERM_CAP));
+    let searchTerms = [...primaryTerms, ...extraTerms].slice(0, effectiveTermCap);
+    // 有参考文案时不退回原赛道关键词(否则又跑回美食);搜索词空就靠图片补位/全局兜底。
+    if (searchTerms.length === 0 && !usingReference) {
+      searchTerms = (input.keywords || []).map((s) => s.toLowerCase()).filter(Boolean);
+    }
+    if (searchTerms.length > 0) {
+      tracker.progress(`🔍 画面搜索词:${searchTerms.join(', ')}`);
+    }
+
+    const refImages = (input.referenceImages || []).filter((p) => p && fs.existsSync(p));
+    const wantVideo = input.useStockVideo !== false;
+    const orientation = aspectToOrientation(input.aspect);
+
+    // 3b. 逐词拉视频,保留「词 → 素材」归属(进度逐词回报,不再"没动静")
+    // 每词下载几段【随出片条数缩放】:单条只需 ~1 段/词,多条才需多备(N 条不重复靠
+    // 同词下的不同段轮流分配)。videoCount=1→2 段/词(够覆盖且最快),videoCount=5→封顶
+    // vcfg.perTermCount(=6)。这是搜索耗时的主因——以前不论出几条都按 6 段/词下载,
+    // 单条视频会白下 3 倍素材;按需缩放后单条下载量直接砍半。
+    // C:每词至少备 3 段(原 2)。本镜词够用就不必借全局,关联更稳;多条出片再按需上探。
+    const perTermCount = Math.max(3, Math.min(vcfg.perTermCount, videoCount + 2));
+    let videoByTerm: StockVideoByTerm[] = [];
+    if (wantVideo && searchTerms.length > 0) {
+      tracker.progress(`搜索在线视频素材(共 ${searchTerms.length} 组关键词)…`);
+      videoByTerm = await fetchStockVideosByTerms({
+        terms: searchTerms,
+        perTermCount,
+        destDir: assetDir,
+        orientation,
+        // 英文词 + 内容语言 locale 兜底;size 让 Pexels 源头按档过滤(默认 small=HD≥720),省下白下白删。
+        locale: localeFor(vcfg, contentLang),
+        videoSize: vcfg.stockVideoSize,
+        minVideoEdge: vcfg.minVideoEdge,
+        minVideoSec: vcfg.minVideoSec,
+        onProgress: ({ phase, done, total, term, totalGot, clip }) =>
+          tracker.progress(phase === 'search'
+            // 搜索阶段(并发):done=已搜完词数。
+            ? `搜索关键词 ${done}/${total}「${term}」…`
+            : clip
+              // 下载阶段段级心跳:done=已完成词数,当前是第 done+1 个词下载中,段 index/count。
+              ? `下载视频素材 词 ${done + 1}/${total}「${term}」· 段 ${clip.index}/${clip.count}(累计 ${totalGot} 段)`
+              : `下载视频素材 ${done}/${total}:「${term}」(累计 ${totalGot} 段)`),
+      });
+    }
+
+    // 建「词 → 该词的视频队列」(持久池)+ 全局视频列表;分配时各镜按自己的词取,用尽再借全局。
+    const poolByTerm = new Map<string, StockVideoAsset[]>();
+    for (const g of videoByTerm) poolByTerm.set(g.term.toLowerCase(), [...g.assets]);
+    const allVideos: StockVideoAsset[] = videoByTerm.flatMap((g) => g.assets);
+
+    // 用户本地素材混拼:把本地片段【均匀铺】到各分镜(每段大致出现一次),作为该镜
+    // 的首选片段,其余位置再用在线空镜补满 → 本地 + 在线混着拼。无本地素材时此 map 为空,
+    // 行为与纯在线完全一致。本地片段数 > 分镜数时,多出的会落到同一镜(成为该镜的额外段)。
+    const localForScene = new Map<number, string[]>();
+    if (localVideos.length > 0 && sentences.length > 0) {
+      localVideos.forEach((clip, j) => {
+        const idx = Math.min(sentences.length - 1, Math.round((j * sentences.length) / localVideos.length));
+        const arr = localForScene.get(idx) || [];
+        arr.push(clip);
+        localForScene.set(idx, arr);
+      });
+      tracker.progress(`混入本地视频素材 ${localVideos.length} 个(优先露出,在线空镜补满)`);
+    }
+
+    // 单条视频的片段分配:每次用 fresh usedVideo 集 + (批量时)打乱后的素材队列,
+    // 让批量出片的每条画面组合都不同。同一份持久池,各条互不影响。
+    const assignOnce = (shuffle: boolean): string[][] => {
+      const usedVideo = new Set<string>();
+      const workByTerm = new Map<string, StockVideoAsset[]>();
+      for (const [k, v] of poolByTerm) workByTerm.set(k, shuffle ? shuffled(v) : [...v]);
+      const workAll = shuffle ? shuffled(allVideos) : [...allVideos];
+
+      // 取一段【本条还没用过】的素材:先本镜搜索词命中,再借全局。新鲜素材都分完才返 undefined。
+      const takeFreshClip = (i: number): string | undefined => {
+        for (const term of perSceneTerms[i] || []) {
+          const q = workByTerm.get(term);
+          if (q) {
+            const v = q.find((a) => !usedVideo.has(a.path));
+            if (v) { usedVideo.add(v.path); return v.path; }
+          }
+        }
+        const any = workAll.find((a) => !usedVideo.has(a.path));
+        if (any) { usedVideo.add(any.path); return any.path; }
+        return undefined;
+      };
+
+      // 新鲜素材分完后的循环兜底:只要下到了视频,就【绝不退在线图片】(用户要求:宁可复用视频也别补图)。
+      // 用游标轮转整池,让复用尽量错开、不老是同一段;池子真空(一段没下到)才返 undefined → 上层退图/文字卡。
+      let reuseCursor = 0;
+      const reuseClip = (): string | undefined => {
+        if (workAll.length === 0) return undefined;
+        const p = workAll[reuseCursor % workAll.length].path;
+        reuseCursor++;
+        return p;
+      };
+
+      // want = ceil(时长/maxClip):该镜基础段数;cap = floor(时长/最短单段):该镜【最多】能放几段。
+      // 多下来的新鲜素材后面按 cap 分摊进各镜 —— 既把下载的素材尽量用满(不浪费),画面也更丰富。
+      // 用户反馈「下了几十段很多没用上、想画面再丰富点」→ 把最短单段 1.6→1.2s、每镜封顶 8→12 段:
+      //   切得更勤、剩余下载素材尽量铺进去,少浪费(1.2s 仍不至于碎到跳帧)。
+      const MIN_SEG_SEC = 1.2;
+      const wantOf = (i: number) => Math.max(1, Math.min(8, Math.ceil(Math.max(1.2, audios[i].durationSec) / maxClip)));
+      const capOf = (i: number) => Math.max(wantOf(i), Math.min(12, Math.floor(Math.max(1.2, audios[i].durationSec) / MIN_SEG_SEC)));
+
+      const clipsByScene: string[][] = sentences.map((): string[] => []);
+      // 1) 用户本地素材优先露出(封顶到本镜 want)。
+      sentences.forEach((_, i) => {
+        for (const lc of localForScene.get(i) || []) {
+          if (clipsByScene[i].length >= wantOf(i)) break;
+          clipsByScene[i].push(lc);
+        }
+      });
+      // 2) 各镜先用新鲜在线素材补到 want。
+      sentences.forEach((_, i) => {
+        while (clipsByScene[i].length < wantOf(i)) {
+          const fresh = takeFreshClip(i);
+          if (fresh) clipsByScene[i].push(fresh);
+          else break;
+        }
+      });
+      // 3) 还有没用上的新鲜素材 → 轮流多塞给各镜(到该镜 cap 为止),把下载的素材尽量用满、画面更丰富。
+      for (let guard = 0; guard < 4096 && workAll.some((a) => !usedVideo.has(a.path)); guard++) {
+        let progressed = false;
+        for (let i = 0; i < sentences.length; i++) {
+          if (clipsByScene[i].length >= capOf(i)) continue;
+          const fresh = takeFreshClip(i);
+          if (fresh) { clipsByScene[i].push(fresh); progressed = true; }
+        }
+        if (!progressed) break;
+      }
+      // 4) 仍空的镜(池子非空但本镜词没命中且新鲜素材已分完)→ 循环复用,绝不退图片。
+      sentences.forEach((_, i) => {
+        if (clipsByScene[i].length === 0) {
+          const r = reuseClip();
+          if (r) clipsByScene[i].push(r);
+        }
+      });
+      return clipsByScene;
+    };
+
+    // 用第一条(不打乱)的分配统计覆盖率 + 决定补位图片数量(各条覆盖率相近,算一次即可)。
+    const probe = assignOnce(false);
+    const scenesWithoutVideo = probe.filter((c) => c.length === 0).length;
+    const totalClipsUsed = probe.reduce((n, c) => n + c.length, 0);
+    const localUsed = localVideos.length > 0
+      ? probe.reduce((n, c) => n + c.filter((p) => localVideos.includes(p)).length, 0)
+      : 0;
+
+    // 3c. 视频没覆盖到的分镜补图。D:按【该镜自己的搜索词】分组搜图,让补位图也贴该镜内容,
+    //     而不是从全局词汤里随便挑一张。建 imageByScene(镜号→图)精确回填;另留扁平
+    //     imagePool 兜底(批量出片打乱后,某条里没覆盖的镜可能不在 map 内,用它顶上)。
+    const uncoveredIdx = probe.map((c, i) => (c.length === 0 ? i : -1)).filter((i) => i >= 0);
+    const imageByScene = new Map<number, string>();
+    const flatImages: string[] = [];
+    if (uncoveredIdx.length > 0 && (searchTerms.length > 0 || refImages.length > 0)) {
+      tracker.progress('补充在线图片素材(按各镜内容)…');
+      // 先把用户参考图按顺序铺给最前面没覆盖的镜(参考图本就是用户想露出的画面)。
+      let ri = 0;
+      for (const idx of uncoveredIdx) {
+        if (ri >= refImages.length) break;
+        imageByScene.set(idx, refImages[ri++]);
+      }
+      // 其余没覆盖的镜:按各自首词(空则退全局首词/keywords)分组,逐词搜图后回填。
+      const byTerm = new Map<string, number[]>();
+      for (const idx of uncoveredIdx) {
+        if (imageByScene.has(idx)) continue;
+        const term = (perSceneTerms[idx] && perSceneTerms[idx][0])
+          || searchTerms[0] || (input.keywords || []).map((s) => s.toLowerCase())[0] || '';
+        if (!term) continue;
+        const arr = byTerm.get(term) || [];
+        arr.push(idx);
+        byTerm.set(term, arr);
+      }
+      // 逐词搜图,总量封顶 20(避免长稿请求过多)。每词要够覆盖该词下的所有镜。
+      let budget = 20;
+      for (const [term, idxs] of byTerm) {
+        if (budget <= 0) break;
+        const want = Math.min(idxs.length, budget);
+        const imgs = await fetchStockImages({
+          keywords: [term],
+          count: want,
+          destDir: assetDir,
+          orientation,
+          minImageEdge: vcfg.minImageEdge,
+        });
+        budget -= imgs.length;
+        imgs.forEach((p, k) => { if (idxs[k] !== undefined) imageByScene.set(idxs[k], p); });
+        flatImages.push(...imgs);
+      }
+    }
+    const imagePool = [...flatImages, ...refImages];
+
+    tracker.done('visuals',
+      (totalClipsUsed > 0 || imageByScene.size > 0 || imagePool.length > 0)
+        ? `画面就绪(视频 ${totalClipsUsed} 段${localUsed > 0 ? `（含本地 ${localUsed} 段）` : ''} → 覆盖 ${sentences.length - scenesWithoutVideo}/${sentences.length} 镜,图片 ${imageByScene.size} 张按镜补位${videoCount > 1 ? ` · ${videoCount} 条各不同组合` : ''})`
+        : '无可用素材,使用文字卡');
+
+    // 在线素材原文件本地留一份(对齐 AI 分支):assetDir 是临时目录、结尾会清掉,把下载的
+    // 在线视频/图片拷到成片输出目录的「素材」子文件夹,供用户复用 / 二剪 / 排查。
+    // 只存下载的在线素材(allVideos + flatImages),不含用户自己的本地上传/参考图。
+    try {
+      const stockFiles = [...allVideos.map((v) => v.path), ...flatImages]
+        .filter((p) => p && fs.existsSync(p));
+      if (stockFiles.length > 0) {
+        const matDir = path.join(destDir, '素材');
+        fs.mkdirSync(matDir, { recursive: true });
+        let saved = 0;
+        const seen = new Set<string>();
+        stockFiles.forEach((src, i) => {
+          if (seen.has(src)) return;
+          seen.add(src);
+          try { fs.copyFileSync(src, path.join(matDir, `${String(i + 1).padStart(3, '0')}_${path.basename(src)}`)); saved++; } catch { /* 单个拷贝失败忽略 */ }
+        });
+        if (saved > 0) tracker.progress(`📁 已在「素材」子目录留存 ${saved} 个在线素材(可复用 / 二剪)`);
+      }
+    } catch { /* 留档失败不影响出片 */ }
+
+    return { assign: assignOnce, imagePool, imageByScene };
+    } // end buildStockPool
+
+    /**
+     * 抖音视频池:【只按热搜标题搜】(用户要求,不 AI 拆分镜词 —— 拆词会让画面偏离热点太远)→ 搜抖音/下视频/
+     *   切片成片段池 → assign 时每镜从池里取、used 去重(切片够多 → 铺镜不重复)。取不到 → null,上层落
+     *   抖音图文/文字卡。保留 perSceneTerms/poolByTerm 结构只为复用切片+去重逻辑,实际只有标题一个词。
+     */
+    async function buildDouyinPool(): Promise<{ assign: (videoIdx: number) => string[][]; imageByScene: Map<number, string> } | null> {
+      // 【只按热搜标题搜】(用户要求):AI 拆分镜词会让画面偏离热点太远(如「沈泉锐第一次当摇子有点生疏」
+      //   被拆成「机械 齐舞 舞台」搜出无关 cut),热搜成片永远只用热搜原标题搜,不额外出关键词。
+      const title = (hotspotTopic?.title || '').trim();
+      if (!title) return null;
+      const searchTerms = [title];
+      const perSceneTerms = sentences.map(() => [title]); // 每镜共用标题词,take 走全局池 + used 去重(不重复铺)
+      // 3) 搜+切片,建 poolByTerm(词→片段)。【关键:切够铺一整条不重复的量】——
+      //   本条要铺多少段 = 各镜段数之和(跟下面 assign 的 want 同口径),据此倒推要切多少片、下几个源。
+      //   严禁复用切片(用户要求):池子按需求 ×1.3 切够;真不够就【多下几个源 / 每个源多切几段不一样的】,
+      //   各段起点均匀错开(最小间隔 0.6s 视为不同片),绝不重复用同一时间段。
+      const segLen = Math.max(2, maxClip);
+      const wantOfScene = (i: number) => Math.max(1, Math.min(4, Math.ceil(Math.max(1.2, sceneDurations[i]) / maxClip)));
+      const totalDemand = sentences.reduce((s, _s, i) => s + wantOfScene(i), 0);
+      const poolTarget = Math.min(80, Math.ceil(totalDemand * 1.3) + 2); // 1.3× 缓冲(给 take 挑选余地),硬顶 80 段防极端长稿
+      // 源视频数:按 poolTarget 估(每源平均能切 ~4 段),夹 [6,20];源越多画面越不雷同。
+      const wantClips = Math.max(6, Math.min(20, Math.ceil(poolTarget / 4) + 1));
+      tracker.progress(`🎬 抖音取材:只按热搜标题搜「${title}」(本条需 ${totalDemand} 段 → 目标切 ${poolTarget} 段、下 ${wantClips} 个源)`);
+      const poolByTerm = new Map<string, string[]>();
+      let si = 0;
+      for (const term of searchTerms) {
+        if (signal?.aborted) break;
+        let dy: { paths: string[]; titles: string[] };
+        if (douyinPrefetch && douyinPrefetch.mode === 'video') {
+          // 写稿前已经搜过抖音视频了:直接复用(【空也复用】→ 不重复搜、不重复等 3 分钟登录;空则上层落文字卡)。
+          if (douyinPrefetch.paths.length > 0) tracker.progress(`   ♻️ 复用写稿前已下好的 ${douyinPrefetch.paths.length} 个抖音视频(不重复下载)`);
+          dy = { paths: douyinPrefetch.paths, titles: douyinPrefetch.titles };
+        } else {
+          dy = await fetchDouyinClips([term], wantClips, assetDir, (m) => tracker.progress(`   ${m}`), signal, 'video', (input as any).hotspotMaterialAccountId);
+        }
+        if (dy.paths.length === 0) { tracker.progress(`   ⚠️「${term}」没取到视频`); continue; }
+        // 下载的源视频留档到输出目录「素材」子目录(assetDir 是临时目录、结尾会清掉,不留档就丢了)。
+        //   跟 stock / 旧 collectDouyinClips 一致 —— 用户要能在成片旁边看到/复用原素材。
+        try {
+          const matDir = path.join(destDir, '素材');
+          fs.mkdirSync(matDir, { recursive: true });
+          dy.paths.forEach((src, i) => {
+            try { fs.copyFileSync(src, path.join(matDir, `素材${String(i + 1).padStart(2, '0')}_${path.basename(src)}`)); } catch { /* 单个失败忽略 */ }
+          });
+        } catch { /* 留档失败不影响出片 */ }
+        // 先探每个源时长 → 算「每个源最多能切几段【不重叠】」(cap,起点间隔 ≥ segLen);再把 poolTarget
+        //   按各源 cap【按比例】分配 → 长视频多切、短视频少切,起点在整段上均匀铺开,段间互不重叠。
+        // ⚠️【2026-06-17 用户实测"画面重复"根因】旧 cap 用 0.6s 间隔 → 同一源能切出几十段【85% 重叠的近重复片】
+        //   (是不同文件、used 去重抓不到,但画面几乎一样)→ 用户看到重复。改成间隔 ≥ segLen(段长)→ 段间【真不
+        //   重叠】,每段是真正不同的画面;短视频自然少切(切不出那么多不同画面就认了,不靠近重复片凑数)。
+        const srcs: { v: string; dur: number; cap: number }[] = [];
+        for (const v of dy.paths) {
+          if (signal?.aborted) break;
+          const dur = await probeDuration(v).catch(() => 0);
+          if (dur <= segLen + 0.3) continue; // 太短切不出一整段,跳过
+          const cap = Math.max(1, Math.floor((dur - segLen) / segLen) + 1); // 间隔≥segLen 的【不重叠】段数
+          srcs.push({ v, dur, cap });
+        }
+        if (srcs.length === 0) { tracker.progress(`   ⚠️ 源视频都太短,切不出片`); continue; }
+        const totalCap = srcs.reduce((n, s) => n + s.cap, 0);
+        const targetSegs = Math.min(poolTarget, totalCap); // 只有总容量 < 目标时才少切(真不够);绝不靠复用补齐
+        // 派每源段数:抖音搜索按相关度排序,【第 1 个源最贴近热点】→ 给它约 35%(用户要求:第一个多给点),
+        //   其余 ~65% 在后面的源里平均分。两头都受各源 cap 限制(短视频切不出那么多就认了),凑不满的从前
+        //   往后轮转补。历史教训:纯 rankW 前倾会堆成 17/4/1…(太偏);纯平均又把最相关的摊薄(太平)→ 取中。
+        const nSrc = srcs.length;
+        const firstQuota = Math.min(srcs[0].cap, Math.max(1, Math.round(targetSegs * 0.35)));
+        const restTarget = Math.max(0, targetSegs - firstQuota);
+        const restN = nSrc - 1;
+        const restBase = restN > 0 ? Math.floor(restTarget / restN) : 0;
+        const restRem = restN > 0 ? restTarget - restBase * restN : 0;
+        const quota = srcs.map((s, i) => (i === 0)
+          ? Math.min(s.cap, firstQuota)
+          : Math.min(s.cap, restBase + ((i - 1) < restRem ? 1 : 0)));
+        let qsum = quota.reduce((a, b) => a + b, 0);
+        for (let guard = 0; guard < 2000 && qsum < targetSegs; guard++) {
+          let added = false;
+          for (let i = 0; i < nSrc && qsum < targetSegs; i++) if (quota[i] < srcs[i].cap) { quota[i]++; qsum++; added = true; }
+          if (!added) break; // 所有源都到 cap 了,凑不满也只能这样
+        }
+        // 切片是逐段 ffmpeg 重编码(慢,几十秒~分钟级),逐个源报进度,别让用户对着空白卡很久。
+        tracker.progress(`✂️ 下载完成,开始切片(${srcs.length} 个源 → 目标 ${targetSegs} 段、起点均匀错开不重复)…`);
+        const segs: string[] = [];
+        for (let vi = 0; vi < srcs.length; vi++) {
+          if (signal?.aborted) break;
+          const { v, dur } = srcs[vi];
+          const n = quota[vi];
+          const step = n > 1 ? (dur - segLen) / (n - 1) : 0; // 起点铺满 [0, dur-segLen],n 段互不重叠
+          tracker.progress(`✂️ 切片中:第 ${vi + 1}/${srcs.length} 个源 → 切 ${n} 段(累计 ${segs.length}/${targetSegs} 段)…`);
+          for (let k = 0; k < n; k++) {
+            if (signal?.aborted) break;
+            const ss = Math.max(0, k * step);
+            const out = path.join(assetDir, `seg_${String(si).padStart(3, '0')}.mp4`);
+            const r = await runFfmpeg(
+              ['-y', '-ss', ss.toFixed(2), '-i', v, '-t', String(segLen), '-an',
+                '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', out],
+              { timeoutMs: 120_000 },
+            );
+            if (r.ok && fs.existsSync(out)) { segs.push(out); si++; }
+          }
+        }
+        if (segs.length) poolByTerm.set(term, segs);
+      }
+      if (poolByTerm.size === 0) return null;
+      const allSegs = Array.from(poolByTerm.values()).flat();
+      hotspotImageCount = allSegs.length; // 仅诊断用(后端 hotspot 已改【按条】计费,不再读 imageCount)
+      if (allSegs.length < totalDemand) {
+        tracker.progress(`⚠️ 抖音源有限,仅切出 ${allSegs.length} 段(本条需 ${totalDemand} 段)→ 个别镜可能复用,已尽量多切不同片`);
+      }
+      tracker.progress(`✂️ 抖音素材就绪:${allSegs.length} 片段(按热搜标题搜 · 切片铺镜不重复)`);
+      // 4) assign:每镜先本镜词、不够借全局、used 去重;每条 videoIdx 打乱错开
+      const assign = (videoIdx: number): string[][] => {
+        const used = new Set<string>();
+        const shuffle = videoIdx > 0;
+        const byTerm = new Map<string, string[]>();
+        for (const [k, v] of poolByTerm) byTerm.set(k, shuffle ? shuffled(v) : [...v]);
+        const all = shuffle ? shuffled(allSegs) : [...allSegs];
+        const take = (i: number): string => {
+          for (const term of perSceneTerms[i] || []) {
+            const q = byTerm.get(term);
+            if (q) { const v = q.find((p) => !used.has(p)); if (v) { used.add(v); return v; } }
+          }
+          const any = all.find((p) => !used.has(p));
+          if (any) { used.add(any); return any; }
+          return all[used.size % Math.max(1, all.length)]; // 全用过 → 循环兜底
+        };
+        return sentences.map((_, i) => {
+          const dur = Math.max(1.2, sceneDurations[i]);
+          const want = Math.max(1, Math.min(4, Math.ceil(dur / maxClip)));
+          const clips: string[] = [];
+          for (let k = 0; k < want; k++) clips.push(take(i));
+          return clips;
+        });
+      };
+      return { assign, imageByScene: new Map() };
+    }
+
+    /**
+     * 抖音图文配图池:【只按热搜标题搜】(用户要求,同 buildDouyinPool 不 AI 拆词)→ 搜抖音图文笔记的图 →
+     *   imageBySceneFor 每镜取一图、used 去重。取不到 → null,上层落文字卡。
+     */
+    async function buildDouyinImagePool(): Promise<{ imageBySceneFor: (videoIdx: number) => Map<number, string>; imagePool: string[] } | null> {
+      // 【只按热搜标题搜】(用户要求):同 buildDouyinPool,图文配图也永远只用热搜原标题,不 AI 拆词偏移。
+      const title = (hotspotTopic?.title || '').trim();
+      if (!title) return null;
+      const searchTerms = [title];
+      const perSceneTerms = sentences.map(() => [title]);
+      tracker.progress(`🖼️ 抖音图文取材:只按热搜标题搜「${title}」`);
+      // 每镜一图,一次性多取:【保证 ≥ 分镜数】+ 缓冲,夹 [10,40](原上限 24 太低 → 长稿不够铺会复用)。
+      const wantImgs = Math.max(10, Math.min(40, sentences.length + 6));
+      const poolByTerm = new Map<string, string[]>();
+      for (const term of searchTerms) {
+        if (signal?.aborted) break;
+        let dy: { paths: string[]; titles: string[] };
+        if (douyinPrefetch && douyinPrefetch.mode === 'image') {
+          // 写稿前已经搜过抖音图文了:直接复用(【空也复用】→ 不重复搜、不重复等登录;空则上层落文字卡)。
+          if (douyinPrefetch.paths.length > 0) tracker.progress(`   ♻️ 复用写稿前已下好的 ${douyinPrefetch.paths.length} 张抖音图(不重复下载)`);
+          dy = { paths: douyinPrefetch.paths, titles: douyinPrefetch.titles };
+        } else {
+          dy = await fetchDouyinClips([term], wantImgs, assetDir, (m) => tracker.progress(`   ${m}`), signal, 'image', (input as any).hotspotMaterialAccountId);
+        }
+        if (dy.paths.length) {
+          poolByTerm.set(term, dy.paths);
+          // 下载的图文图留档到输出目录「素材」子目录(assetDir 临时目录结尾会清,不留档就丢了)。
+          try {
+            const matDir = path.join(destDir, '素材');
+            fs.mkdirSync(matDir, { recursive: true });
+            dy.paths.forEach((src, i) => {
+              try { fs.copyFileSync(src, path.join(matDir, `配图${String(i + 1).padStart(2, '0')}_${path.basename(src)}`)); } catch { /* 单个失败忽略 */ }
+            });
+          } catch { /* 留档失败不影响出片 */ }
+        } else tracker.progress(`   ⚠️「${term}」没取到图文图`);
+      }
+      if (poolByTerm.size === 0) return null;
+      const allImgs = Array.from(poolByTerm.values()).flat();
+      hotspotImageCount = allImgs.length; // 计费按图片数(沿用 hotspot 口径)
+      tracker.progress(`🖼️ 抖音图文就绪:${allImgs.length} 图(按热搜标题搜 · 图片缓慢运镜)`);
+      // 每镜一图:先本镜词、不够借全局、used 去重;每条 videoIdx 打乱错开。
+      const imageBySceneFor = (videoIdx: number): Map<number, string> => {
+        const used = new Set<string>();
+        const shuffle = videoIdx > 0;
+        const byTerm = new Map<string, string[]>();
+        for (const [k, v] of poolByTerm) byTerm.set(k, shuffle ? shuffled(v) : [...v]);
+        const all = shuffle ? shuffled(allImgs) : [...allImgs];
+        const m = new Map<number, string>();
+        sentences.forEach((_, i) => {
+          let pick: string | undefined;
+          for (const term of perSceneTerms[i] || []) {
+            const q = byTerm.get(term);
+            if (q) { const v = q.find((p) => !used.has(p)); if (v) { pick = v; break; } }
+          }
+          if (!pick) pick = all.find((p) => !used.has(p));
+          if (!pick) pick = all[i % Math.max(1, all.length)]; // 全用过 → 循环兜底
+          used.add(pick); m.set(i, pick);
+        });
+        return m;
+      };
+      return { imageBySceneFor, imagePool: allImgs };
+    }
+
+    /**
+     * TikTok 视频池(英文/小语种话题,对称抖音 buildDouyinPool):【只按热搜标题搜】→ 搜 TikTok/下无水印
+     *   视频/切片成片段池 → assign 每镜从池里取、used 去重。取不到 → null,上层落 TikTok 图集/文字卡。
+     *   切片/铺镜逻辑与 buildDouyinPool 完全一致(平台无关,只换 fetchTiktokClips + 文案)。
+     */
+    async function buildTiktokPool(): Promise<{ assign: (videoIdx: number) => string[][]; imageByScene: Map<number, string> } | null> {
+      const title = (hotspotTopic?.title || '').trim();
+      if (!title) return null;
+      const searchTerms = [title];
+      const perSceneTerms = sentences.map(() => [title]); // 每镜共用标题词,take 走全局池 + used 去重
+      const segLen = Math.max(2, maxClip);
+      const wantOfScene = (i: number) => Math.max(1, Math.min(4, Math.ceil(Math.max(1.2, sceneDurations[i]) / maxClip)));
+      const totalDemand = sentences.reduce((s, _s, i) => s + wantOfScene(i), 0);
+      const poolTarget = Math.min(80, Math.ceil(totalDemand * 1.3) + 2);
+      const wantClips = Math.max(6, Math.min(20, Math.ceil(poolTarget / 4) + 1));
+      tracker.progress(`🎬 TikTok 取材:只按热搜标题搜「${title}」(本条需 ${totalDemand} 段 → 目标切 ${poolTarget} 段、下 ${wantClips} 个源)`);
+      const poolByTerm = new Map<string, string[]>();
+      let si = 0;
+      for (const term of searchTerms) {
+        if (signal?.aborted) break;
+        let tk: { paths: string[]; titles: string[] };
+        if (tiktokPrefetch && tiktokPrefetch.mode === 'video') {
+          // 写稿前已经搜过 TikTok 视频了:直接复用(【空也复用】→ 不重复搜、不重复等登录;空则上层落文字卡)。
+          if (tiktokPrefetch.paths.length > 0) tracker.progress(`   ♻️ 复用写稿前已下好的 ${tiktokPrefetch.paths.length} 个 TikTok 视频(不重复下载)`);
+          tk = { paths: tiktokPrefetch.paths, titles: tiktokPrefetch.titles };
+        } else {
+          tk = await fetchTiktokClips([term], wantClips, assetDir, (m) => tracker.progress(`   ${m}`), signal, 'video', (input as any).hotspotMaterialAccountId);
+        }
+        if (tk.paths.length === 0) { tracker.progress(`   ⚠️「${term}」没取到视频`); continue; }
+        try {
+          const matDir = path.join(destDir, '素材');
+          fs.mkdirSync(matDir, { recursive: true });
+          tk.paths.forEach((src, i) => {
+            try { fs.copyFileSync(src, path.join(matDir, `素材${String(i + 1).padStart(2, '0')}_${path.basename(src)}`)); } catch { /* 单个失败忽略 */ }
+          });
+        } catch { /* 留档失败不影响出片 */ }
+        const srcs: { v: string; dur: number; cap: number }[] = [];
+        for (const v of tk.paths) {
+          if (signal?.aborted) break;
+          const dur = await probeDuration(v).catch(() => 0);
+          if (dur <= segLen + 0.3) continue;
+          const cap = Math.max(1, Math.floor((dur - segLen) / 0.6) + 1);
+          srcs.push({ v, dur, cap });
+        }
+        if (srcs.length === 0) { tracker.progress(`   ⚠️ 源视频都太短,切不出片`); continue; }
+        const totalCap = srcs.reduce((n, s) => n + s.cap, 0);
+        const targetSegs = Math.min(poolTarget, totalCap);
+        // 第 1 个源最贴近 → 给约 35%,其余 ~65% 在后面的源里平均分(同上,受各源 cap 限制 + 轮转补)。
+        const nSrc = srcs.length;
+        const firstQuota = Math.min(srcs[0].cap, Math.max(1, Math.round(targetSegs * 0.35)));
+        const restTarget = Math.max(0, targetSegs - firstQuota);
+        const restN = nSrc - 1;
+        const restBase = restN > 0 ? Math.floor(restTarget / restN) : 0;
+        const restRem = restN > 0 ? restTarget - restBase * restN : 0;
+        const quota = srcs.map((s, i) => (i === 0)
+          ? Math.min(s.cap, firstQuota)
+          : Math.min(s.cap, restBase + ((i - 1) < restRem ? 1 : 0)));
+        let qsum = quota.reduce((a, b) => a + b, 0);
+        for (let guard = 0; guard < 2000 && qsum < targetSegs; guard++) {
+          let added = false;
+          for (let i = 0; i < nSrc && qsum < targetSegs; i++) if (quota[i] < srcs[i].cap) { quota[i]++; qsum++; added = true; }
+          if (!added) break;
+        }
+        tracker.progress(`✂️ 下载完成,开始切片(${srcs.length} 个源 → 目标 ${targetSegs} 段、起点均匀错开不重复)…`);
+        const segs: string[] = [];
+        for (let vi = 0; vi < srcs.length; vi++) {
+          if (signal?.aborted) break;
+          const { v, dur } = srcs[vi];
+          const n = quota[vi];
+          const step = n > 1 ? (dur - segLen) / (n - 1) : 0;
+          tracker.progress(`✂️ 切片中:第 ${vi + 1}/${srcs.length} 个源 → 切 ${n} 段(累计 ${segs.length}/${targetSegs} 段)…`);
+          for (let k = 0; k < n; k++) {
+            if (signal?.aborted) break;
+            const ss = Math.max(0, k * step);
+            const out = path.join(assetDir, `seg_${String(si).padStart(3, '0')}.mp4`);
+            const r = await runFfmpeg(
+              ['-y', '-ss', ss.toFixed(2), '-i', v, '-t', String(segLen), '-an',
+                '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', out],
+              { timeoutMs: 120_000 },
+            );
+            if (r.ok && fs.existsSync(out)) { segs.push(out); si++; }
+          }
+        }
+        if (segs.length) poolByTerm.set(term, segs);
+      }
+      if (poolByTerm.size === 0) return null;
+      const allSegs = Array.from(poolByTerm.values()).flat();
+      hotspotImageCount = allSegs.length; // 仅诊断用(后端 hotspot 已改【按条】计费)
+      if (allSegs.length < totalDemand) {
+        tracker.progress(`⚠️ TikTok 源有限,仅切出 ${allSegs.length} 段(本条需 ${totalDemand} 段)→ 个别镜可能复用,已尽量多切不同片`);
+      }
+      tracker.progress(`✂️ TikTok 素材就绪:${allSegs.length} 片段(按热搜标题搜 · 切片铺镜不重复)`);
+      const assign = (videoIdx: number): string[][] => {
+        const used = new Set<string>();
+        const shuffle = videoIdx > 0;
+        const byTerm = new Map<string, string[]>();
+        for (const [k, v] of poolByTerm) byTerm.set(k, shuffle ? shuffled(v) : [...v]);
+        const all = shuffle ? shuffled(allSegs) : [...allSegs];
+        const take = (i: number): string => {
+          for (const term of perSceneTerms[i] || []) {
+            const q = byTerm.get(term);
+            if (q) { const v = q.find((p) => !used.has(p)); if (v) { used.add(v); return v; } }
+          }
+          const any = all.find((p) => !used.has(p));
+          if (any) { used.add(any); return any; }
+          return all[used.size % Math.max(1, all.length)];
+        };
+        return sentences.map((_, i) => {
+          const dur = Math.max(1.2, sceneDurations[i]);
+          const want = Math.max(1, Math.min(4, Math.ceil(dur / maxClip)));
+          const clips: string[] = [];
+          for (let k = 0; k < want; k++) clips.push(take(i));
+          return clips;
+        });
+      };
+      return { assign, imageByScene: new Map() };
+    }
+
+    /**
+     * TikTok 图集池(英文/小语种话题,对称抖音 buildDouyinImagePool):【只按热搜标题搜】→ 搜 TikTok 图集帖
+     *   的图 → imageBySceneFor 每镜取一图、used 去重。取不到 → null,上层落文字卡。
+     */
+    async function buildTiktokImagePool(): Promise<{ imageBySceneFor: (videoIdx: number) => Map<number, string>; imagePool: string[] } | null> {
+      const title = (hotspotTopic?.title || '').trim();
+      if (!title) return null;
+      const searchTerms = [title];
+      const perSceneTerms = sentences.map(() => [title]);
+      tracker.progress(`🖼️ TikTok 图集取材:只按热搜标题搜「${title}」`);
+      const wantImgs = Math.max(10, Math.min(40, sentences.length + 6));
+      const poolByTerm = new Map<string, string[]>();
+      for (const term of searchTerms) {
+        if (signal?.aborted) break;
+        let tk: { paths: string[]; titles: string[] };
+        if (tiktokPrefetch && tiktokPrefetch.mode === 'image') {
+          // 写稿前已经搜过 TikTok 图集了:直接复用(【空也复用】→ 不重复搜、不重复等登录;空则上层落文字卡)。
+          if (tiktokPrefetch.paths.length > 0) tracker.progress(`   ♻️ 复用写稿前已下好的 ${tiktokPrefetch.paths.length} 张 TikTok 图(不重复下载)`);
+          tk = { paths: tiktokPrefetch.paths, titles: tiktokPrefetch.titles };
+        } else {
+          tk = await fetchTiktokClips([term], wantImgs, assetDir, (m) => tracker.progress(`   ${m}`), signal, 'image', (input as any).hotspotMaterialAccountId);
+        }
+        if (tk.paths.length) {
+          poolByTerm.set(term, tk.paths);
+          try {
+            const matDir = path.join(destDir, '素材');
+            fs.mkdirSync(matDir, { recursive: true });
+            tk.paths.forEach((src, i) => {
+              try { fs.copyFileSync(src, path.join(matDir, `配图${String(i + 1).padStart(2, '0')}_${path.basename(src)}`)); } catch { /* 单个失败忽略 */ }
+            });
+          } catch { /* 留档失败不影响出片 */ }
+        } else tracker.progress(`   ⚠️「${term}」没取到图集图`);
+      }
+      if (poolByTerm.size === 0) return null;
+      const allImgs = Array.from(poolByTerm.values()).flat();
+      hotspotImageCount = allImgs.length; // 计费按图片数(沿用 hotspot 口径)
+      tracker.progress(`🖼️ TikTok 图集就绪:${allImgs.length} 图(按热搜标题搜 · 图片缓慢运镜)`);
+      const imageBySceneFor = (videoIdx: number): Map<number, string> => {
+        const used = new Set<string>();
+        const shuffle = videoIdx > 0;
+        const byTerm = new Map<string, string[]>();
+        for (const [k, v] of poolByTerm) byTerm.set(k, shuffle ? shuffled(v) : [...v]);
+        const all = shuffle ? shuffled(allImgs) : [...allImgs];
+        const m = new Map<number, string>();
+        sentences.forEach((_, i) => {
+          let pick: string | undefined;
+          for (const term of perSceneTerms[i] || []) {
+            const q = byTerm.get(term);
+            if (q) { const v = q.find((p) => !used.has(p)); if (v) { pick = v; break; } }
+          }
+          if (!pick) pick = all.find((p) => !used.has(p));
+          if (!pick) pick = all[i % Math.max(1, all.length)];
+          used.add(pick); m.set(i, pick);
+        });
+        return m;
+      };
+      return { imageBySceneFor, imagePool: allImgs };
+    }
+
+    /**
+     * 混剪取材:【只按热搜标题】搜视频、下到任务素材目录(最多 5 个,靠切片填满时长),留档一份到
+     * 「素材」子目录(文件名不带平台名)。返回本地路径(空 = 没登录/没源,上层落回图片配图)。
+     */
+    async function collectDouyinClips(): Promise<string[]> {
+      const title = hotspotTopic?.title || '';
+      const keywords = title ? [title] : []; // 永远只按热搜标题查,不额外出关键词(用户要求)
+      const wantClips = Math.max(2, Math.min(5, Math.ceil((input.targetSeconds ?? 60) / 15))); // 最多 5 个,靠切片填时长
+      tracker.progress(`🎬 混剪取材:按标题搜视频(最多 ${wantClips} 个,切片填满时长)…`);
+      const dy = await fetchDouyinClips(keywords, wantClips, assetDir, (m) => tracker.progress(m), signal, 'video', (input as any).hotspotMaterialAccountId);
+      if (dy.paths.length === 0) {
+        tracker.progress(`⚠️ 没取到混剪素材(${dy.diag.reason || '未知'}),退回图片配图`);
+        return [];
+      }
+      try {
+        const matDir = path.join(destDir, '素材');
+        fs.mkdirSync(matDir, { recursive: true });
+        dy.paths.forEach((src, i) => {
+          try { fs.copyFileSync(src, path.join(matDir, `素材${String(i + 1).padStart(2, '0')}_${path.basename(src)}`)); } catch { /* 单个失败忽略 */ }
+        });
+      } catch { /* 留档失败不影响出片 */ }
+
+      // 切【片段池】:每个视频按 maxClip 切成多段 → 后面打乱铺镜。去重关键 —— 否则同一个长视频被多镜
+      //   复用时每次都从开头截,画面反复重复。视频少(≤5)就靠每个多切几段填满时长。
+      tracker.progress('✂️ 切分素材为片段池…');
+      const segLen = Math.max(2, maxClip);
+      // 按【本条总需求片段数】把池子切够 + 冗余,让后面铺镜【绝不重复】(用户要求:素材不反复用,大不了多切)。
+      //   want 口径必须跟 assignVisuals 一致;各视频均摊目标段数,段在视频内【均匀铺】(起点各不同)。
+      const wantOf = (i: number) => Math.max(1, Math.min(4, Math.ceil(Math.max(1.2, sceneDurations[i]) / maxClip)));
+      const totalWant = sentences.reduce((s, _, i) => s + wantOf(i), 0);
+      const perVideoTarget = Math.max(1, Math.ceil((totalWant + 2) / Math.max(1, dy.paths.length))); // 均摊 + 2 冗余
+      const segs: string[] = [];
+      let si = 0;
+      for (const v of dy.paths) {
+        if (signal?.aborted) break;
+        const dur = await probeDuration(v).catch(() => 0);
+        if (dur <= 0) continue;
+        // 物理上限:相邻段起点至少错开 ~1s(再密就是近重复帧,无意义)。在此上限内尽量切够 perVideoTarget。
+        const maxSegs = Math.max(1, Math.floor((dur - segLen) / 1.0) + 1);
+        const n = Math.max(1, Math.min(maxSegs, perVideoTarget));
+        const step = n > 1 ? (dur - segLen) / (n - 1) : 0; // 均匀铺满整段视频,每段起点都不同
+        for (let k = 0; k < n; k++) {
+          const ss = Math.max(0, k * step);
+          const out = path.join(assetDir, `seg_${String(si).padStart(3, '0')}.mp4`);
+          const r = await runFfmpeg(
+            ['-y', '-ss', ss.toFixed(2), '-i', v, '-t', String(segLen), '-an',
+              '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', out],
+            { timeoutMs: 120_000 },
+          );
+          if (r.ok && fs.existsSync(out)) { segs.push(out); si++; }
+        }
+      }
+      if (segs.length > 0) {
+        tracker.progress(`✂️ 切出 ${segs.length} 个片段(打乱铺镜去重)`);
+        return segs;
+      }
+      return dy.paths; // 切失败兜底:用原视频(可能有重复,但有画面)
+    }
+
+    /**
+     * 图文配图(中文话题的「智能配图」走这条):【只按热搜标题】搜图文笔记、下图到任务素材目录
+     * (文件名不带平台名)。返回本地图片路径(空 = 没登录/没图文 → 上层落回 Serper 谷歌图)。
+     */
+    async function collectDouyinImages(): Promise<string[]> {
+      const title = hotspotTopic?.title || '';
+      const keywords = title ? [title] : []; // 永远只按热搜标题查,不额外出关键词(用户要求)
+      const want = Math.max(8, Math.min(40, Math.ceil((input.targetSeconds ?? 60) / 4) + 2));
+      tracker.progress(`🖼️ 图文配图:按标题搜图文笔记、下图(目标 ${want} 张)…`);
+      const dy = await fetchDouyinClips(keywords, want, assetDir, (m) => tracker.progress(m), signal, 'image', (input as any).hotspotMaterialAccountId);
+      if (dy.paths.length === 0) {
+        tracker.progress(`⚠️ 没取到图文配图(${dy.diag.reason || '未知'}),退回联网配图`);
+        return [];
+      }
+      try {
+        const matDir = path.join(destDir, '素材');
+        fs.mkdirSync(matDir, { recursive: true });
+        dy.paths.forEach((src, i) => {
+          try { fs.copyFileSync(src, path.join(matDir, `配图${String(i + 1).padStart(2, '0')}_${path.basename(src)}`)); } catch { /* 单个失败忽略 */ }
+        });
+      } catch { /* 留档失败不影响出片 */ }
+      return dy.paths;
+    }
+
+    // 4. 组装分镜 + 合成。批量出片时并发跑 videoCount 条(封顶 2 条同时跑):同脚本/配音、每条不同画面组合。
+    //    费用(平台费向上限靠拢 + AI 按条数叠加)开跑前【一次性】整笔预扣,全部失败才整笔退回。
+    throwIfAborted(signal);
+    tracker.start('compose');
+
+    const { width, height } = aspectToSize(input.aspect);
+    // 纯画面模式(无旁白)→ 无旁白文本时间轴,强制关字幕。
+    // ⚠️ 电影级(aiNativeAudio)也没有 TTS 时间轴,但它的字幕【不靠】TTS:文本是每镜台词、
+    //    时间是实测片段时长(见下面原生拼接那段)。原来只认 wantNarration,而电影级恒为
+    //    false → 用户在向导里打开的字幕开关永远点不亮,一条都烧不出来。
+    const subtitleEnabled = (wantNarration || aiNativeAudio) && input.subtitleEnabled !== false;
+    const subtitle: SubtitleStyle = {
+      enabled: subtitleEnabled,
+      fontSize: input.subtitleFontSize && input.subtitleFontSize > 0 ? input.subtitleFontSize : 52,
+      position: input.subtitlePosition || (hotspotDouyinMode ? 'lower' : 'bottom'),
+      color: input.subtitleColor,
+      strokeColor: input.subtitleStrokeColor,
+      fontFile: input.subtitleFont,
+    };
+
+    // BGM 解析(全条共用,只解析一次):builtin:<id> → 随包路径;remote:<url> → 按需下载
+    // 并缓存(命中缓存不重下);用户上传的绝对路径原样返回。再统一过 existsSync 兜底
+    // (取不到 = 不加 BGM,不挡出片)。
+    const resolvedBgm = await resolveBgmPath(input.bgmPath, (m) => tracker.progress(m));
+    let bgmPath = resolvedBgm && fs.existsSync(resolvedBgm) ? resolvedBgm : undefined;
+    // 分段配乐(电影级分镜表):相邻同情绪的镜合成一段,每段按情绪从云端曲库挑一首,
+    //   段间交叉淡入淡出拼成一条完整 BGM 轨 —— 叙事推进时音乐跟着变(悬疑开场 → 紧张冲突
+    //   → 轻快反转 → 钢琴收尾),而不是整片循环同一首。
+    //   条件不足(只有一段 / 曲库拉不到 / 切片失败)→ 内部返回 undefined,原样回落单曲。
+    // ⚠️ 必须先有 bgmPath:用户在向导里选了「无背景音乐」时,不能因为分镜表带了情绪
+    //    就擅自给他配上音乐。分段配乐只是把【他选的那一首】换成按情绪走的一条轨。
+    if (bgmPath && aiShots && aiShots.some((s) => (s.bgmMood || '').trim())) {
+      const segs = aiShots.map((s, i) => ({ mood: s.bgmMood || '', seconds: sceneDurations[i] || s.seconds || 0 }));
+      const moodTrack = await buildMoodBgmTrack(
+        segs, assetDir, runFfmpeg, bgmPath, (m) => tracker.progress(m), signal,
+      );
+      if (moodTrack) bgmPath = moodTrack;
+    }
+    if (input.bgmPath && !bgmPath) tracker.progress('⚠️ 背景音乐获取失败，本条将不加 BGM');
+    if (subtitleEnabled) {
+      tracker.progress(subtitleCues.length > 0
+        ? `字幕时间轴就绪(edge-tts 词边界,共 ${subtitleCues.length} 段)`
+        : '字幕按各镜时长估算(未取到词边界时间轴)');
+    }
+
+    // 费用预扣:开跑前【一次性】整笔预扣(在线模式),金额由服务端按 videoCount + aiCostUsd 算
+    // (平台费向上限靠拢 + AI 费按条数叠加)。全部条目都失败时才在 finally 按 chargeId 整笔退回(幂等)。
+    if (isMode1) {
+      // 热搜成片按【实下图片数】计费(云端代下则 ×2,均由服务端算);其它在线模式按条数+AI 费。
+      const charge = input.engine === 'hotspot'
+        ? await chargeHotspotImages(hotspotImageCount, hotspotUsedCloud)
+        : await chargeMode1Video(input.targetSeconds ?? 45, { videoCount, aiCostUsd });
+      if (!charge.ok) {
+        let err: string;
+        if (charge.reason === 'insufficient') err = '余额不足,无法生成(模式一需先预扣平台基础费,请充值后重试)';
+        else if (charge.reason === 'no_auth') err = '未登录 NoobClaw,无法生成';
+        else err = '平台基础费预扣失败,请稍后重试';
+        tracker.fail('compose', err);
+        return { ok: false, error: err };
+      }
+      chargeId = charge.chargeId;
+      refundOnExit = true;
+      tracker.addTokens(charge.chargedTokens || 0, charge.feeUsd || 0);
+      tracker.progress(videoCount > 1
+        ? `💎 已预扣 ${charge.chargedTokens || 0} 积分（≈$${(charge.feeUsd || 0).toFixed(2)}，准备生成 ${videoCount} 条视频），失败将自动退回`
+        : `💎 平台基础费已预扣 ${charge.chargedTokens || 0} 积分（≈$${(charge.feeUsd || 0).toFixed(2)}），失败将自动退回`);
+    }
+
+    // 单条合成:组装本条画面组合(第 0 条原序、之后打乱)→ composeVideo,成功返回成片路径,失败抛错。
+    const composeOne = async (v: number): Promise<string> => {
+      const label = videoCount > 1 ? `第 ${v + 1}/${videoCount} 条` : '';
+      const { sceneClips, imagePool, imageByScene } = assignVisuals(v);
+      let imgCursor = 0;
+      const scenes: SceneSpec[] = sentences.map((sentence, i) => {
+        const clips = sceneClips[i];
+        const hasVideo = clips.length > 0;
+        // D:无视频的镜优先用「按本镜内容搜来的图」(imageByScene);没有再退扁平池轮转。
+        const image = hasVideo ? undefined
+          : (imageByScene?.get(i)
+            ?? (imagePool.length > 0 ? imagePool[imgCursor++ % imagePool.length] : undefined));
+        return {
+          clips: hasVideo ? clips : undefined,
+          imagePath: image,
+          audioPath: wantNarration ? audios[i].audioPath : undefined,
+          durationSec: sceneDurations[i],
+          subtitle: sentence,
+          // 热搜成片:字幕模糊带统一开 —— 视频镜顺带盖原烧死字幕,图片镜纯做字幕底带,
+          //   两种模式观感一致(用户要求统一)。文字卡(无视频无图)走纯色卡,compose 自动不应用。
+          maskBottomBar: input.engine === 'hotspot',
+        };
+      });
+      const outPath = path.join(destDir, outputFileName(v));
+
+      // ── 电影级 · 原生音频:本地只拼接,绝不重编码、绝不丢音轨 ────────────────
+      // Seedance 出的片段自带人声/口型/环境音,音画同源。composeVideo 全程 `-an`,
+      //   走那条就把这些全丢了。所以只要每一镜都真出了视频,就直接 concat。
+      //   有任何一镜没出视频(降级成静帧/图片)→ 老老实实回 composeVideo,
+      //   否则会拼出一条缺镜头的片子。
+      // ⚠️ 只能拼「自己生成的」片段,不能拼借来的:借来的片段带着邻镜的音轨,那句台词会被
+      //    念两遍、本镜那句消失。
+      // ⚠️⚠️ 但「有镜没出片」也【不能】整条退回 composeVideo —— 那条路每一步都是 `-an`
+      //    (见 compose.ts 文件头),会把所有片段的原生音轨丢光,而电影级又没有本地配音,
+      //    结果是交付一条【完全没声音】的片子,而且已出片那几镜的钱照付。以前这里写的
+      //    「画面照出、只是没有原生音」说轻了。
+      //    正确做法:把没出片的镜【从时间轴上去掉】,其余照常原生拼接。台词是跟着片段走的
+      //    (每段的人声就是喂给它的那句),少一镜只是少一句,绝不会串音;片子短一点,
+      //    远好过一条哑片。
+      const ownIdx = scenes.map((_, i) => i).filter((i) => scenes[i].clips && scenes[i].clips!.length > 0 && aiOwnClip[i]);
+      const canNativeJoin = aiNativeAudio && ownIdx.length > 0;
+      if (aiNativeAudio && ownIdx.length < scenes.length && ownIdx.length > 0) {
+        tracker.progress(`⚠️ 有 ${scenes.length - ownIdx.length} 镜没生成出自己的片段,已从成片中跳过(保住其余镜的原生人声,避免台词错位)`);
+      }
+      if (canNativeJoin) {
+        // clipPaths[k] 与 clipShot[k] 严格平行:后者是这一段来自【原分镜的第几镜】,
+        //   字幕取台词/时长全靠它。不用 flatMap 是因为那样一镜多段就会让下标错位。
+        const clipPaths: string[] = [];
+        const clipShot: number[] = [];
+        for (const i of ownIdx) {
+          for (const c of scenes[i].clips as string[]) { clipPaths.push(c); clipShot.push(i); }
+        }
+        tracker.progress(`${label ? label + ' · ' : ''}🎬 拼接 ${clipPaths.length} 个原生片段(保留 Seedance 人声/音效)`);
+
+        // 字幕(可选)。⚠️ Seedance **不生成字幕** —— 它做的是音画同步和口型对齐,
+        //   画面上的文字我们的 prompt 还明确禁掉了(生成模型写中文常缺笔画/串字)。
+        //   所以要字幕只能本地烧。好在内容和时间轴都是现成的:
+        //     内容 = 每镜台词(就是喂给 Seedance 念的那句)
+        //     时间 = 【实测片段时长】,比以前靠 TTS 词边界估算更准 ——
+        //            那时对的是我们自己合成的音频,现在对的是成片里真实播放的那段。
+        //   走向导的「字幕」开关(默认开 —— 用户拍板:配音交给 Seedance,字幕我们本地烧)。
+        let nativeCues: { text: string; start: number; end: number }[] | undefined;
+        if (subtitleEnabled && aiShots) {
+          const cues: { text: string; start: number; end: number }[] = [];
+          let t = 0;
+          for (let k = 0; k < clipPaths.length; k++) {
+            // ⚠️ k 是【成片里的第几段】,i 是【原分镜的第几镜】。跳过没出片的镜之后这两个
+            //    不再相等 —— 直接拿 k 去索引 aiShots 会让字幕整体串行(第 3 段配第 3 镜的
+            //    台词,而第 3 段其实是第 4 镜)。台词/时长一律按 clipShot 映射回原镜。
+            const i = clipShot[k];
+            const real = await probeDuration(clipPaths[k]).catch(() => 0);
+            const d = real > 0 ? real : (sceneDurations[i] || aiShots[i]?.seconds || 5);
+            const line = (aiShots[i]?.narration || '').trim();
+            // 首尾各留 0.1s,别和镜头切换撞在一帧上。
+            if (line && d > 0.4) cues.push({ text: line, start: t + 0.1, end: t + d - 0.1 });
+            t += d;
+          }
+          if (cues.length > 0) nativeCues = cues;
+        }
+
+        // 字幕来源:【稿子优先,转写只做校验和兜底】(2026-08-04 二次调整)。
+        //
+        // 两次真机实测互相矛盾,所以两头都不能赌:
+        //   · 早先一次:Seedance 改词/换语序,拿稿子当字幕「文字和配音完全对不上」→ 那次改成全用转写;
+        //   · 后来一次:它完全照着 narration 念(prompt 里台词是最高优先级、还写了口型严格同步)。
+        // 全用转写的代价很实在:转写会认错同音字,而且切句用的是【翻译搬运】那套参数
+        //   (pauseSec 0.6 / maxCueSec 5,给真人说话调的),合成语音句中的气口会被当成句号,
+        //   一句话被剁成两条字幕 —— 用户看到的「一句话字幕总是只有一半」就是这么来的。
+        // 现在的做法:仍然转写一次,但只拿它跟稿子比对 ——
+        //   一致(说明它老实照念)→ 返回空,让字幕回落到 nativeCues,也就是【稿子原文 + 每镜真实
+        //     时长】:文字完整、没有转写错字、不会被气口切碎;
+        //   差异大(它又改词了)→ 用转写结果,保证字幕和实际人声一致。
+        /** 字符级子序列匹配率:b 的字符能按顺序在 a 里找到多少。同 verifyNarrationFidelity 的口径。 */
+        const textLikeness = (a: string, b: string): number => {
+          const norm = (s: string) => s.replace(/[\s\p{P}\p{S}]/gu, '');
+          const x = norm(a), y = norm(b);
+          if (!y) return 0;
+          let i = 0, hit = 0;
+          for (const ch of y) { const at = x.indexOf(ch, i); if (at >= 0) { hit++; i = at + 1; } }
+          return hit / y.length;
+        };
+        const asrSubtitles = subtitleEnabled ? async (mergedPath: string) => {
+          const wav = path.join(assetDir, `native_asr_${Date.now()}.wav`);
+          const ax = await runFfmpeg(
+            ['-y', '-i', mergedPath, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav],
+            { timeoutMs: 180_000, signal },
+          );
+          if (!ax.ok || !fs.existsSync(wav)) return [];
+          const dur = await probeDuration(wav).catch(() => 0);
+          tracker.progress(`${label ? label + ' · ' : ''}🎧 转写成片人声,生成与配音完全一致的字幕…`);
+          const asr = await transcribeAudio(wav, dur, contentLang || 'zh', signal);
+          try { fs.unlinkSync(wav); } catch { /* ignore */ }
+          if (!asr.ok || asr.noSpeech) return [];
+          // 句级优先(带时间戳,粒度正好是一行字幕);没有就退回粗粒度 segments。
+          const segs = (asr.sentences && asr.sentences.length > 0) ? asr.sentences : (asr.segments || []);
+          const out = segs
+            .filter((s) => s && s.text && s.text.trim() && s.end > s.start)
+            .map((s) => ({ text: s.text.trim(), start: s.start, end: s.end }));
+          // 转写是要花钱的,记进本次成本(与翻译搬运同口径)。
+          if (asr.tokens) tracker.addTokens(asr.tokens, asr.costUsd || 0);
+          if (out.length === 0) return [];
+          // 跟分镜稿比一比。⚠️ 比的方向要对:算【转写内容有多少能在稿子里找到】,
+          //   而不是反过来。两种失败长得完全不一样,只有这个方向能把它们分开:
+          //     · 转写漏字(弱音/语速快,ASR 常漏,用户实测「字幕里总有字没有,配音里有」)
+          //       → 转写是稿子的子集,匹配率仍然高 → 该用【稿子】,它才是完整的那份;
+          //     · Seedance 改词/换语序 → 转写里冒出稿子没有的字,匹配率掉下来 → 该用【转写】。
+          //   反过来算(稿子的字能在转写里找到多少)会把「漏字」也判成低分,正好选错。
+          const script = (nativeCues || []).map((c) => c.text).join('');
+          const asrText = out.map((o) => o.text).join('');
+          if (script) {
+            const like = textLikeness(script, asrText);
+            if (like >= 0.8) {
+              tracker.progress(`${label ? label + ' · ' : ''}✓ 成片人声就是分镜稿的内容(吻合 ${Math.round(like * 100)}%),字幕用稿子原文 —— 转写会漏字,稿子是完整的`);
+              return [];   // 空 = 交给 concatNativeClips 回落到 nativeCues(稿子 + 每镜真实时长)
+            }
+            tracker.progress(`${label ? label + ' · ' : ''}⚠️ 成片人声与稿子只对上 ${Math.round(like * 100)}%(Seedance 改了词),字幕改用转写结果保证与人声一致`);
+          }
+          tracker.progress(`${label ? label + ' · ' : ''}✓ 字幕已按真实人声对齐(${out.length} 句)`);
+          return out;
+        } : undefined;
+
+        await concatNativeClips({
+          clipPaths,
+          outputPath: outPath,
+          bgmPath,
+          bgmVolume: input.bgmVolume !== undefined && input.bgmVolume >= 0 ? input.bgmVolume : undefined,
+          subtitles: nativeCues,
+          subtitlesFromAudio: asrSubtitles,
+          subtitleFontSize: input.subtitleFontSize && input.subtitleFontSize > 0 ? input.subtitleFontSize : undefined,
+          width, height,
+          onProgress: (m) => tracker.progress(`${label ? label + ' · ' : ''}${m}`),
+          signal,
+        });
+        if (videoCount > 1) tracker.progress(`✅ ${label} 合成完成`);
+        return outPath;
+      }
+
+      await composeVideo({
+        scenes,
+        outputPath: outPath,
+        width,
+        height,
+        maxClipSeconds: maxClip,
+        subtitle,
+        narration: wantNarration,
+        bgmPath,
+        bgmVolume: input.bgmVolume !== undefined && input.bgmVolume >= 0 ? input.bgmVolume : undefined,
+        // edge-tts 词边界出的精确 cue;为空时 compose 内部退回按各镜时长估算。
+        cues: subtitleEnabled && subtitleCues.length > 0 ? subtitleCues : undefined,
+        // 花字(电影级分镜表的 on_screen_text):按各镜在总时间轴上的累计起点定位。
+        //   与字幕是两层 —— 花字大字偏上、只在本镜出现;字幕小字贴底、全程滚。
+        //   跟字幕开关无关(用户可能关字幕但仍要关键数字弹出)。
+        keyTexts: aiShots ? (() => {
+          const out: { text: string; start: number; end: number }[] = [];
+          let t = 0;
+          aiShots.forEach((s, i) => {
+            const d = sceneDurations[i] || s.seconds || 0;
+            const txt = (s.onScreenText || '').trim();
+            // 太短的镜不弹花字(闪一下反而干扰);首尾各留 0.15s 让它跟画面切换错开。
+            if (txt && d >= 1.2) out.push({ text: txt, start: t + 0.15, end: t + d - 0.15 });
+            t += d;
+          });
+          return out.length > 0 ? out : undefined;
+        })() : undefined,
+        onScene: (done, total) => tracker.progress(`${label ? label + ' · ' : ''}合成分镜 ${done}/${total}`),
+      });
+      if (videoCount > 1) tracker.progress(`✅ ${label} 合成完成`);
+      return outPath;
+    };
+
+    // 并发出片但【封顶 2 条同时合成】:ffmpeg 是重 CPU/内存活,5 条全开会互相抢资源、
+    // 反而整体更慢甚至 OOM。顺序保留 + allSettled 语义(个别失败不拖累其余):用固定
+    // 2 个 worker 轮流领下一条,结果按下标回填,与原 Promise.allSettled 收集行为一致。
+    const runWithLimit = async <T,>(
+      count: number,
+      limit: number,
+      task: (i: number) => Promise<T>,
+    ): Promise<PromiseSettledResult<T>[]> => {
+      const results = new Array<PromiseSettledResult<T>>(count);
+      let next = 0;
+      const worker = async (): Promise<void> => {
+        while (next < count) {
+          const i = next++;
+          try {
+            results[i] = { status: 'fulfilled', value: await task(i) };
+          } catch (e) {
+            results[i] = { status: 'rejected', reason: e };
+          }
+        }
+      };
+      const n = Math.max(1, Math.min(limit, count));
+      await Promise.all(Array.from({ length: n }, () => worker()));
+      return results;
+    };
+
+    // 跑全部条目(并发封顶 2),收集成功的成片路径。
+    const settled = await runWithLimit(videoCount, 2, (v) => composeOne(v));
+    const outputPaths: string[] = [];
+    let failCount = 0;
+    for (const r of settled) {
+      if (r.status === 'fulfilled') {
+        outputPaths.push(r.value);
+      } else {
+        failCount++;
+        const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        tracker.progress(`⚠️ 有一条合成失败:${msg.slice(0, 160)}`);
+      }
+    }
+
+    if (outputPaths.length === 0) {
+      // 全部失败:保持 refundOnExit=true,finally 整笔退回预扣的费用(平台 + AI 叠加份)。
+      const err = '所有视频合成失败,未生成任何成片';
+      tracker.fail('compose', err);
+      return { ok: false, error: err };
+    }
+
+    // 至少一条成功 → 整笔费用照收(已按 videoCount 预扣),不退回。
+    refundOnExit = false;
+    // 结尾把【本次实际写片的目录】打出来,方便用户直接点过去(destDir = 任务/日期/批次号)。
+    tracker.progress(videoCount > 1 && failCount > 0
+      ? `🎉 已生成 ${outputPaths.length}/${videoCount} 条（${failCount} 条失败,费用已按 ${videoCount} 条预扣） · 📂 输出目录:${destDir}`
+      : `🎉 已生成 ${outputPaths.length} 条 · 📂 输出目录:${destDir}`);
+
+    // 合成步收尾:标 compose=done(否则它一直 running,发布阶段的日志会被渲染端按「第一个 running 步」
+    //   归到合成步里 —— 用户实测发布日志出现在「4.合成视频」就是这个原因)。
+    tracker.done('compose');
+
+    // ── Step 5: 发布到各大平台(用户硬约束:未登录跳过、不杀任务) ─────────────
+    // 本地 mp4 已经在 outputPaths[0],可以放心调 publish step。哪怕全平台都失败,
+    // 用户还有本地文件,任务终态仍是 done(本地任务核心交付物是 mp4)。
+    // videoCount>1 时只取首条发(避免重复发同样内容触发平台限流);后续条用户自己挑发。
+    // ⚠️ 进 publish 前必须查 abort:合成是最长的一步,用户往往就是在合成期间点的停止。
+    //    少了这道检查,abort 会被"合成已完成"吃掉 → 浏览器接着把片子传完并发出去。
+    //    这里【不能 throwIfAborted】:mp4 已落地、平台费也已在上面 refundOnExit=false 收下,
+    //    抛出去会被外层 catch 归成 tracker.fail('compose') → 成片被记成失败、outputPath 丢失
+    //    (用户找不到片子)、compose 误标红、钱还不退。当成「成了,只是没发」才对。
+    if (signal?.aborted) {
+      tracker.progress('⏹ 已停止 · 成片已保存,跳过发布');
+      tracker.finish(outputPaths[0], outputPaths.length, true); // aborted → UI 显示「已停止」
+      return { ok: true, outputPath: outputPaths[0], outputPaths, aborted: true } as VideoCreationResult;
+    }
+    tracker.start('publish');
+    const wantPublish = Array.isArray(input.publishPlatforms) && input.publishPlatforms.length > 0;
+    try {
+      // 平台发布文案:钩人标题 + 引导互动正文 + 话题标签(跟口播稿/视频标题是不同产物)。
+      //   优先级:用户向导填的 > AI 生成的 > 兜底(标题首句 + keywords)。
+      //   只在【确实有平台要发】时才调 AI(省钱);AI 失败自动降级到兜底。
+      const cap = await resolvePublishCaption({
+        wantPublish,
+        // AI 模式 script 是局部 AI 重写稿;严格模式是 input.script。这里用最终的 script
+        //   变量(已是 AI 重写后的),不再用 input.script —— 修「文不对题」的根因。
+        summary: script || input.script || '',
+        // 标题参考也用 AI 重写后的 script 首句(不用 input.script —— 否则 AI 降级时兜底标题又文不对题)。
+        title: script ? script.split(/[。！？\n]/).filter(Boolean)[0]?.slice(0, 40) : undefined,
+        // 有参考文案时不传赛道关键词(否则话题标签/正文跟着美食走、跟 spacex 口播打架);
+        // 发布文案纯按上面 summary(=实际口播内容)生成,跟口播/画面保持一致。
+        keywords: userText ? undefined : input.keywords,
+        track: userText ? undefined : input.track,
+        lang: contentLang,
+        // 热搜成片:发布标题默认用热搜原标题(userTitle 优先、AI 不覆盖);正文/标签仍 AI 生成。
+        //   ⚠️ 但热搜原标题是中文,当创作语言选了外语(「中文热点讲给海外看」出海玩法)时,再用
+        //   中文标题就自相矛盾 → 只有创作语言是中文(zh/zh-TW,含 auto 检测到中文热点)时才用原标题;
+        //   选了外语则不塞 userTitle,让 AI 按目标语言生成钩人标题。用户在向导自填 publishTitle 最优先。
+        userTitle: input.publishTitle
+          || (input.engine === 'hotspot' && (contentLang === 'zh' || contentLang === 'zh-TW')
+            ? hotspotTopic?.title
+            : undefined),
+        userCaption: input.publishCaption,
+        userTags: input.hashtags,
+        onLog: (m: string) => tracker.progress(m),
+        onCost: (tk, usd) => tracker.addTokens(tk, usd),
+      });
+      // 矩阵号 edition:发布走指纹内核 CDP(按平台→选定账号上传),不走扩展;
+      //   非矩阵 / 内核不可用时仍走旧 runPublishStep(扩展)。
+      const { MATRIX_EDITION } = require('../../matrixEdition');
+      let pubResult: { publishedCount: number; skippedCount: number; failedCount: number; details: any[] };
+      if (MATRIX_EDITION && wantPublish) {
+        const { runMatrixPublishStep } = require('./publishers/runMatrixPublish');
+        pubResult = await runMatrixPublishStep({
+          platforms: Array.isArray(input.publishPlatforms) ? input.publishPlatforms : [],
+          accounts: (input as any).publishAccounts || {},
+          videoPath: outputPaths[0],
+          title: cap.title,
+          description: cap.description,
+          tags: cap.tags,
+          onLog: (msg: string) => tracker.progress(msg),
+          signal,
+        });
+      } else {
+        const { runPublishStep } = require('./publishers/runPublish');
+        pubResult = await runPublishStep({
+          platforms: Array.isArray(input.publishPlatforms) ? input.publishPlatforms : [],
+          videoPath: outputPaths[0],
+          title: cap.title,
+          description: cap.description,
+          tags: cap.tags,
+          onLog: (msg: string) => tracker.progress(msg),
+          signal,
+        });
+      }
+      // 热搜成片:把该选题记为【已用】(下次选题排除)——只在【至少一个平台发布成功】、或【仅存本地已出片】
+      //   时才记;发布全失败 → 不记 → 下次还能重试同一热点。(用户要求:有一个平台上传成功才记录。)
+      if (input.engine === 'hotspot' && hotspotTopic?.id) {
+        const published = !wantPublish || ((pubResult && pubResult.publishedCount) || 0) > 0;
+        if (published) {
+          markHotspotUsed(input.taskId || '', hotspotTopic.id);
+          tracker.progress(`🗂️ 已记录该热点为「已用」,下次选题不再重复:「${hotspotTopic.title}」`);
+        } else {
+          tracker.progress('↩️ 本条未发布成功,该热点不记为已用,下次可重试');
+        }
+      }
+    } catch (e) {
+      // runPublishStep 自身就吞所有错,这层 catch 只是兜底(import 失败等极端情况)
+      tracker.progress(`⚠️ 发布步骤异常:${String((e as Error)?.message || e).slice(0, 120)}`);
+    }
+    tracker.finish(outputPaths[0], outputPaths.length);
+    return { ok: true, outputPath: outputPaths[0], outputPaths };
+  } catch (e) {
+    const err = e instanceof Error ? e.message : String(e);
+    // 用户停止:归一成「已停止」+ aborted 标记。否则 UI 上会直接显示内部错误串
+    // 「VIDEO_ABORTED:已停止」(渲染端没有这个前缀的文案映射),而且外层 batch 循环
+    // 靠 r.aborted 判断要不要整批收手 —— 不带这个字段它就永远看不到「这条是被停的」。
+    const aborted = err.startsWith('VIDEO_ABORTED');
+    const msg = aborted ? '已停止' : err.slice(0, 300);
+    tracker.fail(aborted ? null : 'compose', msg);
+    return { ok: false, error: msg, ...(aborted ? { aborted: true } : {}) } as VideoCreationResult;
+  } finally {
+    // 成片失败 → 退回开跑前预扣的平台基础费(幂等,按 chargeId;退不掉只记日志不影响清理)。
+    if (refundOnExit && chargeId) {
+      try {
+        const refunded = await refundMode1Video(chargeId);
+        tracker.progress(refunded
+          ? '↩️ 成片失败，已退回预扣的平台基础费'
+          : '⚠️ 成片失败，平台基础费退回请求未成功（稍后可联系客服核对）');
+      } catch { /* 退款失败仅忽略,不影响清理 */ }
+    }
+    // 清理临时素材(成片已落到 Documents)
+    try { fs.rmSync(assetDir, { recursive: true, force: true }); } catch {}
+  }
+}

@@ -1,0 +1,3157 @@
+/**
+ * 指纹内核连接池 —— 矩阵号的命门基础设施。
+ *
+ * 按 accountId 起多个 fingerprint-chromium 实例(一号一实例:固定指纹种子 +
+ * 持久 user-data-dir + 绑定代理 + 独立 debug-port),各自一条 CDP 连接。
+ * 发布 driver 只认 ctx.cmd(),与浏览器实现解耦 → 把 driver 的浏览器命令路由到
+ * 这里对应 accountId 的 CDP 会话,现有 driver 一行不改即可在指纹内核里跑。
+ *
+ * 与单实例的 cdpBrowser.ts 区别:这里是 Map<accountId, session> 的池,且每个
+ * 会话有【独立的消息 id 空间与 pending 表】,避免多实例间 CDP 响应串话。
+ *
+ * 并发安全(2026-06-20 审计修复):
+ *   · launchKernel / getPage 都用 in-flight Promise 去重,杜绝同 accountId 并发
+ *     双开进程 / 建多条 WS 泄漏(TOCTOU)。
+ *   · WS close/error / 进程 exit → failSession 立即 reject 所有挂起命令,不再干等 30s。
+ *
+ * 内核选型:adryfish/fingerprint-chromium(BSD-3,引擎级指纹)。内核按需从自家
+ * OSS 下载(见 kernelInstaller)。不再回退系统 Chrome:没有指纹内核就不启动
+ * (无指纹隔离的矩阵号没有意义),抛 NO_KERNEL 让 UI 引导用户先下载。
+ * 仍保留显式 kernelPath(手动指定),供调试。
+ */
+
+import { spawn, execFileSync, type ChildProcess } from 'child_process';
+import WebSocket from 'ws';
+import fs from 'fs';
+import path from 'path';
+import { randomUUID } from 'crypto';
+import { coworkLog } from '../coworkLogger';
+import { installedKernelPath, ensureTabGroupExtension } from './kernelInstaller';
+import { ensureProxyBridge, probeProxy } from './proxyBridge';
+import { getAccount, proxyBadgeInfo, getLocalEgressIp, setAccountStatus, sameProxyRoute, normalizeEgressIp, recordAccountEgress, markAccountRecovery, markAccountCooldown } from './accountManager';
+import * as accountAuthority from './accountManager';
+import { identifyProfile } from './profileIdentity';
+import { acquireSystemKeepAwake, releaseSystemKeepAwake } from './powerKeepAwake';
+import type { Fingerprint, Proxy } from './types';
+import { AsyncLocalStorage } from 'async_hooks';
+import { automationSafety, AutomationSafetyError, AUTOMATION_RESTRICTION_EXPR, operationForCommand, operationForScript, restrictedResponse, type Operation, type SafetyReason } from './automationSafety';
+import { diagnosticAccountAlias, KernelNavigationError, NavigationTrace, navigationPage, type NavigationFailure } from './kernelNavigation';
+
+let automationLogSink: ((accountId: string, msg: string) => void) | undefined;
+export function setAutomationLogSink(sink: (accountId: string, msg: string) => void): void { automationLogSink = sink; }
+export function isAutomationPaused(accountId: string): boolean { return !!automationSafety.blocked(accountId); }
+export async function runAutomationScript(accountId: string, fn: (ctx: any) => Promise<any>, ctx: any, receipt?: KernelLeaseReceipt): Promise<any> {
+  if (receipt) return withKernelLease(receipt, () => runAutomationScript(accountId, fn, ctx));
+  automationSafety.assertAllowed(accountId);
+  const aborted = typeof ctx.aborted === 'function' ? ctx.aborted.bind(ctx) : () => false;
+  const originalAborted = ctx.aborted;
+  const progress = new Map<string, (...args: any[]) => any>();
+  // Remote scripts may catch browser errors and execute their normal completion
+  // path. Keep state/report writes available, but suppress misleading progress.
+  for (const key of ['report', 'log', 'stepStart', 'stepLog', 'stepDone', 'setActionTargets', 'finish']) {
+    if (typeof ctx[key] !== 'function') continue;
+    const original = ctx[key];
+    progress.set(key, original);
+    ctx[key] = (...args: any[]) => { if (!aborted() && !isAutomationPaused(accountId)) return original.apply(ctx, args); };
+  }
+  ctx.aborted = () => aborted() || isAutomationPaused(accountId);
+  try {
+    const result = await fn(ctx);
+    // A restriction or failed page can appear after the last click; verify remote "done".
+    if (!aborted() && ctx.platform === 'tiktok') {
+      const reason = await kernelEval(accountId, AUTOMATION_RESTRICTION_EXPR).catch(() => {
+        throw new Error('任务收尾页面检测失败，请检查浏览器或网络后重试');
+      });
+      if (typeof reason !== 'string') throw new Error('任务收尾页面检测未返回有效结果，请检查浏览器或网络后重试');
+      if (['captcha', 'rate_limited', 'forbidden', 'account_flag', 'login_wall'].includes(reason)) {
+        automationSafety.halt(accountId, reason as SafetyReason, 0, `任务收尾页面检测=${reason}`);
+      }
+      if (typeof reason === 'string' && reason.startsWith('page_error:')) {
+        automationSafety.pageFailed(accountId, reason.slice('page_error:'.length));
+        throw new Error('任务收尾页面加载失败，请检查网络或平台提示');
+      }
+    }
+    // A remote script may catch a browser error and return "done".
+    automationSafety.assertAllowed(accountId);
+    return result;
+  } catch (error) {
+    automationSafety.assertAllowed(accountId);
+    throw error;
+  } finally {
+    ctx.aborted = originalAborted;
+    for (const [key, original] of progress) ctx[key] = original;
+  }
+}
+
+const observedRootWrites = new Set<string>();
+
+function safetyLog(accountId: string, msg: string): void {
+  const alias = diagnosticAccountAlias(accountId);
+  coworkLog('INFO', 'automationSafety', `[${alias}] ${msg}`);
+  if (msg.startsWith('🛑')) {
+    try {
+      const ownPause = automationSafety.accountPause(accountId);
+      const blocked = ownPause || automationSafety.blocked(accountId);
+      const account = getAccount(accountId);
+      const recovery = account?.recovery;
+      const alreadySaved = account?.authority && observedRootWrites.has(accountId);
+      if (!alreadySaved && blocked?.code === 'rate_limited') markAccountCooldown(accountId, blocked.until);
+      else if (!alreadySaved && blocked && (!account?.authority || !!ownPause) &&
+          (ownPause || recovery?.reason !== 'rate_limited' || recovery.nextCheckAt <= Date.now())) {
+        setAccountStatus(accountId, 'limited', blocked.reason);
+      }
+    }
+    catch { coworkLog('WARN', 'automationSafety', `[${alias}] failed to persist paused account status`); }
+  }
+  try { automationLogSink?.(accountId, msg); } catch { /* Logging must not change an operation. */ }
+}
+
+async function paceOperation(s: KernelSession, kind: Operation): Promise<(succeeded?: boolean) => void> {
+  if (!s.automation) return () => {};
+  const completed = await automationSafety.before(s.accountId, kind);
+  const result = await send(s, 'Runtime.evaluate', { expression: AUTOMATION_RESTRICTION_EXPR, returnByValue: true });
+  const reason = result?.result?.value;
+  if (typeof reason !== 'string') throw new Error('network_error:页面检测失败');
+  if (['captcha', 'rate_limited', 'forbidden', 'account_flag', 'login_wall'].includes(reason)) {
+    automationSafety.halt(s.accountId, reason as SafetyReason, 0, `页面检测=${reason}；操作=${kind}；页面=${navigationPage(s.navigation?.url)}`);
+  }
+  if (typeof reason === 'string' && reason.startsWith('page_error:')) {
+    automationSafety.pageFailed(s.accountId, reason.slice('page_error:'.length));
+    automationSafety.assertAllowed(s.accountId);
+    if (kind !== 'navigate') throw new AutomationSafetyError('页面加载失败，取消本次操作');
+  }
+  automationSafety.assertAllowed(s.accountId);
+  return completed;
+}
+
+const automationOperationContext = new AsyncLocalStorage<{
+  session: KernelSession; generation?: number; connection?: string;
+}>();
+// ponytail: one global operation queue; split by platform only if measured throughput requires it.
+let automationOperationTail: Promise<void> = Promise.resolve();
+async function withAutomationOperation<T>(s: KernelSession, kind: Operation, action: () => Promise<T>): Promise<T> {
+  if (!s.automation || automationOperationContext.getStore()) return action();
+  const previous = automationOperationTail;
+  let release!: () => void;
+  automationOperationTail = new Promise<void>((resolve) => { release = resolve; });
+  const signal = kernelSignal(s);
+  let onAbort!: () => void;
+  try {
+    await Promise.race([previous, new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal?.reason instanceof AutomationSafetyError ? signal.reason : new AutomationSafetyError('任务已结束'));
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener('abort', onAbort, { once: true });
+    })]);
+  } catch (e) {
+    // Cancelled callers leave the queue chain intact for other accounts.
+    void previous.then(release, release);
+    throw e;
+  } finally { signal?.removeEventListener('abort', onAbort); }
+  try {
+    if (!s.automation || !automationSafety.isActive(s.accountId)) throw new AutomationSafetyError('任务已结束');
+    automationSafety.assertAllowed(s.accountId);
+    await verifyKernelEgress(s);
+    const completed = await paceOperation(s, kind);
+    let succeeded = false;
+    try {
+      const document = s.navigation?.snapshot();
+      const result = await automationOperationContext.run({
+        session: s, generation: document?.generation, connection: document?.connectionEpoch,
+      }, action);
+      succeeded = true;
+      return result;
+    }
+    finally { completed(succeeded); }
+  } finally { release(); }
+}
+
+export interface KernelSession {
+  accountId: string;
+  automation?: boolean;
+  diagnosticsId: string;
+  navigation?: NavigationTrace;
+  navigating?: boolean;
+  startPagePending?: boolean;
+  manualWindowError?: string;
+  loginScanReady?: boolean;
+  loginScanAttempt?: object;
+  identityRevision?: object;
+  lastLoginProbe?: { platform: string; result: boolean | null; reason: LoginCheckReason; at: number };
+  loginChecks?: Set<AbortController>;
+  loginRestriction?: string;
+  /** 用户自己点「打开窗口」开的(手动浏览用):不做防最小化复原。 */
+  userOwned?: boolean;
+  windowLease?: KernelLeaseReceipt;
+  profileReservation?: string;
+  profileIdentityKey?: string;
+  cleanupMode?: boolean;
+  cleanupOwner?: object;
+  authoritativeAccount?: boolean;
+  process: ChildProcess | null;
+  debugPort: number;
+  userDataDir: string;
+  pageWs: WebSocket | null;       // 当前操作的 page 连接
+  pageTargetId: string | null;
+  pageInit: Promise<KernelSession> | null; // getPage 去重(并发共享同一次初始化)
+  pageAbort?: AbortController;
+  connectingWs?: WebSocket;
+  operationSignal?: AbortSignal;
+  detachOperationSignal?: () => void;
+  boundProxy?: Proxy;
+  egressCheckedAt?: number;
+  observedEgressIp?: string; // Actual observation from this kernel, not a proxy endpoint.
+  egressProbe?: Promise<string>;
+  egressAbort?: AbortController;
+  targetCleanupPending?: boolean;
+  msgId: number;                  // 本会话独立 id 空间
+  pending: Map<number, { resolve: (d: any) => void; reject: (e: Error) => void }>;
+  proxyAuth?: { username: string; password: string; origin: string }; // 凭据仅用于配置的代理认证
+  proxyChallenge?: ProxyChallenges;
+  fileChooserWaiter?: ((params: any) => void) | null; // 等 Page.fileChooserOpened(真实文件选择器拦截上传)
+  label?: string;                 // 账号标签(窗口左上角常驻角标,多窗区分用)
+  slot: number;                   // 第几个窗口(用于错开层叠位置)
+  background?: boolean;           // 静默后台窗(保活/复验):起来即最小化、防最小化守卫跳过、不打扰用户
+}
+
+type ProxyChallenges = { attempts: Set<string>; networkIds: Map<string, string>; repeated: boolean };
+
+export interface LaunchKernelOptions {
+  accountId: string;
+  cleanupOwner?: object;
+  signal?: AbortSignal;
+  kernelPath?: string;            // 显式内核路径(手动覆盖);优先级最高
+  kernelVersion?: string;         // 该号绑定的内核版本(从已下载版本里取)
+  userDataDir: string;            // 持久 profile 目录
+  fingerprint: Fingerprint;
+  proxy?: Proxy;
+  headless?: boolean;
+  label?: string;                 // 窗口左上角常驻角标文案(一般是账号备注名 + 分组);设了才往页面注入绿色角标
+  groupTitle?: string;            // 标签分组(蓝色 pill)标题。属浏览器 chrome、不进页面 → 跑任务也该给友好名,
+                                  //   跟 label(页面角标/足迹)解耦:不传 label 不注入页面角标,但 groupTitle 仍可友好。
+  startUrl?: string;              // 首次 URL 由 kernelEnsureUrl 在新标签页、CDP 就绪后打开。
+  skipLease?: boolean;            // 不占「按账号使用互斥锁」(openLogin:用户交互、只读 cookie 轮询,不驱动页面)
+  manual?: boolean;               // 人工刷新/断开仍占使用锁,但允许检查并解除重复身份冲突。
+  background?: boolean;           // 静默后台窗:headless 回退可见窗时不弹到用户脸上(起来即最小化 + 不被防最小化守卫复原)。
+                                  //   保活/复验专用;kernelBringToFront 会解除此标记并复原窗口。
+}
+
+const sessions = new Map<string, KernelSession>();
+const launching = new Map<string, Promise<KernelSession>>(); // 启动去重
+// 按 accountId 的【引用计数】:每次 launchKernel +1、closeKernel -1;>0 说明还有别的流程在用
+// 这个号 → closeKernel 不真关(防「A 任务用着、B 流程把窗关了」误关 + 防并发撞同一 profile 损坏)。
+const refCount = new Map<string, number>();
+// 正在【优雅关闭】中的子进程:closeKernel 已把 session 从表里删了,但进程还会再活最多 4s(等 Browser.close
+// 干净退出)才被强杀,这期间它【仍占着 profile 锁】。若此时同号被重开,doLaunch 见 sessions 里没有 → 误清锁 +
+// 又开一个新进程 → 两进程抢同一 user-data-dir → 弹「打开个人资料出了点问题」+ 开出两个窗。记下这些将死进程,
+// doLaunch 重开前先把它彻底收走(kill + 等退出)再清锁,保证【串行】不并发抢锁。
+const closingProcs = new Map<string, ChildProcess>();
+const profileCleanupOwners = new Map<string, object>();
+const profileReservations = new Map<string, string>();
+const profileKey = (directory: string) => {
+  const resolved = identifyProfile(directory);
+  if (!resolved) throw new KernelNavigationError('ownership_unconfirmed');
+  return process.platform === 'win32' ? resolved.directory.toLowerCase() : resolved.directory;
+};
+
+// 按 accountId 的【使用互斥锁(异步队列)】:同一账号同一时刻只允许一个流程操作,其他【排队等】。
+// 防「涨粉任务和视频任务同时驱动同一个号的页面 → 命令打架/串台」。launchKernel 时占锁、
+// closeKernel 时释放。openLogin(用户交互、只读 cookie 轮询)用 skipLease 不占锁,不阻塞任务。
+const leaseTail = new Map<string, Promise<void>>();   // 每号一条队尾 promise
+const leaseHeld = new Map<string, () => void>();       // 当前持有者的释放函数
+async function acquireLease(accountId: string, signal?: AbortSignal): Promise<() => void> {
+  signal?.throwIfAborted();
+  let release!: () => void;
+  const mine = new Promise<void>((res) => { release = res; });
+  const prev = leaseTail.get(accountId) || Promise.resolve();
+  const tail = prev.then(() => mine);
+  leaseTail.set(accountId, tail);
+  void tail.then(() => { if (leaseTail.get(accountId) === tail) leaseTail.delete(accountId); });
+  try { await waitForKernel(prev, signal); signal?.throwIfAborted(); }
+  catch (error) { release(); throw error; } // Preserve predecessor ordering without taking its lease.
+  leaseHeld.set(accountId, release);
+  return release;
+}
+function releaseLease(accountId: string, owner?: () => void): void {
+  const r = leaseHeld.get(accountId);
+  if (r && (!owner || r === owner)) { leaseHeld.delete(accountId); r(); }
+}
+let nextSlot = 0;                // 第几个窗口(错开层叠位置用)
+
+// ── 防最小化 + 防系统休眠(对齐旧客户端 chrome-extension 的 unminimizeManagedWindows + chrome.power)──
+// 矩阵内核是独立 fingerprint-chromium、纯 CDP 控,用不到扩展的 chrome.windows/chrome.power → 照搬【行为】换实现:
+//   · 防最小化:周期轮询每个内核窗口,windowState==='minimized' → setWindowBounds normal(不抢焦点,对齐扩展 drawAttention:false)。
+//   · 防休眠:有内核存活就 OS 级保活(见 powerKeepAwake),全部关闭后释放。
+// 单一所有者 = windowGuardTimer:launch 时 ensureWindowGuards 起;tick 见 sessions 空则自停 + 释放保活(免在每个
+//   sessions.delete 点挂钩)。扩展用 onFocusChanged 毫秒级 + 30s alarm 兜底;CDP 无廉价焦点事件,2.5s 轮询足够快
+//   (扩展注释:最小化节流要几分钟才坏)。
+const WINDOW_GUARD_INTERVAL_MS = 2500;
+/** 正在按「用户关窗 = 退出」收尾的内核进程(按进程记,进程退出即自然失效;防重复发退出)。 */
+const quittingProcs = new WeakSet<ChildProcess>();
+/** 连续几拍看到「一个页面都没有」(要连续 2 拍 ≈5s 才判定用户关窗,防页面瞬时为空 / window.close 误杀)。 */
+const emptyTicks = new Map<string, number>();
+let guardTicking = false;
+/** 带超时的本地 DevTools HTTP 请求(内核 HTTP 卡死时不让轮询无限挂起)。 */
+function kernelSignal(s: KernelSession): AbortSignal | undefined {
+  const signals = [s.operationSignal, s.automation ? automationSafety.signal(s.accountId) : undefined].filter((v): v is AbortSignal => !!v);
+  return signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+}
+
+function waitForKernel<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => { cleanup(); reject(signal.reason || new Error('内核操作已取消')); };
+    const cleanup = () => signal.removeEventListener('abort', abort);
+    work.then((value) => { cleanup(); resolve(value); }, (error) => { cleanup(); reject(error); });
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+function bindKernelSignal(s: KernelSession, signal?: AbortSignal): void {
+  s.detachOperationSignal?.();
+  s.operationSignal = signal;
+  const abort = () => failSession(s, 'kernel operation cancelled');
+  s.detachOperationSignal = () => signal?.removeEventListener('abort', abort);
+  if (signal?.aborted) abort();
+  else signal?.addEventListener('abort', abort, { once: true });
+}
+
+async function devFetchJson(url: string, ms = 1500, signal?: AbortSignal, method = 'GET'): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('DevTools HTTP timeout')), ms);
+  const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  try {
+    return await waitForKernel((async () => {
+      combined.throwIfAborted();
+      const r = await fetch(url, { signal: combined, method });
+      if (!r.ok) throw new Error(`DevTools HTTP ${r.status}`);
+      return r.json();
+    })(), combined);
+  } finally { clearTimeout(timer); }
+}
+/** 该号内核是否正在按「用户关窗」退出中(openWindow 等用来判断要不要等它退完再重开)。 */
+export function isKernelQuitting(accountId: string): boolean {
+  const p = sessions.get(accountId)?.process;
+  return !!p && p.exitCode === null && quittingProcs.has(p);
+}
+let windowGuardTimer: ReturnType<typeof setInterval> | null = null;
+
+function ensureWindowGuards(): void {
+  if (windowGuardTimer) return;
+  acquireSystemKeepAwake();
+  windowGuardTimer = setInterval(() => { void windowGuardTick(); }, WINDOW_GUARD_INTERVAL_MS);
+}
+
+function stopWindowGuards(): void {
+  if (windowGuardTimer) { clearInterval(windowGuardTimer); windowGuardTimer = null; }
+  releaseSystemKeepAwake();
+}
+
+/**
+ * 用户把窗口关光了 → 像「右键退出」一样退出内核:先走浏览器级 CDP 的 Browser.close(正常退出,cookie / 会话落盘,
+ * 下次不弹「未正确关闭」),4s 还没退再强杀兜底。页面级连接此时已断,所以连 /json/version 给的浏览器端点。
+ */
+async function quitKernelGracefully(s: KernelSession): Promise<void> {
+  const proc = s.process;
+  if (!proc || proc.exitCode !== null || quittingProcs.has(proc)) return;   // 已在退出中 → 不重复发
+  quittingProcs.add(proc);
+  emptyTicks.delete(s.accountId);
+  try {
+    const v: any = await devFetchJson(`http://127.0.0.1:${s.debugPort}/json/version`);
+    if (v?.webSocketDebuggerUrl) {
+      await new Promise<void>((resolve) => {
+        const ws = new WebSocket(v.webSocketDebuggerUrl);
+        let finished = false;
+        let t: ReturnType<typeof setTimeout> | null = null;
+        const done = () => { if (finished) return; finished = true; if (t) clearTimeout(t); try { ws.close(); } catch { /* ignore */ } resolve(); };
+        ws.on('open', () => { try { ws.send(JSON.stringify({ id: 1, method: 'Browser.close' })); } catch { /* ignore */ } setTimeout(done, 300); });
+        ws.on('error', done);
+        t = setTimeout(done, 2000);
+      });
+    }
+  } catch { /* 端点不通:下面强杀兜底 */ }
+  setTimeout(() => { try { if (proc.exitCode === null) proc.kill(); } catch { /* ignore */ } }, 4000);
+}
+
+async function windowGuardTick(): Promise<void> {
+  // 没有内核了 → 自停轮询 + 释放保活。
+  if (sessions.size === 0) { stopWindowGuards(); return; }
+  if (guardTicking) return;   // 上一拍还没跑完(某个内核 HTTP 慢)→ 跳过本拍,不堆积
+  guardTicking = true;
+  try { await windowGuardTickInner(); } finally { guardTicking = false; }
+}
+
+async function windowGuardTickInner(): Promise<void> {
+  for (const s of Array.from(sessions.values())) {
+    // 窗口被用户关光了(macOS 点左上角关闭只关窗口,Chromium 进程还留在程序坞,要右键「退出」才真退)→
+    //   当作关掉浏览器:结束进程,与 Windows 关掉最后一个窗口即退出一致(2026-11-01)。
+    //   只对连上过页面的会话判断(pageTargetId 有值),启动中的不算;exit 回调会清会话/计数,各流程随之收尾。
+    if (s.pageTargetId && s.process && s.process.exitCode === null && !quittingProcs.has(s.process)) {
+      try {
+        const list: any[] = await devFetchJson(`http://127.0.0.1:${s.debugPort}/json/list`);
+        if (Array.isArray(list) && !list.some((t) => t.type === 'page')) {
+          const n = (emptyTicks.get(s.accountId) || 0) + 1;
+          emptyTicks.set(s.accountId, n);
+          if (n >= 2 && s.process.exitCode === null) {   // 连续 2 拍(≈5s)都空 才算用户关了窗
+            coworkLog('INFO', 'kernelPool', `kernel ${diagnosticAccountAlias(s.accountId)}: 窗口已全部关闭,按「退出浏览器」处理`);
+            void quitKernelGracefully(s);
+          }
+          continue;
+        }
+        emptyTicks.delete(s.accountId);
+      } catch { /* 调试端口瞬时不通:下一拍再查 */ }
+    }
+    // 只在有活页面连接时被动检查(最小化不会断 CDP);headless 保活窗无窗口,getWindowForTarget 报错即跳过。
+    if (s.background) continue; // 静默后台窗(保活/复验)本来就该待在最小化,别复原
+    if (s.userOwned) continue;  // 用户自己「打开窗口」手动用的:让用户自由最小化
+    if (!s.pageWs || s.pageWs.readyState !== WebSocket.OPEN || !s.pageTargetId) continue;
+    try {
+      const win = await send(s, 'Browser.getWindowForTarget', { targetId: s.pageTargetId });
+      if (win?.windowId == null || win?.bounds?.windowState !== 'minimized') continue;
+      // CDP 版 unminimize:set normal(不带 left/top → 不挪位、不抢焦点);二次确认兜底(部分平台 ack 但没动作,对齐扩展双 update)。
+      await send(s, 'Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal' } });
+      const after = await send(s, 'Browser.getWindowForTarget', { targetId: s.pageTargetId });
+      if (after?.bounds?.windowState === 'minimized') {
+        await send(s, 'Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal' } });
+      }
+      coworkLog('INFO', 'kernelPool', `防最小化:已复原内核窗口 ${diagnosticAccountAlias(s.accountId)}`);
+    } catch { /* 非关键:窗口/连接瞬态,下一拍再来 */ }
+  }
+}
+
+/**
+ * 注入「账号角标」脚本:窗口左上角常驻绿色标签显示账号名,多窗叠在一起也能分清。
+ * 防风控:① 账号名文字放进 closed shadowRoot —— 页面 JS 读不到内容;② 宿主元素不带
+ * id/class、状态只存闭包(不挂 window)—— 抖音侧基本无法枚举/识别这个角标。
+ */
+// 绿色身份角标 + 第二行【代理IP】角标。proxyMode:'ok'=能通/本机(绿)、'down'=代理不通(黄)、'dup'=撞IP(红+风控提示)。
+function badgeScript(label: string, proxyText: string, proxyMode: 'ok' | 'down' | 'dup'): string {
+  const L = JSON.stringify(label);
+  let line2 = '代理IP: ' + proxyText;
+  if (proxyMode === 'dup') line2 += '  ⚠️ 多个账号都在用该IP,存在风控风险,请尽早更换代理IP';
+  else if (proxyMode === 'down') line2 += '  ⚠️ 代理不通,请检查';
+  const P = JSON.stringify(line2);
+  const bg2 = proxyMode === 'dup' ? '#dc2626' : proxyMode === 'down' ? '#d97706' : '#16a34a';
+  // 只在【顶层文档】渲染:addScriptToEvaluateOnNewDocument 会对所有 frame(含 iframe)生效,
+  //   视频号登录二维码等页面把内容放在 iframe 里,不守卫会在 iframe 内再渲染一个 position:fixed 角标盖住二维码。
+  //   cross-origin iframe 访问 window.top 可能抛,catch 即判定为子 frame → 不渲染。
+  return `(function(){try{if(window.top!==window.self)return;}catch(e){return;}var node=null;function m(){try{var root=document.body||document.documentElement;if(!root)return;if(node&&node.isConnected)return;`
+    + `var host=document.createElement('div');host.style.cssText='position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483647;pointer-events:none;display:flex;flex-direction:column;align-items:center';`
+    + `var sr=host.attachShadow?host.attachShadow({mode:'closed'}):null;var box=sr||host;`
+    + `var b=document.createElement('div');b.textContent=${L};b.style.cssText='background:#16a34a;color:#fff;font:bold 13px/1.5 system-ui,sans-serif;padding:3px 12px;border-radius:0 0 8px 8px';box.appendChild(b);`
+    + `var p=document.createElement('div');p.textContent=${P};p.style.cssText='background:${bg2};color:#fff;font:bold 12px/1.4 system-ui,sans-serif;padding:3px 12px;border-radius:0 0 8px 8px;margin-top:1px';box.appendChild(p);`
+    + `root.appendChild(host);node=host;}catch(e){}}m();setInterval(m,2000);})();`;
+}
+
+// 黄色「登录已过期」角标(左上角,closed shadow,自愈)—— 跟 badgeScript 同款隐身,黄底 + 过期文案。
+// 用户要求「角标不横幅」:左上角小标,占绿色身份角标那个位(top:0);出现时把绿色身份角标隐藏(按样式特征找到它
+// 设 display:none —— 不改 badgeScript 本身)。登录成功跳页后本页 document 销毁、绿标在新页正常恢复。
+function expiredBadgeScript(text: string): string {
+  const T = JSON.stringify(text);
+  return `(function(){try{if(window.top!==window.self)return;}catch(e){return;}var node=null;`
+    // 隐藏绿色身份角标:它是 body 直接子节点、position:fixed、top/left:0、z-index 拉满的 div(badgeScript 的签名);排除自己(node)。
+    + `function hideGreen(root){try{var ch=root.children;for(var i=0;i<ch.length;i++){var el=ch[i];if(el!==node&&el.tagName==='DIV'&&el.style&&el.style.position==='fixed'&&el.style.top==='0px'&&el.style.zIndex==='2147483647'){el.style.display='none';}}}catch(e){}}`
+    + `function m(){try{var root=document.body||document.documentElement;if(!root)return;hideGreen(root);if(node&&node.isConnected)return;var host=document.createElement('div');host.style.cssText='position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483647;pointer-events:none';var sr=host.attachShadow?host.attachShadow({mode:'closed'}):null;var b=document.createElement('div');b.textContent=${T};b.style.cssText='background:#facc15;color:#1f2937;font:bold 13px/1.5 system-ui,sans-serif;padding:4px 14px;border-radius:0 0 8px 8px;box-shadow:0 1px 6px rgba(0,0,0,.3)';(sr||host).appendChild(b);root.appendChild(host);node=host;}catch(e){}}m();setInterval(m,2000);})();`;
+}
+
+// 内核缺失的统一错误标记:UI 据此弹「去下载内核」引导,不再回退系统 Chrome。
+export const NO_KERNEL_ERROR = 'NO_KERNEL';
+
+/**
+ * 清理上次实例残留的单例锁。
+ * 同一 user-data-dir 第二次启动时,Chromium 见到陈旧的 SingletonLock/lockfile 会把命令
+ * 转交「上一个实例」后【自身立即退出】→ 调试端口永不打开 → 上层表现为「浏览器意外退出 /
+ * read ECONNRESET」。只在【没有存活 session】时清(有存活 session 走复用,绝不清)。
+ */
+function clearSingletonLocks(dir: string): void {
+  for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket', 'lockfile']) {
+    try { fs.rmSync(path.join(dir, name), { force: true }); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * 收走仍占着该 profile 的【活孤儿】内核(本 sidecar 没有句柄的残留:上次 app 崩溃 / 被 SIGKILL
+ * 强杀后,mac 上内核子进程不随父进程死而成的孤儿)。mac/Linux 的 SingletonLock 是软链,target
+ * 形如 `<hostname>-<pid>`:读出 pid,确认它还活着且确是 chromium,就 SIGKILL 并等它退出。
+ *
+ * 为什么必须杀进程而不能只删锁:删锁文件不会让活着的孤儿松手,反而让新内核与孤儿【抢同一
+ * user-data-dir】→ 弹「打开您的个人资料时出了点问题」+ 开出双窗。Windows 走 Job Object 级联杀
+ * (sidecar 一死内核也死),无此孤儿,直接跳过。
+ */
+async function reapProfileHolder(userDataDir: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  let target = '';
+  try { target = fs.readlinkSync(path.join(userDataDir, 'SingletonLock')); } catch { return; }
+  const m = /-(\d+)$/.exec(target);
+  if (!m) return;
+  const pid = parseInt(m[1], 10);
+  if (!Number.isFinite(pid) || pid <= 1 || pid === process.pid) return;
+  try { process.kill(pid, 0); } catch { return; } // 进程已不在 → 陈旧锁,交给 clearSingletonLocks 清
+  // pid 复用防误杀:确认它确实是浏览器进程(best-effort)。ps 明确说「不是浏览器」才放过;
+  // ps 不可用(cmd 为空)时该 SingletonLock 只出现在我们私有 profile 目录,极大概率是我们内核 → 仍杀。
+  let cmd = '';
+  try { cmd = execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8', timeout: 3000 }).toString(); } catch { /* ps 不可用 */ }
+  if (cmd && !/chromium|chrome|--user-data-dir/i.test(cmd)) return;
+  try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ }
+  for (let i = 0; i < 20 && pid; i++) { try { process.kill(pid, 0); } catch { break; } await sleep(100); } // 等它真退出(锁释放)最多 ~2s
+  coworkLog('INFO', 'kernelPool', `reaped orphan kernel`);
+}
+
+/**
+ * sidecar 启动时清扫上次 app 残留的孤儿指纹内核(被强杀/崩溃后仍占着 profile 锁的僵尸窗):
+ * 逐个账号 profile 目录收孤儿 + 清陈旧锁。best-effort,失败不影响启动。Windows 无孤儿(reapProfileHolder 直接跳过)。
+ */
+export async function reapOrphanKernels(userDataDirs: string[]): Promise<void> {
+  for (const dir of userDataDirs) {
+    try { await reapProfileHolder(dir); clearSingletonLocks(dir); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * 全局孤儿清扫(跨账号,app 启动时跑一次):按命令行特征(--user-data-dir 指向我们的 matrix profiles
+ * 根目录)找出上次残留的【所有】指纹内核进程并强杀。reapProfileHolder 只能收「SingletonLock 软链里
+ * 记了 pid」的孤儿,mac 上 Chromium 不一定留这个软链 → 收不干净;漏网孤儿会继续监听旧调试端口,
+ * 曾导致新会话经 /json/version 误连到【别的账号】的浏览器(角标/导航串号)。此扫按进程表兜底。
+ * 必须在任何 launchKernel 之前跑完(否则会把刚拉起的内核当孤儿误杀)。
+ */
+export async function reapOrphanKernelsByProfileRoot(profilesRoot: string): Promise<number> {
+  const root = (profilesRoot || '').trim();
+  if (!root) return 0;
+  const pids: number[] = [];
+  try {
+    if (process.platform === 'win32') {
+      // Windows 有 Job Object 级联杀,理论无孤儿;仍兜底扫(JobObject 建失败/旧版本残留)。
+      // WQL 里反斜杠是转义字符 → 路径必须双写,否则整条查询语法错、静默扫不到。
+      const like = root.replace(/\\/g, '\\\\').replace(/'/g, "''").replace(/([%_\[])/g, '[$1]');
+      const psCmd = `Get-CimInstance Win32_Process -Filter "CommandLine like '%${like}%'" | Select-Object -ExpandProperty ProcessId`;
+      const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd], { encoding: 'utf8', timeout: 15000 }).toString();
+      for (const line of out.split(/\r?\n/)) { const p = parseInt(line.trim(), 10); if (Number.isFinite(p)) pids.push(p); }
+    } else {
+      const out = execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8', timeout: 10000 }).toString();
+      for (const line of out.split('\n')) {
+        if (!line.includes(root) || !line.includes('--user-data-dir')) continue;
+        const m = /^\s*(\d+)\s/.exec(line);
+        if (m) pids.push(parseInt(m[1], 10));
+      }
+    }
+  } catch { return 0; } // 进程表读不了就算了,不影响启动
+  let reaped = 0;
+  for (const pid of pids) {
+    if (!Number.isFinite(pid) || pid <= 1 || pid === process.pid) continue;
+    // 保险:本进程正管着的会话不杀(启动时 sessions 为空,此判断只防误用)。
+    let ours = false;
+    for (const s of sessions.values()) { if (s.process && s.process.pid === pid) { ours = true; break; } }
+    if (ours) continue;
+    try { process.kill(pid, 'SIGKILL'); reaped++; } catch { /* 已退出/无权限 */ }
+  }
+  if (reaped) coworkLog('INFO', 'kernelPool', `global orphan sweep: killed ${reaped} leftover kernel process(es)`);
+  return reaped;
+}
+
+// ── 启动参数:指纹 + 代理 + 防泄漏 ──
+
+function proxyServerAddress(proxy: Proxy): string {
+  const scheme = proxy.protocol === 'socks5h' ? 'socks5' : proxy.protocol;
+  const host = proxy.host.includes(':') && !proxy.host.startsWith('[') ? `[${proxy.host}]` : proxy.host;
+  const url = new URL(`${scheme}://${host}:${proxy.port}`);
+  if (!['http:', 'https:', 'socks5:'].includes(url.protocol) || !url.hostname || url.username || url.password
+      || (url.pathname && url.pathname !== '/') || url.search || url.hash
+      || !Number.isInteger(proxy.port) || proxy.port < 1 || proxy.port > 65535) throw new Error('代理地址格式无效');
+  return `${url.protocol}//${url.host}`;
+}
+
+function buildKernelArgs(opts: LaunchKernelOptions, debugPort: number, bridgePort?: number | null): string[] {
+  const { fingerprint: fp, proxy } = opts;
+  const args = [
+    `--remote-debugging-port=${debugPort}`,
+    `--user-data-dir=${opts.userDataDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    // 抑制「Chromium 未正确关闭 · 要恢复页面吗」气泡 + 启动不自动恢复上次会话(自动化里气泡盖页面会点错)。
+    '--disable-session-crashed-bubble',
+    '--hide-crash-restore-bubble',
+    '--no-crash-upload',
+    `--fingerprint=${fp.seed}`,
+  ];
+  if (fp.platformOs) args.push(`--fingerprint-platform=${fp.platformOs}`);
+  if (fp.brand) args.push(`--fingerprint-brand=${fp.brand}`);
+  if (fp.hardwareConcurrency) args.push(`--fingerprint-hardware-concurrency=${fp.hardwareConcurrency}`);
+  if (fp.lang) { args.push(`--lang=${fp.lang}`, `--accept-lang=${fp.lang}`); }
+  if (fp.timezone) args.push(`--timezone=${fp.timezone}`);
+
+  if (proxy) {
+    if (bridgePort) {
+      // 带账密 SOCKS5:Chromium 不支持 SOCKS5 账密 → 指向本地无认证中转(proxyBridge),由它替我们做上游账密握手。
+      args.push(`--proxy-server=socks5://127.0.0.1:${bridgePort}`);
+    } else {
+      // socks5h 在 chromium 里用 socks5(socks5 默认远程 DNS,防 DNS 泄漏)。
+      // 带 auth 的 HTTP/HTTPS 代理【不内联账密】(Chromium 不支持)→ 经 CDP Fetch.authRequired 在 getPage 里提供凭据。
+      args.push(`--proxy-server=${proxyServerAddress(proxy)}`);
+    }
+    args.push('--disable-non-proxied-udp'); // 防 WebRTC 漏真实 IP
+  }
+
+  // 【tab group 可行性验证版】给内核挂一个极小 MV3 扩展:窗口内标签自动归到「账号名」彩色分组。
+  // --disable-features 那条是为新版 chromium 把 --load-extension 重新放开(新版把它关进了默认禁用的
+  // feature 开关);旧版/fingerprint-chromium 无此 feature 会忽略,无害。能不能真加载,mac 真机见分晓。
+  try {
+    const extDir = ensureTabGroupExtension(opts.accountId, opts.groupTitle || opts.label || opts.accountId);
+    if (extDir) {
+      args.push(`--load-extension=${extDir}`);
+      args.push('--disable-features=DisableLoadExtensionCommandLineSwitch');
+    }
+  } catch { /* 扩展非关键,失败不挡启动 */ }
+
+  if (opts.headless) args.push('--headless=new');
+  else args.push('--window-size=1180,820'); // 启动即按目标尺寸开，消除先大后缩的跳动。
+  if (opts.startUrl) args.push('about:blank');
+  return args;
+}
+
+// ── 启动一个号的内核实例(in-flight 去重,杜绝同号双开) ──
+
+export async function launchKernel(opts: LaunchKernelOptions): Promise<KernelSession> {
+  // 占「按账号使用互斥锁」:同号有别的流程正在用 → 在这里【排队等】,直到它 closeKernel 释放。
+  //   openLogin(skipLease)不占锁,不阻塞任务。
+  opts.signal?.throwIfAborted();
+  const leaseOwner = !opts.skipLease ? await acquireLease(opts.accountId, opts.signal) : undefined;
+  // 引用计数 +1:任何流程要用这个号都先 +1,closeKernel 时 -1,归 0 才真关。
+  refCount.set(opts.accountId, (refCount.get(opts.accountId) || 0) + 1);
+  const automated = !opts.skipLease && !opts.background && !opts.manual;
+  let reservedProfile: string | undefined;
+  try {
+    opts.signal?.throwIfAborted();
+    const current = getAccount(opts.accountId);
+    if (current?.authority) {
+      const key = profileKey(opts.userDataDir);
+      const exclusive = profileCleanupOwners.get(key);
+      const alreadyClaimed = profileReservations.get(key);
+      const cleanup = !!exclusive && exclusive === opts.cleanupOwner;
+      try { accountAuthority.assertProfileAccess(opts.accountId, opts.userDataDir, undefined, cleanup); }
+      catch { throw new KernelNavigationError('ownership_unconfirmed'); }
+      if ((exclusive && !cleanup) || (opts.cleanupOwner && !cleanup) ||
+          (alreadyClaimed && alreadyClaimed !== opts.accountId) ||
+          (current.authority.attempt && !opts.manual && !opts.skipLease)) {
+        throw new KernelNavigationError('ownership_unconfirmed');
+      }
+      profileReservations.set(key, opts.accountId);
+      reservedProfile = key;
+    }
+    if (automated) {
+      const account = getAccount(opts.accountId);
+      if (account?.bindingConflict) throw new Error('账号身份重复，自动任务已停止；请重新关联唯一账号后再运行');
+      if (account?.manualDisconnect) throw new Error('账号已主动断开，请重新连接后运行');
+      if (account?.chargeUncertain) throw new Error('计费结果不明，请核对账单后恢复');
+      const identity = account?.boundUid ? `${account.platform}:${account.boundUid}` : opts.accountId;
+      // Proxy endpoint grouping is conservative; it is not proof of a shared public IP.
+      const group = opts.proxy ? `proxy:${opts.proxy.protocol}:${opts.proxy.host}:${opts.proxy.port}` : `local:${getLocalEgressIp() || 'unknown'}`;
+      automationSafety.begin(opts.accountId, identity, group, (msg) => safetyLog(opts.accountId, msg), !!account);
+      await waitForKernel(automationSafety.before(opts.accountId, 'launch'), opts.signal);
+    }
+    const existing = sessions.get(opts.accountId);
+    // 复用前确认进程【真活着】:崩溃的子进程 .killed 仍是 false(那只代表我们没主动 kill),
+    // 必须再查 exitCode===null,否则会复用到已死进程 → 后续 CDP 全部 ECONNRESET。
+    if (existing && existing.process && !existing.process.killed && existing.process.exitCode === null) {
+      if (existing.profileIdentityKey) {
+        try { accountAuthority.assertProfileAccess(opts.accountId, opts.userDataDir, existing.profileIdentityKey, existing.cleanupMode); }
+        catch { throw new KernelNavigationError('ownership_unconfirmed'); }
+      }
+      existing.automation = automated;
+      bindKernelSignal(existing, opts.signal);
+      if (!automated) automationSafety.end(opts.accountId);
+      else if (existing.pageWs) await enableAutomationNetwork(existing);
+      if (automated) await verifyKernelEgress(existing, true);
+      return existing;
+    }
+    const inflight = launching.get(opts.accountId);
+    if (inflight) return await waitForKernel(inflight, opts.signal);
+
+    const signals = [opts.signal, automated ? automationSafety.signal(opts.accountId) : undefined].filter((v): v is AbortSignal => !!v);
+    const launchSignal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+    const p = doLaunch({ ...opts, signal: launchSignal }).then(async (s) => {
+      s.profileReservation = reservedProfile;
+      try {
+      s.automation = automated;
+      bindKernelSignal(s, opts.signal);
+      opts.signal?.throwIfAborted();
+      if (automated && s.pageWs) await enableAutomationNetwork(s);
+      if (automated) await verifyKernelEgress(s, true);
+      return s;
+      } catch (error) {
+        s.detachOperationSignal?.();
+        failSession(s, 'kernel launch cancelled');
+        if (sessions.get(opts.accountId) === s) sessions.delete(opts.accountId);
+        try { s.process?.kill(); } catch { /* already exited */ }
+        throw error;
+      }
+    }).finally(() => {
+      if (launching.get(opts.accountId) === p) launching.delete(opts.accountId);
+    });
+    launching.set(opts.accountId, p);
+    return await p;
+  } catch (e) {
+    if (e instanceof AutomationSafetyError && e.reason !== '任务已结束' && !e.reason.startsWith('network_error:')) {
+      try {
+        if (e.code === 'rate_limited') markAccountCooldown(opts.accountId, e.until);
+        else {
+          const recovery = getAccount(opts.accountId)?.recovery;
+          if (recovery?.reason !== 'rate_limited' || recovery.nextCheckAt <= Date.now()) setAccountStatus(opts.accountId, 'limited', e.message);
+        }
+      }
+      catch { coworkLog('WARN', 'automationSafety', `[${diagnosticAccountAlias(opts.accountId)}] failed to persist blocked launch status`); }
+    }
+    if (automated) automationSafety.end(opts.accountId);
+    // 启动失败时调用方拿到 reject、【不应再 closeKernel】→ 这里回退本调用方的 +1 并释放锁,防计数/锁泄漏。
+    // 放 catch 里(而非创建者单点 p.catch)是为了让【每个调用方】各自回退自己的那份:
+    // skipLease 流程会 join 进行中的 doLaunch(lease 拦不住它),原来只回退创建者的 +1,joiner 的 +1
+    // 永久泄漏 → 该号 refCount 永远 >0 → closeKernel 永不真关,窗口只能手关。
+    refCount.set(opts.accountId, Math.max(0, (refCount.get(opts.accountId) || 1) - 1));
+    if (reservedProfile && profileReservations.get(reservedProfile) === opts.accountId &&
+        !sessions.has(opts.accountId) && !launching.has(opts.accountId) && !closingProcs.has(opts.accountId)) {
+      profileReservations.delete(reservedProfile);
+    }
+    if (!opts.skipLease) releaseLease(opts.accountId, leaseOwner);
+    opts.signal?.throwIfAborted();
+    const message = (e as Error)?.message;
+    if (message === 'NO_KERNEL' || /^kernel_start:(?:proxy_config|profile_unavailable|proxy_bridge|process_exited|debug_port_unavailable|spawn_failed)$/.test(message)
+      || ['账号身份重复，自动任务已停止；请重新关联唯一账号后再运行', '账号已主动断开，请重新连接后运行', '计费结果不明，请核对账单后恢复'].includes(message)) throw new Error(message);
+    if (e instanceof AutomationSafetyError || e instanceof KernelNavigationError) throw e;
+    throw new Error('kernel_start:initialization_failed');
+  }
+}
+
+async function doLaunch(opts: LaunchKernelOptions): Promise<KernelSession> {
+  opts.signal?.throwIfAborted();
+  // Validate before starting a process: malformed addresses must not leave an orphan browser.
+  let proxyAddress: string | undefined;
+  try { proxyAddress = opts.proxy ? proxyServerAddress(opts.proxy) : undefined; }
+  catch { throw new Error('kernel_start:proxy_config'); }
+  // 优先级:显式路径(手动指定)> 该号绑定版本 > 任意已装版本。
+  // 不再回退系统 Chrome:没有我们的指纹内核就不跑(无指纹隔离=矩阵号无意义),
+  // 抛 NO_KERNEL 让上层弹「去下载内核」。
+  const kernelPath = opts.kernelPath || installedKernelPath(opts.kernelVersion) || installedKernelPath();
+  if (!kernelPath) throw new Error(NO_KERNEL_ERROR);
+  coworkLog('INFO', 'kernelPool', 'fingerprint kernel selected');
+
+  const tracked = !!getAccount(opts.accountId)?.authority;
+  const originalDirectory = opts.userDataDir;
+  const initially = tracked ? accountAuthority.assertProfileAccess(opts.accountId, originalDirectory, undefined, !!opts.cleanupOwner) : undefined;
+  let profile: ReturnType<typeof accountAuthority.assertProfileAccess> | undefined;
+  try {
+    if (initially) profile = accountAuthority.prepareProfileDirectory(opts.accountId, originalDirectory, initially, !!opts.cleanupOwner);
+    else if (!fs.existsSync(opts.userDataDir)) fs.mkdirSync(opts.userDataDir, { recursive: true });
+  } catch { throw new Error('kernel_start:profile_unavailable'); }
+  if (profile && (!profile.exists || profile.directory !== initially?.directory)) throw new KernelNavigationError('ownership_unconfirmed');
+  if (profile) opts = { ...opts, userDataDir: profile.directory };
+
+  // 同号上一个进程还在「优雅关闭」中(占着 profile 锁)→ 先立即强杀并等它真退出,再清锁开新窗,
+  // 否则两进程抢同一 user-data-dir → 「打开个人资料出了点问题」+ 双窗(见 closingProcs 注释)。
+  const dying = closingProcs.get(opts.accountId);
+  if (dying && dying.exitCode === null) {
+    if (opts.cleanupOwner) throw new Error('profile_cleanup_unconfirmed');
+    try { dying.kill(); } catch { /* ignore */ }
+    for (let i = 0; i < 30 && dying.exitCode === null; i++) await waitForKernel(sleep(100), opts.signal); // 等退出最多 ~3s
+  }
+  closingProcs.delete(opts.accountId);
+
+  const prev = sessions.get(opts.accountId);
+  // 没有【本进程的】存活实例才动锁:先收走仍占着该 profile 的活孤儿(上次 app 崩溃/被强杀后残留,
+  // 见 reapProfileHolder),再清陈旧单例锁。防「二次启动撞上活孤儿 → 双开抢同一 user-data-dir →
+  // 打开您的个人资料时出了点问题 / 内核秒退 ECONNRESET」。
+  if (!tracked && !opts.cleanupOwner && (!prev || !prev.process || prev.process.killed)) {
+    await reapProfileHolder(opts.userDataDir);
+    clearSingletonLocks(opts.userDataDir);
+  }
+  // 调试端口不再自分配(原 nextDebugPort 从 9300 递增,app 重启后从头再分 → 若上次的孤儿内核还监听着
+  // 同号端口,新进程绑不上但 /json/version 由【孤儿】应答 → CDP 接管了别的账号的浏览器:角标/导航/发布全
+  // 打错窗(串号)。改 --remote-debugging-port=0:内核自选空闲端口并写进 profile 下 DevToolsActivePort
+  // 文件,端口归属由目标进程自己落盘,物理上连不错实例。spawn 前先删陈旧文件,防读到上次的旧端口。
+  const portFile = path.join(opts.userDataDir, 'DevToolsActivePort');
+  // 带账密 SOCKS5:先起本地无认证中转(Chromium 不支持 SOCKS5 账密),拿到本地端口让 args 指向它。
+  //   认证桥失败即停止启动；HTTP/HTTPS 认证仍由 Fetch.authRequired 处理。
+  let bridgePort: number | null = null;
+  if (opts.proxy?.username && opts.proxy?.password && (opts.proxy.protocol === 'socks5' || opts.proxy.protocol === 'socks5h')) {
+    bridgePort = await waitForKernel(ensureProxyBridge(opts.proxy), opts.signal);
+    if (!bridgePort) throw new Error('kernel_start:proxy_bridge');
+  }
+  const args = buildKernelArgs(opts, 0, bridgePort);
+  opts.signal?.throwIfAborted();
+
+  // 把内核 stdout/stderr 落到 profile 下的 kernel.log:崩了能看到真实原因(原来 stdio:'ignore' 完全瞎)。
+  const instanceId = randomUUID();
+  if (profile) {
+    accountAuthority.assertProfileAccess(opts.accountId, originalDirectory, profile.key, !!opts.cleanupOwner);
+    accountAuthority.trackProfileProcess(opts.accountId, opts.userDataDir, instanceId);
+  }
+  try { fs.rmSync(portFile, { force: true }); } catch { /* ignore */ }
+  let outFd: number | 'ignore' = 'ignore';
+  const logPath = path.join(opts.userDataDir, 'kernel.log');
+  try { outFd = fs.openSync(logPath, 'a'); } catch { outFd = 'ignore'; }
+
+  coworkLog('INFO', 'kernelPool', `launch kernel ${diagnosticAccountAlias(opts.accountId)}`);
+  let proc: ChildProcess;
+  try { proc = spawn(kernelPath, args, { detached: false, stdio: ['ignore', outFd, outFd] }); }
+  catch {
+    if (tracked) accountAuthority.noteProfileProcessExit(opts.accountId, instanceId);
+    throw new Error('kernel_start:spawn_failed');
+  }
+  finally { if (typeof outFd === 'number') { try { fs.closeSync(outFd); } catch { /* Child process owns its fd. */ } } }
+  let spawnFailed = false;
+  proc.on('error', () => {
+    spawnFailed = true;
+    if (tracked && !proc.pid) {
+      try { accountAuthority.noteProfileProcessExit(opts.accountId, instanceId); }
+      catch { /* No committed proof: the reservation remains. */ }
+    }
+  });
+  if (tracked) {
+    proc.once('exit', () => {
+      try { accountAuthority.noteProfileProcessExit(opts.accountId, instanceId); }
+      catch { /* An uncommitted exit leaves the previous PID in the durable proof. */ }
+    });
+    try { if (proc.pid) accountAuthority.trackProfileProcess(opts.accountId, opts.userDataDir, instanceId, proc.pid); }
+    catch (error) { try { proc.kill(); } catch { /* already closed */ } throw error; }
+  }
+  let ready = false;
+  let debugPort = 0;
+  try {
+  for (let i = 0; i < 40; i++) {
+    await waitForKernel(sleep(500), opts.signal);
+    if (spawnFailed || proc.exitCode !== null) break;
+    if (!debugPort) {
+      try {
+        const p = parseInt(fs.readFileSync(portFile, 'utf8').split(/\r?\n/)[0].trim(), 10);
+        if (Number.isFinite(p) && p > 0) debugPort = p;
+      } catch { continue; } // 文件还没写出来
+    }
+    if (debugPort) {
+      try {
+        await devFetchJson(`http://127.0.0.1:${debugPort}/json/version`, 1500, opts.signal);
+        ready = true; break;
+      } catch { opts.signal?.throwIfAborted(); /* not ready */ }
+    }
+  }
+  } catch (error) { try { proc.kill(); } catch { /* already exited */ } throw error; }
+  if (!ready) {
+    try { proc.kill(); } catch { /* ignore */ }
+    const reason = spawnFailed ? 'spawn_failed' : proc.exitCode !== null ? 'process_exited' : 'debug_port_unavailable';
+    coworkLog('WARN', 'kernelPool', 'fingerprint kernel did not start', { account: diagnosticAccountAlias(opts.accountId), reason });
+    throw new Error(`kernel_start:${reason}`);
+  }
+
+  const session: KernelSession = {
+    accountId: opts.accountId,
+    process: proc,
+    debugPort,
+    userDataDir: opts.userDataDir,
+    pageWs: null,
+    pageTargetId: null,
+    pageInit: null,
+    diagnosticsId: instanceId,
+    cleanupMode: !!opts.cleanupOwner,
+    cleanupOwner: opts.cleanupOwner,
+    profileIdentityKey: profile?.key,
+    authoritativeAccount: tracked,
+    startPagePending: !!opts.startUrl,
+    msgId: 1,
+    pending: new Map(),
+    // 走了本地中转(bridgePort)就不再开 Fetch 认证(中转已替我们认证);仅 HTTP/HTTPS 认证代理才需 Fetch.authRequired。
+    proxyAuth: (!bridgePort && opts.proxy?.username && opts.proxy?.password && ['http', 'https'].includes(opts.proxy.protocol))
+      ? { username: opts.proxy.username, password: opts.proxy.password,
+        origin: new URL(proxyAddress!).origin }
+      : undefined,
+    label: opts.label,
+    slot: nextSlot++,
+    background: opts.background,
+    boundProxy: opts.proxy ? { ...opts.proxy } : undefined,
+  };
+  // 进程崩溃/退出 → 清 session + reject 挂起命令,避免后续复用死 session 卡满超时。
+  proc.on('exit', () => {
+    emptyTicks.delete(opts.accountId);
+    session.detachOperationSignal?.();
+    failSession(session, 'kernel process exited');
+    if (session.profileReservation) {
+      const key = session.profileReservation;
+      if (profileReservations.get(key) === opts.accountId &&
+          (!sessions.has(opts.accountId) || sessions.get(opts.accountId) === session) && !launching.has(opts.accountId)) {
+        profileReservations.delete(key);
+      }
+    }
+    if (session.windowLease) {
+      kernelLeases.delete(session.windowLease);
+      session.windowLease = undefined;
+    }
+    if (sessions.get(opts.accountId) === session) { sessions.delete(opts.accountId); refCount.delete(opts.accountId); }
+  });
+  sessions.set(opts.accountId, session);
+  ensureWindowGuards(); // 有内核存活 → 起防最小化轮询 + 系统防休眠(全部关闭后自停)。
+  coworkLog('INFO', 'kernelPool', `kernel ${diagnosticAccountAlias(opts.accountId)} ready on ${debugPort}`);
+  return session;
+}
+
+async function readKernelEgress(s: KernelSession): Promise<string> {
+  if (s.egressProbe) return s.egressProbe;
+  const controller = new AbortController();
+  s.egressAbort = controller;
+  const parentSignal = kernelSignal(s);
+  const signal = parentSignal ? AbortSignal.any([parentSignal, controller.signal]) : controller.signal;
+  const pending = readKernelEgressOnce(s, signal).finally(() => {
+    if (s.egressProbe === pending) s.egressProbe = undefined;
+    if (s.egressAbort === controller) s.egressAbort = undefined;
+  });
+  s.egressProbe = pending;
+  return pending;
+}
+
+async function readKernelEgressOnce(s: KernelSession, signal: AbortSignal): Promise<string> {
+  signal.throwIfAborted();
+  await getPage(s.accountId);
+  signal.throwIfAborted();
+  // A neutral background target has no platform CSP and uses this exact browser's
+  // proxy/VPN route. Keep its socket and CDP pending table separate from the task page.
+  const isolated = (): KernelSession => ({ ...s, automation: false, operationSignal: undefined, detachOperationSignal: undefined, loginChecks: undefined, loginRestriction: undefined,
+    pageWs: null, pageTargetId: null, pageInit: null, pageAbort: undefined, connectingWs: undefined,
+    egressProbe: undefined, egressAbort: undefined, navigation: undefined, proxyChallenge: undefined, msgId: 1, pending: new Map() });
+  const control = isolated(), probe = isolated();
+  probe.operationSignal = signal;
+  let targetId: string | undefined;
+  try {
+    const version = await devFetchJson(`http://127.0.0.1:${s.debugPort}/json/version`, 1500, signal);
+    const browserPath = new URL(version.webSocketDebuggerUrl).pathname;
+    if (!/^\/devtools\/browser\/[^/]+$/.test(browserPath)) throw new Error('network_error:内核控制地址无效');
+    await openPageSocket(control, '', signal, `ws://127.0.0.1:${s.debugPort}${browserPath}`);
+    // Once sent, wait at most 5s for the creation acknowledgement even on user
+    // stop; a separate browser-level connection can clean up a late target ID.
+    targetId = await createEgressTarget(control);
+    probe.pageTargetId = targetId;
+    signal.throwIfAborted();
+    await openPageSocket(probe, targetId, signal);
+    if (probe.proxyAuth) {
+      probe.proxyChallenge = { attempts: new Set(), networkIds: new Map(), repeated: false };
+      await send(probe, 'Fetch.enable', { handleAuthRequests: true, patterns: [{ urlPattern: '*' }] }, 3000);
+    }
+    const result = await sendLocalControl(probe, 'Runtime.evaluate', {
+      expression: '(async()=>{const c=new AbortController();const t=setTimeout(()=>c.abort(),7000);try{const r=await fetch("https://api.ipify.org?format=text",{cache:"no-store",signal:c.signal});if(!r.ok)return "";return (await r.text()).trim();}catch{return "";}finally{clearTimeout(t);}})()',
+      returnByValue: true, awaitPromise: true,
+    }, 9000);
+    return normalizeEgressIp(result?.result?.value);
+  } finally {
+    // Cleanup must still run after abort; do not send through the guarded operation queue.
+    if (targetId) sendNoWait(control, 'Target.closeTarget', { targetId });
+    failSession(probe, 'egress probe finished');
+    if (!control.targetCleanupPending) failSession(control, 'egress control finished');
+  }
+}
+
+function createEgressTarget(control: KernelSession): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const id = control.msgId++;
+    let timedOut = false;
+    const cleanup = () => { clearTimeout(timer); control.pending.delete(id); control.targetCleanupPending = false; };
+    let timer = setTimeout(() => {
+      timedOut = true; control.targetCleanupPending = true;
+      reject(new Error('network_error:出口检测页创建超时'));
+      timer = setTimeout(() => {
+        cleanup();
+        coworkLog('WARN', 'matrix-egress', `[${diagnosticAccountAlias(control.accountId)}] probe target acknowledgement missing after cleanup deadline`);
+        failSession(control, 'egress target cleanup deadline');
+      }, 30000);
+    }, 5000);
+    control.pending.set(id, {
+      resolve: (result) => {
+        cleanup();
+        const targetId = typeof result?.targetId === 'string' ? result.targetId : '';
+        if (timedOut) {
+          if (targetId) sendNoWait(control, 'Target.closeTarget', { targetId });
+          failSession(control, 'late egress target cleaned');
+        } else if (targetId) resolve(targetId);
+        else reject(new Error('network_error:无法创建出口检测页'));
+      },
+      reject: (error) => {
+        cleanup();
+        if (timedOut) failSession(control, 'late egress target creation failed');
+        reject(error);
+      },
+    });
+    try {
+      if (!control.pageWs || control.pageWs.readyState !== WebSocket.OPEN) throw new Error('CDP not connected');
+      control.pageWs.send(JSON.stringify({ id, method: 'Target.createTarget', params: { url: 'about:blank', background: true } }));
+    } catch (error) { cleanup(); reject(error); }
+  });
+}
+
+/** Observe the exit without making an external IP service a prerequisite for tasks. */
+async function verifyKernelEgress(s: KernelSession, force = false): Promise<void> {
+  if (!s.automation) return;
+  automationSafety.assertAllowed(s.accountId);
+  const account = getAccount(s.accountId);
+  if (!account || !sameProxyRoute(account.proxy, s.boundProxy)) {
+    automationSafety.stopRun(s.accountId, 'network_error:代理配置已修改，请重新打开账号浏览器');
+  }
+  if (!force && s.egressCheckedAt && Date.now() - s.egressCheckedAt < 5 * 60_000) return;
+  s.egressCheckedAt = Date.now();
+  try {
+    const ip = await readKernelEgress(s);
+    if (!sameProxyRoute(getAccount(s.accountId)?.proxy, s.boundProxy)) {
+      automationSafety.stopRun(s.accountId, 'network_error:代理配置已修改，请重新打开账号浏览器');
+    }
+    if (!ip) return;
+    const observedAt = Date.now();
+    const outcome = recordAccountEgress(s.accountId, ip, observedAt, s.boundProxy);
+    if (outcome === 'stale_route') {
+      automationSafety.stopRun(s.accountId, 'network_error:代理配置已修改，请重新打开账号浏览器');
+    }
+    s.observedEgressIp = ip;
+    automationSafety.setGroup(s.accountId, `exit:${ip}`);
+    s.egressCheckedAt = observedAt;
+  } catch (error) {
+    kernelSignal(s)?.throwIfAborted();
+    if (error instanceof AutomationSafetyError) throw error;
+    coworkLog('INFO', 'matrix-egress', `[${diagnosticAccountAlias(s.accountId)}] exit observation unavailable; keeping configured proxy route`);
+  }
+}
+
+// ── 单会话 CDP 通信(每会话独立 id 空间;getPage 去重) ──
+
+async function getPage(accountId: string, cleanupOwner?: object): Promise<KernelSession> {
+  const s = sessions.get(accountId);
+  if (s?.cleanupMode && (!cleanupOwner || s.cleanupOwner !== cleanupOwner)) {
+    throw new KernelNavigationError('ownership_unconfirmed');
+  }
+  if (s?.authoritativeAccount) {
+    if (s.profileIdentityKey) {
+      try { accountAuthority.assertProfileAccess(accountId, s.userDataDir, s.profileIdentityKey, s.cleanupMode); }
+      catch { throw new KernelNavigationError('ownership_unconfirmed'); }
+    }
+    const held = kernelLeaseScope.getStore();
+    if (held && (held.accountId !== accountId || !isKernelLeaseCurrent(held))) {
+      throw new KernelNavigationError('ownership_unconfirmed');
+    }
+  }
+  if (!s) throw new Error(`no kernel session for ${accountId}`);
+  const operationSignal = kernelSignal(s);
+  operationSignal?.throwIfAborted();
+  if (s.pageInit) return waitForKernel(s.pageInit, operationSignal);
+  if (s.pageWs && s.pageWs.readyState === WebSocket.OPEN) return s;
+
+  const controller = new AbortController();
+  s.pageAbort = controller;
+  const signal = operationSignal ? AbortSignal.any([operationSignal, controller.signal]) : controller.signal;
+  const p = waitForKernel(doGetPage(s, signal), signal).catch((error) => {
+    if (s.pageAbort === controller) failSession(s, 'page connection failed');
+    throw error;
+  }).finally(() => {
+    if (s.pageInit === p) s.pageInit = null;
+    if (s.pageAbort === controller) s.pageAbort = undefined;
+  });
+  s.pageInit = p;
+  return p;
+}
+
+// Chromium 109+ 的 /json/new 只认 PUT:GET 会返回纯文本「Using unsafe HTTP verb GET to invoke /json/new…」
+//   → .json() 抛 "Unexpected token 'U'" 一路传到 UI「读取失败」(小红书刷新信息真机踩过)。
+//   老内核不校验 verb,PUT 同样可用;保险起见解析失败再回退一次 GET。
+async function devtoolsNewTab(debugPort: number, signal?: AbortSignal): Promise<any> {
+  try { return await devFetchJson(`http://127.0.0.1:${debugPort}/json/new`, 1500, signal, 'PUT'); }
+  catch (error) {
+    signal?.throwIfAborted();
+    // A lost response may already have created the tab; do not repeat on timeout.
+    if (!(error instanceof SyntaxError) && !/DevTools HTTP (400|404|405)$/.test(String((error as Error)?.message))) throw error;
+  }
+  return devFetchJson(`http://127.0.0.1:${debugPort}/json/new`, 1500, signal);
+}
+
+function openPageSocket(s: KernelSession, targetId: string, signal?: AbortSignal, socketUrl?: string): Promise<WebSocket> {
+  signal?.throwIfAborted();
+  return new Promise<WebSocket>((resolve, reject) => {
+    const sock = new WebSocket(socketUrl || `ws://127.0.0.1:${s.debugPort}/devtools/page/${targetId}`, { handshakeTimeout: 5000 });
+    s.connectingWs = sock;
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      sock.removeListener('open', opened);
+      sock.removeListener('close', closed);
+      if (s.connectingWs === sock) s.connectingWs = undefined;
+    };
+    const failed = (error: Error) => {
+      if (settled) return;
+      settled = true; cleanup();
+      // Keep the error listener: terminate() can emit an asynchronous error before open.
+      try { sock.terminate(); } catch { /* already closed */ }
+      reject(error);
+    };
+    const abort = () => failed(new Error('CDP connection cancelled'));
+    const closed = () => failed(new Error('CDP closed before connection opened'));
+    const opened = () => {
+      if (settled) return;
+      settled = true; cleanup();
+      sock.on('message', (data) => { if (s.pageWs === sock) onMessage(s, data); });
+      sock.on('close', () => { if (s.pageWs === sock) failSession(s, 'page websocket closed'); });
+      s.pageWs = sock;
+      resolve(sock);
+    };
+    const timer = setTimeout(() => failed(new Error('CDP connection timeout')), 5000);
+    sock.on('error', (error) => {
+      if (!settled) failed(error);
+      else if (s.pageWs === sock) failSession(s, 'page websocket error');
+    });
+    sock.once('open', opened);
+    sock.once('close', closed);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+  });
+}
+
+async function doGetPage(s: KernelSession, signal?: AbortSignal): Promise<KernelSession> {
+  const list: any[] = await devFetchJson(`http://127.0.0.1:${s.debugPort}/json/list`, 1500, signal);
+  const selectPage = (tabs: any[]) => tabs.find((t) => t.type === 'page' && (s.pageTargetId
+    ? t.id === s.pageTargetId : !s.startPagePending || navigationPage(t.url) === 'blank'));
+  let target = selectPage(list);
+  if (!target) {
+    // 之前连上过页面、现在一个页面都没了 = 用户把内核窗口全关了。
+    //   Windows 关掉最后一个窗口 Chromium 自己就退出;macOS 不退(进程留在程序坞里)。原来这里会自动
+    //   新开一个标签 → 扫码轮询 / 刷新信息每隔几秒又把窗口弹回来,用户只能去程序坞「退出」(2026-11-01)。
+    //   改成和 Windows 一致:当作关掉浏览器 —— 结束进程(exit 回调清会话/计数,各流程 getSession 为空即收尾),不再自动开新窗。
+    if (s.pageTargetId) {
+      // 再确认一次(页面瞬时为空 / 跳转换进程时别误判):1.5s 后仍一个页面都没有才算用户关了窗。
+      await waitForKernel(sleep(1500), signal);
+      let again: any[] = [];
+      try { again = await devFetchJson(`http://127.0.0.1:${s.debugPort}/json/list`, 1500, signal); } catch { signal?.throwIfAborted(); }
+      target = Array.isArray(again) ? selectPage(again) : undefined;
+      if (!target) {
+        if (again.some(t => t.type === 'page')) throw new KernelNavigationError('target_closed');
+        coworkLog('INFO', 'kernelPool', `kernel ${diagnosticAccountAlias(s.accountId)}: 窗口已被用户关闭,按「退出浏览器」处理`);
+        void quitKernelGracefully(s);
+        throw new Error('kernel window closed by user');
+      }
+    }
+    if (!target) target = await devtoolsNewTab(s.debugPort, signal);
+  }
+  s.pageTargetId = target.id;
+
+  await openPageSocket(s, target.id, signal);
+
+  await send(s, 'Page.enable');
+  await enableAutomationNetwork(s);
+  // The dynamic executor is injected lazily by kernelExec after the document is admitted.
+  // 本机出口 IP 探测(仅【无代理】号):内核里 fetch ip 服务读真实出口(反映这个内核到底走没走 VPN;主进程 undici
+  //   不一定走 VPN,必须内核侧探)。【在注入角标之前探】→ 角标一次性带上「本机 <ip>」,不再二次重注入。
+  //   ⚠️ 之前探到后二次注入 badgeScript 会叠出【第二个角标】(各自 setInterval 维护、互不删)→ 两个角标重叠串成
+  //   「本机默认 …206.35」那种乱码。改为:没缓存就等(封顶 3s)再注入;有缓存先用、后台刷新供下次起窗。
+  const IPIFY_EXPR = '(async function(){try{var r=await fetch("https://api.ipify.org?format=text",{cache:"no-store"});var t=((await r.text())||"").trim();return /^[0-9a-fA-F:.]{3,45}$/.test(t)?t:"";}catch(e){return "";}})()';
+  const readLocalIp = async () => (await sendLocalControl(s, 'Runtime.evaluate', {
+    expression: IPIFY_EXPR, returnByValue: true, awaitPromise: true,
+  }, 3000))?.result?.value;
+  try {
+    const accForIp = getAccount(s.accountId);
+    if (!s.cleanupMode && !s.automation && accForIp && !accForIp.proxy) {
+      if (!getLocalEgressIp()) {
+        const ip = await readLocalIp().catch(() => '');
+        if (ip) { const { setLocalEgressIp } = await import('./accountManager'); setLocalEgressIp(String(ip)); }
+      } else {
+        void (async () => {
+          try { const ip = await readLocalIp(); if (ip) { const { setLocalEgressIp } = await import('./accountManager'); setLocalEgressIp(String(ip)); } } catch { /* ignore */ }
+        })();
+      }
+    }
+  } catch { signal?.throwIfAborted(); }
+  // 账号角标:窗口左上角常驻账号名 + 代理/本机 IP(IP 已在上面探好、写进 proxyBadgeInfo)。
+  //   addScriptToEvaluateOnNewDocument 让它跨整页导航也在;立即再注入一次给当前页。【只注入这一次】,别在别处二次注入。
+  if (!s.cleanupMode && s.label) {
+    try {
+      // 代理 IP 角标:撞 IP→红(风控提示)、有代理且探测能通→绿/不通→黄、本机→绿。探测仅在有代理且未撞 IP 时跑(≤6s)。
+      const info = proxyBadgeInfo(s.accountId);
+      let pmode: 'ok' | 'down' | 'dup' = 'ok';
+      if (info.duplicate) pmode = 'dup';
+      else if (info.hasProxy) {
+        try { const acc = getAccount(s.accountId); pmode = (acc?.proxy && await waitForKernel(probeProxy(acc.proxy), signal)) ? 'ok' : 'down'; } catch { signal?.throwIfAborted(); pmode = 'ok'; }
+      }
+      const script = badgeScript(s.label, info.text, pmode);
+      await sendLocalControl(s, 'Page.addScriptToEvaluateOnNewDocument', { source: script });
+      await sendLocalControl(s, 'Runtime.evaluate', { expression: script });
+    } catch { signal?.throwIfAborted(); /* 角标非关键 */ }
+  }
+  // 错开窗口位置:多个号别完全重叠,便于分辨。静默后台窗(保活/复验)则直接最小化,不打扰用户。
+  try {
+    const win = await send(s, 'Browser.getWindowForTarget', { targetId: s.pageTargetId });
+    if (win?.windowId != null) {
+      if (s.background) {
+        await send(s, 'Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'minimized' } });
+      } else {
+        const off = (s.slot % 6) * 40;
+        await send(s, 'Browser.setWindowBounds', { windowId: win.windowId, bounds: { left: 60 + off, top: 60 + off, width: 1180, height: 820 } });
+      }
+    }
+  } catch { signal?.throwIfAborted(); /* 窗口定位非关键 */ }
+  signal?.throwIfAborted();
+  return s;
+}
+
+async function enableAutomationNetwork(s: KernelSession): Promise<void> {
+  if (s.navigation) return;
+  const tree = await send(s, 'Page.getFrameTree');
+  s.navigation = new NavigationTrace(s.accountId, s.diagnosticsId,
+    fields => { if (process.env.NOOBCLAW_NAV_DIAGNOSTICS !== '0') coworkLog('INFO', 'matrix-navigation', 'navigation event', fields); },
+    (params, main, write, receipt) => protectNetworkResponse(s, params, main, write, receipt),
+    (connection, generation) => getAccount(s.accountId)?.authority
+      ? accountAuthority.observeRoot(s.accountId, s.diagnosticsId, connection, generation) : undefined,
+    () => ({ exitIp: s.observedEgressIp, secrets: [s.boundProxy?.username || '', s.boundProxy?.password || ''] }));
+  s.navigation.seed(tree?.frameTree?.frame);
+  await send(s, 'Network.enable');
+  await send(s, 'Page.setLifecycleEventsEnabled', { enabled: true });
+}
+
+function protectNetworkResponse(s: KernelSession, params: any, mainDocument: boolean, criticalWrite: boolean, observation?: accountAuthority.ObservationReceipt): number | undefined {
+  const status = params.response?.status;
+  if (mainDocument && status >= 200 && status < 300) s.manualWindowError = undefined;
+  const now = Date.now();
+  const frameId = params.frameId || (mainDocument ? s.navigation?.frame : undefined);
+  const restriction = restrictedResponse({ ...params, frameId }, now, mainDocument ? frameId : undefined, criticalWrite);
+  const until = mainDocument && restriction?.reason === 'rate_limited' ? now + Math.max(30 * 60_000, restriction.retryAfterMs) : undefined;
+  if (observation && (status === 403 || until)) {
+    try {
+      accountAuthority.recordRootProtection(observation, status === 403 ? 'forbidden' : 'rate_limited', until);
+    } catch {
+      coworkLog('WARN', 'automationSafety', 'root protection could not be committed');
+    }
+  }
+  if (!s.automation) {
+    if (!observation && until && (s.navigating || s.background || s.loginScanReady)) {
+      try { markAccountCooldown(s.accountId, until); }
+      catch { safetyLog(s.accountId, '无法保存 HTTP 429 冷却'); }
+    }
+    return until;
+  }
+  if (!restriction) return until;
+  try {
+    const url = params.response.url;
+    const host = new URL(url).hostname.replace(/^www\./, '');
+    const pageHost = new URL(s.navigation?.url || url).hostname.replace(/^www\./, '');
+    if (mainDocument || host === pageHost || host.endsWith('.' + pageHost) || pageHost.endsWith('.' + host)) {
+      const kind = mainDocument ? '主页面' : criticalWrite ? '互动/发布请求' : '普通资源';
+      const detail = `HTTP ${params.response.status}；类型=${kind}；页面=${navigationPage(url)}`;
+      if (restriction.pause) {
+        if (observation) observedRootWrites.add(s.accountId);
+        try { automationSafety.halt(s.accountId, restriction.reason, restriction.retryAfterMs, detail); }
+        finally { observedRootWrites.delete(s.accountId); }
+      }
+      else safetyLog(s.accountId, `⚠️ ${detail}；单次 403 仅记录告警，后续仍检查页面限制提示。`);
+    }
+  } catch { coworkLog('WARN', 'automationSafety', 'response restriction processing failed'); }
+  return until;
+}
+
+function onMessage(s: KernelSession, data: WebSocket.RawData): void {
+  let msg: any;
+  try { msg = JSON.parse(data.toString()); } catch { return; }
+  if (!msg || typeof msg !== 'object') return;
+  // 命令响应
+  if (msg.id && s.pending.has(msg.id)) {
+    const h = s.pending.get(msg.id)!;
+    s.pending.delete(msg.id);
+    if (msg.error) h.reject(new Error('CDP command failed')); else h.resolve(msg.result);
+    return;
+  }
+  if (typeof msg.method === 'string') {
+    try { s.navigation?.observe(msg.method, msg.params); }
+    catch { s.navigation?.record('event_processing_failed'); }
+  }
+  if (msg.method === 'Fetch.authRequired') {
+    answerProxyChallenge(s, msg.params);
+  } else if (msg.method === 'Fetch.requestPaused') {
+    if (typeof msg.params?.requestId === 'string') {
+      const scope = s.proxyChallenge;
+      if (scope && scope.networkIds.size < 64 && typeof msg.params.networkId === 'string') {
+        scope.networkIds.set(msg.params.requestId, msg.params.networkId);
+      }
+      sendNoWait(s, 'Fetch.continueRequest', { requestId: msg.params.requestId },
+        () => s.navigation?.record('proxy_control_failed', { operation: 'continue' }));
+    }
+  } else if (msg.method === 'Page.fileChooserOpened') {
+    // 真实文件选择器被拦下(点了页面的上传按钮触发)→ 把事件交给等待者去 setFileInputFiles。
+    if (s.fileChooserWaiter) { const w = s.fileChooserWaiter; s.fileChooserWaiter = null; try { w(msg.params); } catch { /* ignore */ } }
+  }
+}
+
+function answerProxyChallenge(s: KernelSession, params: any): void {
+  if (typeof params?.requestId !== 'string') return;
+  const challenge = params.authChallenge;
+  const scope = s.proxyChallenge;
+  let match = false;
+  try {
+    match = challenge?.source === 'Proxy' && !!s.proxyAuth && s.proxyAuth.origin !== 'null'
+      && new URL(challenge.origin).origin === s.proxyAuth.origin;
+  } catch { /* An unparseable source cannot receive credentials. */ }
+  const repeated = !!scope?.attempts.has(params.requestId);
+  const provide = !!scope && match && !repeated && scope.attempts.size < 8;
+  if (provide) scope.attempts.add(params.requestId);
+  if (scope && match && !provide) scope.repeated = true;
+  const response = provide ? 'ProvideCredentials' : challenge?.source === 'Server' ? 'Default' : 'CancelAuth';
+  const credentials = provide ? { username: s.proxyAuth!.username, password: s.proxyAuth!.password } : {};
+  s.navigation?.record('proxy_challenge', {
+    source: match ? 'configured_proxy' : challenge?.source === 'Proxy' ? 'other_proxy' : challenge?.source === 'Server' ? 'server' : 'unknown',
+    provided: provide, outcome: repeated ? 'repeated' : provide ? 'pending' : 'declined',
+    root: !!params.frameId && params.frameId === s.navigation?.frame,
+    ...s.navigation?.refs(params.frameId, undefined, scope?.networkIds.get(params.requestId)),
+  });
+  const reply = { requestId: params.requestId, authChallengeResponse: { response, ...credentials } };
+  const onFailure = () => s.navigation?.record('proxy_control_failed', { operation: 'auth' });
+  if (provide) void send(s, 'Fetch.continueWithAuth', reply, 2000, scope).catch(onFailure);
+  else sendNoWait(s, 'Fetch.continueWithAuth', reply, onFailure);
+}
+
+/** WS 断开/进程退出:reject 所有挂起命令并清理,使后续 getPage 重建连接。 */
+function failSession(s: KernelSession, reason: string): void {
+  for (const check of s.loginChecks || []) check.abort(new Error(reason));
+  s.loginChecks?.clear();
+  const egressAbort = s.egressAbort;
+  s.egressAbort = undefined;
+  egressAbort?.abort(new Error(reason));
+  const pageAbort = s.pageAbort;
+  s.pageAbort = undefined;
+  pageAbort?.abort(new Error(reason));
+  const connecting = s.connectingWs;
+  s.connectingWs = undefined;
+  try { connecting?.terminate(); } catch { /* already closed */ }
+  for (const [, h] of s.pending) { try { h.reject(new Error(reason)); } catch { /* ignore */ } }
+  s.pending.clear();
+  const ws = s.pageWs;
+  s.pageWs = null;
+  try { ws?.close(); } catch { /* ignore */ }
+  s.pageInit = null;
+  s.navigation?.disconnect(reason === 'kernel operation cancelled' ? 'cancelled' : reason === 'proxy interception cleanup failed' ? 'protocol' : 'connection');
+  s.navigation = undefined;
+  s.proxyChallenge = undefined;
+}
+
+/** 发命令不等响应(用于 Fetch 拦截应答)。 */
+function sendNoWait(s: KernelSession, method: string, params: Record<string, unknown> = {}, onFailure?: () => void): void {
+  if (!['Fetch.continueRequest', 'Fetch.continueWithAuth', 'Browser.close', 'Target.closeTarget'].includes(method)) return;
+  if (method.startsWith('Fetch.') && (!s.proxyChallenge || typeof params.requestId !== 'string')) return;
+  try { s.pageWs?.send(JSON.stringify({ id: s.msgId++, method, params }), error => { if (error) onFailure?.(); }); }
+  catch { onFailure?.(); }
+}
+
+// Fixed passive probe for a root restored without a new DOM lifecycle event.
+const ROOT_PROOF_EXPRESSION = `({href:location.href,readyState:document.readyState,restriction:(${AUTOMATION_RESTRICTION_EXPR})})`;
+
+const loginReadCapabilities = new WeakMap<object, {
+  session: KernelSession; socket: KernelSession['pageWs']; generation: number | undefined; fence: accountAuthority.AssociationFence;
+  expression: string;
+}>();
+const activeCookieWrites = new WeakMap<KernelSession, object>();
+const profileCookieQueue = new Map<string, Promise<unknown>>();
+
+async function cookieMutation(s: KernelSession, method: 'Network.setCookie' | 'Network.setCookies' | 'Network.clearBrowserCookies',
+  params: Record<string, unknown>, signal?: AbortSignal, fence?: accountAuthority.AssociationFence) {
+  const key = s.profileIdentityKey || profileKey(s.userDataDir);
+  const connection = s.pageWs;
+  const epoch = s.navigation?.snapshot().connectionEpoch;
+  const work = (profileCookieQueue.get(key) || Promise.resolve()).catch((): undefined => undefined).then(async () => {
+    signal?.throwIfAborted();
+    if (sessions.get(s.accountId) !== s || !connection || s.pageWs !== connection) throw new Error('navigation:cancelled');
+    const account = getAccount(s.accountId);
+    if (s.profileIdentityKey) accountAuthority.assertProfileAccess(s.accountId, s.userDataDir, s.profileIdentityKey, s.cleanupMode);
+    const receipt = account?.authority
+      ? accountAuthority.recordCookieMutation(s.accountId, s.diagnosticsId, epoch || 'unknown', method === 'Network.clearBrowserCookies', fence, method === 'Network.setCookie')
+      : undefined;
+    const authority = {};
+    activeCookieWrites.set(s, authority);
+    try {
+      const result = await send(s, method, params, 12000, undefined, authority);
+      if (sessions.get(s.accountId) !== s || s.pageWs !== connection || signal?.aborted ||
+          (receipt && (!fence || !accountAuthority.isCurrentAssociation(fence)))) {
+        throw new Error('navigation:cancelled');
+      }
+      if (receipt) accountAuthority.settleCookieMutation(receipt, 'completed');
+      return result;
+    } catch (error) {
+      if (receipt) accountAuthority.settleCookieMutation(receipt, 'unknown');
+      throw error;
+    } finally {
+      if (activeCookieWrites.get(s) === authority) activeCookieWrites.delete(s);
+    }
+  });
+  profileCookieQueue.set(key, work);
+  try { return await waitForKernel(work, signal); }
+  finally {
+    // Cancellation ends this waiter. The queue remains occupied until the sent command settles.
+    void work.finally(() => { if (profileCookieQueue.get(key) === work) profileCookieQueue.delete(key); }).catch((): undefined => undefined);
+  }
+}
+
+const localControlPermits = new WeakMap<object, {
+  session: KernelSession; socket: KernelSession['pageWs']; method: string; params: Record<string, unknown>;
+}>();
+
+function sendLocalControl(s: KernelSession, method: 'Runtime.evaluate' | 'Page.addScriptToEvaluateOnNewDocument',
+  params: Record<string, unknown>, timeout?: number) {
+  const permit = {};
+  localControlPermits.set(permit, { session: s, socket: s.pageWs, method, params });
+  return send(s, method, params, timeout, undefined, undefined, undefined, permit);
+}
+
+function send(s: KernelSession, method: string, params: Record<string, unknown> = {}, timeoutMs = 30000, auth?: ProxyChallenges, cookieWrite?: object, loginRead?: object, localControl?: object): Promise<any> {
+  const allowed = [
+    'Runtime.evaluate', 'Runtime.callFunctionOn', 'Input.dispatchKeyEvent', 'Input.dispatchMouseEvent',
+    'Input.insertText', 'DOM.setFileInputFiles', 'Page.setBypassCSP', 'Page.setInterceptFileChooserDialog',
+    'Page.navigate', 'Page.enable', 'Page.addScriptToEvaluateOnNewDocument', 'Page.getFrameTree',
+    'Page.setLifecycleEventsEnabled', 'Page.bringToFront', 'Page.captureScreenshot', 'Browser.getWindowForTarget',
+    'Browser.setWindowBounds', 'Network.enable', 'Network.getCookies', 'Network.getAllCookies',
+    'Network.setCookie', 'Network.setCookies', 'Network.clearBrowserCookies', 'Fetch.enable', 'Fetch.disable', 'Fetch.continueWithAuth',
+  ];
+  if (!allowed.includes(method)) throw new KernelNavigationError('protocol');
+  if (/^Network\.(setCookie|setCookies|clearBrowserCookies)$/.test(method)
+      && (!cookieWrite || activeCookieWrites.get(s) !== cookieWrite)) throw new KernelNavigationError('protocol');
+  const authControl = !!auth && s.proxyChallenge === auth
+    && (method === 'Fetch.disable' && Object.keys(params).length === 0
+      || method === 'Fetch.continueWithAuth' && typeof params.requestId === 'string' && auth.attempts.has(params.requestId));
+  if ((auth && !authControl) || (['Fetch.disable', 'Fetch.continueWithAuth'].includes(method) && !authControl)
+      || (method === 'Fetch.enable' && (!s.proxyChallenge || params.handleAuthRequests !== true
+        || JSON.stringify(params.patterns) !== '[{"urlPattern":"*"}]'))) throw new KernelNavigationError('protocol');
+  const capability = loginRead && loginReadCapabilities.get(loginRead);
+  const authorizedLoginRead = capability && method === 'Runtime.evaluate' && params.expression === capability.expression
+    && s === capability.session && s.pageWs === capability.socket && s.navigation?.snapshot().generation === capability.generation
+    && accountAuthority.isCurrentAssociation(capability.fence);
+  if (loginRead && !authorizedLoginRead) throw new KernelNavigationError('ownership_unconfirmed');
+  const permission = localControl && localControlPermits.get(localControl);
+  const local = permission && permission.session === s && permission.socket === s.pageWs
+    && permission.method === method && permission.params === params;
+  if ((localControl || method === 'Page.addScriptToEvaluateOnNewDocument') && !local) throw new KernelNavigationError('protocol');
+  const signal = authControl ? undefined : kernelSignal(s);
+  signal?.throwIfAborted();
+  if (s.automation && !authControl) automationSafety.assertAllowed(s.accountId);
+  const business = /^(Input\.|DOM\.|Runtime\.callFunctionOn$)/.test(method)
+    || method === 'Page.setBypassCSP' || method === 'Page.captureScreenshot'
+    || (method === 'Page.setInterceptFileChooserDialog' && params.enabled !== false)
+    || (method === 'Runtime.evaluate' && params.expression !== AUTOMATION_RESTRICTION_EXPR
+        && params.expression !== ROOT_PROOF_EXPRESSION && !authorizedLoginRead && !local);
+  const account = s.automation || business ? getAccount(s.accountId) : undefined;
+  const governed = s.authoritativeAccount || !!account?.authority;
+  if (s.cleanupMode && (business || method === 'Page.navigate' || method === 'Page.bringToFront')) {
+    throw new KernelNavigationError('ownership_unconfirmed');
+  }
+  if (s.profileIdentityKey && (business || method === 'Page.navigate' || method === 'Page.bringToFront')) {
+    try { accountAuthority.assertProfileAccess(s.accountId, s.userDataDir, s.profileIdentityKey); }
+    catch { throw new KernelNavigationError('ownership_unconfirmed'); }
+  }
+  if (governed && !authControl && !authorizedLoginRead && !local && !cookieWrite) {
+    const held = kernelLeaseScope.getStore();
+    if ((business && !held) || (held && (s.accountId !== held.accountId ||
+        s.diagnosticsId !== held.sessionInstanceId || !isKernelLeaseCurrent(held)))) {
+      throw new KernelNavigationError('ownership_unconfirmed');
+    }
+  }
+  if (business) {
+    if (s.automation || governed) s.navigation?.assertBusinessReady(true);
+    if (governed) {
+      const current = s.navigation?.snapshot();
+      const initial = automationOperationContext.getStore();
+      if (!current || (initial && (initial.session !== s || initial.connection !== current.connectionEpoch
+          || initial.generation !== current.generation))) throw new KernelNavigationError('ownership_unconfirmed');
+      if (!accountAuthority.selectAvailability(s.accountId)?.available) throw new AutomationSafetyError('账号保护或身份尚待核验');
+    }
+  }
+  const id = s.msgId++;
+  return new Promise((resolve, reject) => {
+    if (!s.pageWs || s.pageWs.readyState !== WebSocket.OPEN) {
+      reject(new Error(`CDP not connected: ${method}`));
+      return;
+    }
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); s.pending.delete(id); };
+    const abort = () => { cleanup(); reject(signal?.reason || new Error('CDP cancelled')); };
+    const timer = setTimeout(() => { cleanup(); reject(new Error(`CDP timeout: ${method}`)); }, timeoutMs > 0 ? timeoutMs : 30000);
+    s.pending.set(id, {
+      resolve: (d) => { cleanup(); resolve(d); },
+      reject: (e) => { cleanup(); reject(e); },
+    });
+    signal?.addEventListener('abort', abort, { once: true });
+    try { s.pageWs.send(JSON.stringify({ id, method, params })); }
+    catch (error) { cleanup(); reject(error); }
+  });
+}
+
+// ── 高层操作(按 accountId) ──
+
+async function pageForNavigation(accountId: string): Promise<KernelSession> {
+  try { return await getPage(accountId); }
+  catch (error) {
+    sessions.get(accountId)?.operationSignal?.throwIfAborted();
+    if (error instanceof AutomationSafetyError || error instanceof KernelNavigationError) throw error;
+    throw new KernelNavigationError('connection');
+  }
+}
+
+export async function kernelNavigate(accountId: string, url: string): Promise<void> {
+  const s = await pageForNavigation(accountId);
+  const ws = s.pageWs;
+  try { await withAutomationOperation(s, 'navigate', () => navigatePage(s, url)); }
+  catch (error) {
+    s.operationSignal?.throwIfAborted();
+    if (error instanceof AutomationSafetyError || error instanceof KernelNavigationError) throw error;
+    if (s.automation) automationSafety.assertAllowed(accountId);
+    throw new KernelNavigationError(/^CDP timeout:/.test(String((error as Error)?.message)) ? 'timeout' : s.pageWs !== ws ? 'connection' : 'protocol');
+  }
+}
+
+/** A new, successful root document on the same manual browser connection. */
+export async function navigateForAccountReview(accountId: string, url: string) {
+  const session = await pageForNavigation(accountId);
+  const trace = session.navigation;
+  const socket = session.pageWs;
+  if (!trace || !socket || session.automation) throw new KernelNavigationError('ownership_unconfirmed');
+  const before = trace.reviewDocument();
+  await kernelNavigate(accountId, url);
+  const result = trace.reviewDocument();
+  const assertCurrent = () => {
+    if (getSession(accountId) !== session || session.pageWs !== socket || session.navigation !== trace) {
+      throw new KernelNavigationError('ownership_unconfirmed');
+    }
+    const now = trace.reviewDocument();
+    if (now.failure && now.failure.sequence > before.reviewSequence) throw new KernelNavigationError(now.failure.code);
+    if (now.state !== 'confirmed' || now.generation === undefined || now.generation === before.generation
+        || now.generation !== result.generation || now.connectionEpoch !== result.connectionEpoch || now.url !== result.url
+        || now.status === undefined || now.status < 200 || now.status >= 300) {
+      throw new KernelNavigationError('ownership_unconfirmed');
+    }
+  };
+  assertCurrent();
+  return { url: result.url, generation: result.generation!, connectionEpoch: result.connectionEpoch, assertCurrent };
+}
+
+async function navigatePage(s: KernelSession, url: string): Promise<void> {
+  if (s.navigating) throw new KernelNavigationError('busy');
+  if (s.automation && getAccount(s.accountId)?.authority && !accountAuthority.selectAvailability(s.accountId)?.available) {
+    throw new AutomationSafetyError('账号保护或身份尚待核验');
+  }
+  const trace = s.navigation!;
+  const signal = kernelSignal(s);
+  const budget = new AbortController();
+  const waitSignal = signal ? AbortSignal.any([signal, budget.signal]) : budget.signal;
+  const ws = s.pageWs;
+  const auth: ProxyChallenges | undefined = s.proxyAuth ? { attempts: new Set(), networkIds: new Map(), repeated: false } : undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let outcome: NavigationFailure | 'ready' = 'protocol';
+  let error: unknown;
+  let proofAttempted = false;
+  const confirmDocument = async (): Promise<'ready'> => {
+    let result: NavigationFailure | 'ready';
+    try { result = await trace.waitForDocument(waitSignal); }
+    catch (failure) {
+      signal?.throwIfAborted();
+      if (!budget.signal.aborted) throw failure;
+      result = trace.timeout();
+    }
+    if (result === 'ownership_unconfirmed' && !proofAttempted && !waitSignal.aborted) {
+      proofAttempted = true;
+      const sequence = trace.snapshot().sequence;
+      try {
+        const tree = await waitForKernel(send(s, 'Page.getFrameTree', {}, 1500), waitSignal);
+        const page = await waitForKernel(send(s, 'Runtime.evaluate', {
+          expression: ROOT_PROOF_EXPRESSION, returnByValue: true,
+        }, 1500), waitSignal);
+        if (s.pageWs === ws && trace.proveRoot(sequence, tree?.frameTree?.frame, page?.result?.value?.href,
+          page?.result?.value?.readyState, page?.result?.value?.restriction)) result = await trace.waitForDocument(waitSignal);
+      } catch { signal?.throwIfAborted(); }
+    }
+    if (result !== 'ready') throw new KernelNavigationError(result, trace.httpUntil);
+    return result;
+  };
+
+  s.navigating = true;
+  trace.begin(url);
+  timer = setTimeout(() => budget.abort(), 15_000);
+  try {
+    if (auth) {
+      s.proxyChallenge = auth;
+      await waitForKernel(send(s, 'Fetch.enable', { handleAuthRequests: true, patterns: [{ urlPattern: '*' }] }, 2000), waitSignal);
+    }
+    trace.acknowledge(await waitForKernel(send(s, 'Page.navigate', { url }, 15_000), waitSignal));
+    outcome = await confirmDocument();
+    try { await send(s, 'Page.bringToFront', {}, 2000); } catch { /* Window visibility is best effort. */ }
+    outcome = await confirmDocument();
+  } catch (failure) {
+    const denial = trace.lastHttpFailure;
+    error = failure instanceof AutomationSafetyError ? failure
+      : denial === 'http_403' || denial === 'http_429' ? new KernelNavigationError(denial, trace.httpUntil) : budget.signal.aborted ? new KernelNavigationError(trace.timeout(), trace.httpUntil) : failure;
+  }
+
+  try {
+    if (auth && s.pageWs === ws && s.proxyChallenge === auth) {
+      if (auth.attempts.size) trace.record('proxy_outcome', {
+        outcome: auth.repeated ? 'challenge_declined' : outcome === 'ready' ? 'navigation_ready' : 'unconfirmed',
+      });
+      try { await send(s, 'Fetch.disable', {}, 2000, auth); }
+      catch {
+        trace.record('proxy_control_failed', { operation: 'disable' });
+        if (s.pageWs === ws) {
+          failSession(s, 'proxy interception cleanup failed');
+          ws?.terminate();
+        }
+        error ||= new KernelNavigationError('protocol');
+      } finally { if (s.proxyChallenge === auth) s.proxyChallenge = undefined; }
+    }
+    s.operationSignal?.throwIfAborted();
+    signal?.throwIfAborted();
+    if (s.automation) automationSafety.assertAllowed(s.accountId);
+    if (error) throw error;
+    if (s.pageWs !== ws) throw new KernelNavigationError('connection');
+    outcome = await confirmDocument();
+  } catch (failure) {
+    if (s.operationSignal?.aborted) outcome = 'cancelled';
+    else if (failure instanceof AutomationSafetyError) {
+      trace.finish(failure.code || 'platform_restricted');
+      throw failure;
+    } else {
+      outcome = failure instanceof KernelNavigationError ? failure.code
+        : /^CDP timeout:/.test(String((failure as Error)?.message)) ? 'timeout' : s.pageWs !== ws ? 'connection' : 'protocol';
+    }
+    throw failure;
+  } finally {
+    clearTimeout(timer);
+    trace.finish(outcome);
+    s.navigating = false;
+  }
+}
+
+export async function kernelEval(accountId: string, expression: string, timeoutMs?: number): Promise<any> {
+  const s = await getPage(accountId);
+  const operation = operationForScript(expression);
+  const evaluate = async () => {
+    const r = await send(s, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, timeoutMs);
+    return r?.result?.value;
+  };
+  return operation ? withAutomationOperation(s, operation, evaluate) : evaluate();
+}
+
+/**
+ * 区域截图(CDP Page.captureScreenshot):按【文档绝对坐标】裁一块返回 base64 PNG。
+ * clip.scale=2 让输出是 2x 像素密度(截图卡缩进 1080 宽成片仍锐)。captureBeyondViewport
+ * 免滚动拼接。爆帖成片的 reddit_search driver 靠它逐卡截帖子/评论。
+ */
+export async function kernelScreenshot(
+  accountId: string,
+  clip?: { x: number; y: number; width: number; height: number; scale?: number },
+): Promise<string> {
+  const s = await getPage(accountId);
+  const params: any = { format: 'png', captureBeyondViewport: true };
+  if (clip && Number.isFinite(clip.x) && Number.isFinite(clip.width)) {
+    params.clip = { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale: clip.scale || 1 };
+  }
+  const r = await send(s, 'Page.captureScreenshot', params, 30_000);
+  return String(r?.data || '');
+}
+
+/** 把该号窗口的页面提到前台(登录过期提醒:让用户一眼看到要重扫的那个窗口)。非关键,失败忽略。 */
+/** 标记该号会话为「用户自己打开的窗口」(不做防最小化复原)。 */
+export function markUserOwned(accountId: string): void {
+  automationSafety.end(accountId);
+  const manualSession = sessions.get(accountId);
+  if (manualSession) manualSession.automation = false;
+  const s = sessions.get(accountId);
+  if (s) s.userOwned = true;
+}
+
+/** 连上页面(设 pageTargetId,窗口守护才认得它)并确保停在 url:页面还是空白/新标签页才导航,已打开就不刷新(别打断用户)。 */
+export async function kernelEnsureUrl(accountId: string, url?: string, requireSite = false, platform?: string): Promise<'attached' | 'ready' | 'preserved'> {
+  const s = await pageForNavigation(accountId);
+  if (!url) return 'attached';
+  const tree = await send(s, 'Page.getFrameTree', {}, 5000).catch(() => { throw new KernelNavigationError('protocol'); });
+  const frame = tree?.frameTree?.frame;
+  const page = navigationPage(frame?.url);
+  if (!frame?.url || frame.unreachableUrl || page === 'error') {
+    throw new KernelNavigationError(s.navigation?.lastHttpFailure || 'browser_error', s.navigation?.httpUntil);
+  }
+  if (s.navigation?.lastHttpFailure) throw new KernelNavigationError(s.navigation.lastHttpFailure, s.navigation.httpUntil);
+  if (requireSite && page !== 'blank') {
+    const expected = new URL(url);
+    const actual = new URL(frame.url);
+    const expectedHost = expected.hostname.replace(/^www\./, '');
+    const actualHost = actual.hostname.replace(/^www\./, '');
+    const sameSite = actual.protocol === expected.protocol
+      && (actualHost === expectedHost || actualHost.endsWith('.' + expectedHost));
+    const expectedPath = expected.pathname.replace(/\/$/, '') || '/';
+    const actualPath = actual.pathname.replace(/\/$/, '') || '/';
+    const entry = actualPath === expectedPath || (expectedPath !== '/' && actualPath.startsWith(expectedPath + '/'));
+    if (!sameSite) throw new KernelNavigationError('different_page');
+    if (!entry) {
+      const diagnostic: { reason: LoginCheckReason } = { reason: 'page_unavailable' };
+      const loginPlatform = platform || (/(^|\.)tiktok\.com$/i.test(expectedHost) ? 'tiktok' : '');
+      const timeout = AbortSignal.timeout(5000);
+      const result = loginPlatform
+        ? await waitForKernel(checkKernelLoginInner(accountId, loginPlatform, diagnostic, timeout), timeout).catch((): null => null)
+        : null;
+      if (result !== true) throw new KernelNavigationError('different_page');
+    }
+  }
+  if (page === 'blank') await kernelNavigate(accountId, url);
+  s.startPagePending = false;
+  return page === 'blank' ? 'ready' : 'preserved';
+}
+
+export async function kernelBringToFront(accountId: string): Promise<void> {
+  try {
+    const s = await getPage(accountId);
+    // 静默后台窗被用户流程(扫码/重连)复用时:解除 background 标记并从最小化复原,否则 bringToFront 无感。
+    if (s.background) {
+      s.background = false;
+      try {
+        const win = await send(s, 'Browser.getWindowForTarget', { targetId: s.pageTargetId });
+        if (win?.windowId != null) await send(s, 'Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal' } });
+      } catch { /* 非关键 */ }
+    }
+    await send(s, 'Page.bringToFront');
+  } catch { /* 非关键 */ }
+}
+
+/** 在该号当前页注入红色「登录已过期,请重新扫码」角标(自愈;登录后导航离开会自然消失)。非关键,失败忽略。 */
+export async function kernelShowExpiredBadge(accountId: string, text: string): Promise<void> {
+  try { const s = await getPage(accountId); await sendLocalControl(s, 'Runtime.evaluate', { expression: expiredBadgeScript(text) }); } catch { /* 非关键 */ }
+}
+
+// ── 命令执行器(window.__nbExec)服务端下发 + 注入 ──
+// 复用扩展 content.js/background.js 的 DOM 命令实现(见 backend/matrix/drivers/command_executor.js)。
+// 改命令行为只改后端 + 重启,不打包 client。
+function matrixApiBase(): string {
+  return process.env.NOOBCLAW_API_BASE_URL || 'https://api.noobclaw.com';
+}
+let executorSource: string | null = null;        // lastGood 缓存
+let executorFetchedAt = 0;                         // 上次成功拉取时间(TTL 刷新用)
+const EXECUTOR_TTL_MS = 60_000;                    // 缓存新鲜窗口:超过则下次取用前刷新
+let executorFetch: Promise<string | null> | null = null;
+async function getExecutorSource(): Promise<string | null> {
+  // 旧实现永久缓存(进程一辈子只拉一次)→ 改后端要重启 app 才生效。改成 TTL 刷新:
+  //   TTL 内复用(避免一次运行内 N 个账号各拉一遍),超过 TTL 下次取用前重拉 →
+  //   后端 git pull + restart 后,下一轮任务(>60s)自动拿到新执行器,不用重启客户端。
+  if (executorSource && (Date.now() - executorFetchedAt) < EXECUTOR_TTL_MS) return executorSource;
+  if (executorFetch) return executorFetch;
+  executorFetch = (async () => {
+    try {
+      const res = await fetch(`${matrixApiBase()}/api/matrix/command-executor`, { signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) throw new Error(`http_${res.status}`);
+      const data: any = await res.json();
+      if (typeof data?.source === 'string' && data.source) { executorSource = data.source; executorFetchedAt = Date.now(); return executorSource; }
+      throw new Error('no_source');
+    } catch (e) {
+      coworkLog('WARN', 'kernelPool', 'fetch command-executor failed');
+      return executorSource; // 失败保 lastGood(可能为 null:首次失败 → 命令层不可用,上层会报错)
+    } finally { executorFetch = null; }
+  })();
+  return executorFetch;
+}
+
+/** 把执行器注入该号当前页(定义 window.__nbExec)。getPage 时也会装 init 脚本跨导航生效。 */
+async function injectExecutor(accountId: string): Promise<boolean> {
+  const s = await getPage(accountId);
+  const src = await waitForKernel(getExecutorSource(), kernelSignal(s));
+  if (!src) return false;
+  try { await send(s, 'Runtime.evaluate', { expression: src }); return true; } catch { return false; }
+}
+
+/** 执行页面类命令:确保 __nbExec 在位 → window.__nbExec(command, params)。返回执行器结果对象。 */
+export async function kernelExec(accountId: string, command: string, params: any, timeoutMs?: number): Promise<any> {
+  const operation = operationForCommand(command, String(params?.selector || params?.textSelector || ''));
+  const execute = async () => {
+  let present = false;
+  try { present = await kernelEval(accountId, "typeof window.__nbExec==='function'"); } catch { present = false; }
+  if (!present) {
+    const ok = await injectExecutor(accountId);
+    if (!ok) return { ok: false, error: 'executor_unavailable(后端 /api/matrix/command-executor 未就绪?)' };
+  }
+  const expr = 'window.__nbExec(' + JSON.stringify(command) + ',' + JSON.stringify(params || {}) + ')';
+  return await kernelEval(accountId, expr, timeoutMs);
+  };
+  return operation ? withAutomationOperation(await getPage(accountId), operation, execute) : execute();
+}
+
+// 可信按键(CDP Input.dispatchKeyEvent;比 JS 合成 KeyboardEvent 的 isTrusted=false 强)。
+// 剧本搜索框提交用 keypress Enter。
+export interface TrustedInputTarget { selector: string; url: string; text: string; }
+export interface TrustedClickTarget extends TrustedInputTarget { clickSelector: string; }
+
+async function assertInputTarget(s: KernelSession, target: TrustedInputTarget, requireSelection = false): Promise<void> {
+  const expression = `(function(){const e=document.querySelector(${JSON.stringify(target.selector)});
+    if(location.href!==${JSON.stringify(target.url)}||!e||!e.contains(document.activeElement))return false;
+    if((e.textContent||'').replace(/\\u200b/g,'').trim()!==${JSON.stringify(target.text)})return false;
+    return ${requireSelection ? `(window.getSelection()?.toString()||'').replace(/\\u200b/g,'').trim()===${JSON.stringify(target.text)}` : 'true'};})()`;
+  const reply = await send(s, 'Runtime.evaluate', { expression, returnByValue: true });
+  if (reply?.result?.value !== true) throw new Error('输入前视频、焦点或评论正文发生变化，本次未输入');
+}
+
+export async function kernelKeypress(accountId: string, key: string, target?: TrustedInputTarget): Promise<void> {
+  const s = await getPage(accountId);
+  return withAutomationOperation(s, /^(Enter|Return)$/i.test(key) ? 'interaction' : 'input', async () => {
+    if (target) await assertInputTarget(s, target, key === 'Backspace');
+    const KEYS: Record<string, any> = {
+      Enter: { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, text: '\r' },
+      Backspace: { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
+    };
+    const k = KEYS[key] || { key, code: key };
+    await send(s, 'Input.dispatchKeyEvent', { type: 'keyDown', ...k });
+    await send(s, 'Input.dispatchKeyEvent', { type: 'keyUp', ...k });
+
+  });
+}
+
+export async function kernelClick(accountId: string, x: number, y: number, target?: TrustedClickTarget): Promise<void> {
+  const s = await getPage(accountId);
+  let before: any, expression = '', kind: Operation = 'input';
+  if (s.automation) {
+    expression = `(function(){var e=document.elementFromPoint(${Number(x)},${Number(y)});if(!e)return null;
+      var b=e.closest('button,[role="button"],a,[data-e2e]')||e;
+      return {url:location.href,tag:b.tagName,id:b.id,editable:!!e.closest('input,textarea,[contenteditable="true"],.DraftEditor-root'),kind:(b.getAttribute('data-e2e')||'')+' '+(b.getAttribute('data-testid')||''),label:b.getAttribute('aria-label')||'',text:(b.innerText||'').slice(0,80)};})()`;
+    before = (await send(s, 'Runtime.evaluate', { expression, returnByValue: true }))?.result?.value;
+    kind = before?.editable ? 'input' : operationForCommand('click', before ? `${before.kind} ${before.label} ${before.text}` : '') || 'input';
+  }
+  return withAutomationOperation(s, kind, async () => {
+  if (target) {
+    await assertInputTarget(s, target);
+    const expression = `(function(){const e=document.querySelector(${JSON.stringify(target.clickSelector)});const hit=document.elementFromPoint(${Number(x)},${Number(y)});return !!e&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&(hit===e||e.contains(hit));})()`;
+    const matched = await send(s, 'Runtime.evaluate', { expression, returnByValue: true });
+    if (matched?.result?.value !== true) throw new Error('发送按钮或遮挡状态变化，本次未点击');
+  }
+  if (s.automation) {
+    const after = (await send(s, 'Runtime.evaluate', { expression, returnByValue: true }))?.result?.value;
+    if (!before || JSON.stringify(before) !== JSON.stringify(after)) throw new Error('限速等待期间页面/点击目标变化，取消本次点击');
+  }
+  await send(s, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+  await send(s, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+  });
+}
+
+// 可信文本插入(CDP Input.insertText):像真键盘那样把整段文本插入【当前聚焦元素】,isTrusted=true、
+// 穿 shadow、ProseMirror/Slate 等富文本编辑器认(合成 KeyboardEvent + execCommand 它们都不认 → 字进不去,
+// 典型:B站评论 .brt-editor)。调用前需先把目标编辑器聚焦(可信点击)。
+export async function kernelInsertText(accountId: string, text: string, target?: TrustedInputTarget): Promise<void> {
+  const s = await getPage(accountId);
+  return withAutomationOperation(s, 'input', async () => {
+    if (target) await assertInputTarget(s, target);
+    await send(s, 'Input.insertText', { text: String(text || '') });
+
+  });
+}
+
+// 可信滚轮(CDP Input.dispatchMouseEvent mouseWheel):部分平台(小红书/快手创作中心)懒加载
+// 只认真实 wheel,JS scrollTop/scrollIntoView 触发不了。
+export async function kernelWheel(accountId: string, x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
+  const s = await getPage(accountId);
+  return withAutomationOperation(s, 'scroll', async () => {
+    await send(s, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x: x || 400, y: y || 400, deltaX: deltaX || 0, deltaY: deltaY || 0 });
+
+  });
+}
+
+/**
+ * 文件注入 —— 把本地视频灌进 file input(CDP DOM.setFileInputFiles)。
+ *
+ * setFileInputFiles 是标准 CDP 上传原语(Puppeteer/Playwright 同款),抖音/小红书/B站已验证可用。
+ * 唯一被改对的是【成功判据】:CDP 只在把文件真设进一个合法 file input 后才成功 resolve,所以"至少一个
+ * setFileInputFiles 没抛"本身就是成功信号。【不】事后回读 input.files.length —— React/受控组件(推特/
+ * TikTok/快手/头条)的 onChange 会立刻读走文件并清空 input.value → 回读恒 0 → 误报失败(抖音/小红书/B站
+ * 不清空才"碰巧"过)。旧扩展 upload_file_from_url 注入完也不回读,故无此坑。
+ *
+ * 深遍历 light DOM + open shadowRoot + 同源 iframe 收集候选 → 按 selector 过滤(没命中且 deep 时回退
+ * accept 含 video/mp4/空)→ 给所有命中的都 setFileInputFiles(多候选不确定哪个真,全设最稳)。
+ */
+export async function kernelSetFileInput(
+  accountId: string, selector: string, filePaths: string[], opts?: { deep?: boolean; single?: boolean },
+): Promise<{ ok: boolean; reason?: string; found: number; attached: number }> {
+  // 0) 本地文件先校验存在(对齐旧 uploadFileToInput 的 fs.existsSync 前置):路径错时给明确
+  //    file_not_found,而不是笼统的 set_file_input_failed —— 否则成片路径/合成失败也只会显示同一个错。
+  for (const fp of filePaths) {
+    if (!fp || !fs.existsSync(fp)) {
+      return { ok: false, reason: 'file_not_found:' + String(fp || '∅').slice(0, 120), found: 0, attached: 0 };
+    }
+  }
+  const s = await getPage(accountId);
+  return withAutomationOperation(s, 'input', async () => {
+    const sel = selector || '';
+    const deep = !!opts?.deep;
+    const single = !!opts?.single;
+    // 1) 深遍历收集候选 input 到 window.__mtxFI,返回数量。
+    //    ⚠️ 旧版只穿 shadowRoot 漏了同源 iframe;对齐旧客户端 uploadVideoToInputDeep 的三层深遍历,补 iframe.contentDocument。
+    //    single=true(图文上传用):最终只灌【一个】input(优先 accept 含 image 的),对齐扩展 uploadFileFromUrl 的
+    //    querySelector 单设 —— 否则"全设"把图也灌进图文页「添加文件」附件 input(accept 空/*),帖子冒出多余
+    //    nbmx_img.jpg 文件(图片本身 4 张仍正常)。视频上传不传 single,多候选仍"全设最稳"。
+    const collectExpr = `(function(sel, deep, single){
+      function collect(root, out){
+        try { root.querySelectorAll('input[type=file]').forEach(function(el){ out.push(el); }); } catch(e){}
+        var nodes=[]; try { nodes = root.querySelectorAll('*'); } catch(e){}
+        for (var i=0;i<nodes.length;i++){ var sr=null; try{ sr=nodes[i].shadowRoot; }catch(e){} if(sr) collect(sr,out); }
+        var fr=[]; try { fr = root.querySelectorAll('iframe,frame'); } catch(e){}
+        for (var j=0;j<fr.length;j++){ var idoc=null; try{ idoc=fr[j].contentDocument; }catch(e){} if(idoc) collect(idoc,out); }
+      }
+      var all=[]; collect(document, all);
+      var pick=[];
+      if(sel){ for(var i=0;i<all.length;i++){ try{ if(all[i].matches(sel)) pick.push(all[i]); }catch(e){} } }
+      if(!pick.length && (deep || !sel)){ pick = all.filter(function(el){ var a=(el.accept||'').toLowerCase(); return a.indexOf('video')>=0||a.indexOf('mp4')>=0||a===''; }); }
+      if(!pick.length && deep) pick = all;
+      if(single && pick.length > 1){
+        var imgs = pick.filter(function(el){ return (el.accept||'').toLowerCase().indexOf('image')>=0; });
+        pick = [ imgs.length ? imgs[0] : pick[0] ];
+      }
+      window.__mtxFI = pick;
+      return pick.length;
+    })(${JSON.stringify(sel)}, ${deep}, ${single})`;
+    const cnt: any = await send(s, 'Runtime.evaluate', { expression: collectExpr, returnByValue: true });
+    const n = Number(cnt?.result?.value || 0);
+    if (!n) return { ok: false, reason: 'no_input_matched(sel=' + (sel || '∅') + ',deep=' + deep + ')', found: 0, attached: 0 };
+    // 2) 逐个取 objectId → setFileInputFiles(单个失败继续,但记录第一条错误便于定位)。
+    //    ⚠️【成功判据 = setFileInputFiles 成功返回】CDP 只在把文件真设进一个合法 file input 后才成功 resolve,
+    //    所以"至少一个 setFileInputFiles 没抛"本身就是成功信号。不能再靠事后回读 input.files.length:
+    //    React/受控组件(推特/TikTok/快手/头条)的 onChange 会立刻读走文件并清空 input.value → 回读恒为 0 →
+    //    对这些平台误报失败(抖音/小红书/B站不清空才"碰巧"过)。旧扩展 upload_file_from_url 注入完不回读,故无此坑。
+    let firstErr = '';
+    let anySet = false;
+    for (let i = 0; i < n; i++) {
+      try {
+        const elRes: any = await send(s, 'Runtime.evaluate', { expression: `window.__mtxFI[${i}]`, returnByValue: false });
+        const objectId = elRes?.result?.objectId;
+        if (!objectId) { if (!firstErr) firstErr = 'no_objectId'; continue; }
+        await send(s, 'DOM.setFileInputFiles', { files: filePaths, objectId });
+        anySet = true;
+      } catch (e: any) { if (!firstErr) firstErr = String(e?.message || e).slice(0, 120); }
+    }
+    // 3) 辅助诊断:回读 files.length(仅作 attached 计数,不作成功/失败判据 —— 见上)。
+    const verify: any = await send(s, 'Runtime.evaluate', {
+      expression: `(function(){ var n=0; (window.__mtxFI||[]).forEach(function(el){ try{ if(el.files&&el.files.length) n++; }catch(e){} }); try{ delete window.__mtxFI; }catch(e){} return n; })()`,
+      returnByValue: true,
+    });
+    const attached = Number(verify?.result?.value || 0);
+    if (anySet) return { ok: true, found: n, attached };
+    // 找到了候选但每个 setFileInputFiles 都抛 → 真失败,带出 CDP 错误便于定位。
+    return { ok: false, reason: 'set_files_all_threw(found=' + n + (firstErr ? ',cdpErr=' + firstErr : '') + ')', found: n, attached: 0 };
+
+  });
+}
+
+/**
+ * 文件注入(页面世界 DataTransfer)—— 把视频字节构造成真 File 灌进 file input,再派 change/input 事件,
+ *   = 模拟【真人选文件】。这是 TikTok 创作端反爬 SDK(webmssdk)认的方式;CDP DOM.setFileInputFiles 会被它
+ *   识别/拒绝 → 上传到一半「task not exist」崩成「出错了请重试」。
+ *
+ * 字节怎么进页面(2026-06-24 改):**base64 经 CDP 直接灌**,不走网络。
+ *   原来走本地 sidecar http URL + 页面 fetch,但 TikTok Studio 是 https → 页面 fetch http://127.0.0.1 被挡
+ *   (混合内容/代理/CSP)→ 实测「inject_Failed to fetch」→ 回落 CDP → 还是被 TikTok 拒。改成把文件读成 base64、
+ *   用 Runtime.callFunctionOn 当【参数】传进页面(不进表达式源码、不走网络)→ 页面里 atob 解码成 File → DataTransfer。
+ *   彻底绕开 fetch 的所有坑。大文件(>80MB)base64 太大伤 CDP 通道 → 放弃这条让上层回落。
+ */
+export async function kernelSetFileInputViaDataTransfer(
+  accountId: string,
+  filePath: string,
+  opts?: { mimeType?: string; ttlMs?: number },
+): Promise<{ ok: boolean; reason?: string; bytes?: number }> {
+  if (!sessions.get(accountId)) return { ok: false, reason: 'no_session' };
+  const fsMod = require('fs');
+  if (!fsMod.existsSync(filePath)) return { ok: false, reason: 'file_not_found' };
+  const s = await getPage(accountId);
+  return withAutomationOperation(s, 'input', async () => {
+    const pathMod = require('path');
+    const fileName = pathMod.basename(filePath);
+    const mime = opts?.mimeType || 'video/mp4';
+    let b64: string;
+    try {
+      const buf: Buffer = fsMod.readFileSync(filePath);
+      if (buf.length > 80 * 1024 * 1024) return { ok: false, reason: 'file_too_large_for_b64(' + buf.length + ')' };
+      b64 = buf.toString('base64');
+    } catch (e: any) { return { ok: false, reason: 'read_failed:' + String(e?.message || e).slice(0, 60) }; }
+    // 三层深遍历底座(顶层 + 同源 iframe + open shadowRoot)定位 file input。
+    const DEEP = 'function nbDeepAll(sel){var out=[];function walk(root,d){if(!root||d>6)return;'
+      + 'try{var m=root.querySelectorAll(sel);for(var i=0;i<m.length;i++)out.push(m[i]);}catch(e){}'
+      + 'var all=[];try{all=root.querySelectorAll("*");}catch(e){}'
+      + 'for(var k=0;k<all.length;k++){var sr=null;try{sr=all[k].shadowRoot;}catch(e){}if(sr)walk(sr,d+1);}'
+      + 'var fr=[];try{fr=root.querySelectorAll("iframe,frame");}catch(e){}'
+      + 'for(var j=0;j<fr.length;j++){var idoc=null;try{idoc=fr[j].contentDocument;}catch(e){}if(idoc)walk(idoc,d+1);}}'
+      + 'walk(document,0);return out;}';
+    const findExpr = '(function(){' + DEEP
+      + 'var ins=nbDeepAll(\'input[type="file"]\');var input=null;'
+      + 'for(var i=0;i<ins.length;i++){var ac=ins[i].getAttribute("accept")||"";if(ac.indexOf("video")>=0||ac.indexOf("mp4")>=0){input=ins[i];break;}}'
+      + 'if(!input&&ins.length)input=ins[0];return input;})()';
+    // 在页面里:base64(参数) → Uint8Array → File → DataTransfer → input.files → 派 change/input。
+    const fnDecl = 'function(b64,name,mime){try{'
+      + 'var input=this;if(!input)return JSON.stringify({ok:false,reason:"no_input"});'
+      + 'var bin=atob(b64);var len=bin.length;var bytes=new Uint8Array(len);for(var i=0;i<len;i++)bytes[i]=bin.charCodeAt(i);'
+      + 'var win=(input.ownerDocument&&input.ownerDocument.defaultView)||window;'
+      + 'var file=new win.File([bytes],name,{type:mime});'
+      + 'var dt=new win.DataTransfer();dt.items.add(file);input.files=dt.files;'
+      + 'input.dispatchEvent(new win.Event("change",{bubbles:true}));'
+      + 'input.dispatchEvent(new win.Event("input",{bubbles:true}));'
+      + 'return JSON.stringify({ok:true,bytes:len});'
+      + '}catch(e){return JSON.stringify({ok:false,reason:"inject_"+String(e&&e.message||e).slice(0,80)});}}';
+    try {
+      try { await send(s, 'Page.setBypassCSP', { enabled: true }); } catch { /* 非关键 */ }
+      const found: any = await send(s, 'Runtime.evaluate', { expression: findExpr, returnByValue: false });
+      const objectId = found?.result?.objectId;
+      if (!objectId) return { ok: false, reason: 'no_input_matched' };
+      const r: any = await send(s, 'Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: fnDecl,
+        arguments: [{ value: b64 }, { value: fileName }, { value: mime }],
+        returnByValue: true,
+      });
+      let v: any = null;
+      try { v = r?.result?.value ? JSON.parse(r.result.value) : null; } catch { /* ignore */ }
+      if (v && v.ok === true) return { ok: true, bytes: v.bytes };
+      return { ok: false, reason: (v && v.reason) || 'inject_no_result' };
+    } catch (e: any) {
+      return { ok: false, reason: 'dt_inject_threw:' + String(e?.message || e).slice(0, 100) };
+    }
+
+  });
+}
+
+/**
+ * 文件注入(真实文件选择器拦截)—— 最贴近【人手动选文件】,TikTok 专用:
+ *   合成 DataTransfer(isTrusted=false)被 webmssdk 拒;直接 setFileInputFiles(跳过站点上传按钮)→ 上传会话
+ *   没初始化 →「task not exist / 出错了」。手动之所以行,是【点了站点自己的上传按钮】(跑 onClick 初始化会话+埋点)
+ *   且 change 事件 isTrusted=true。本函数把两者都满足:
+ *     ① Page.setInterceptFileChooserDialog 开拦截(原生选择器不真弹);
+ *     ② 在上传按钮中心派【可信鼠标点击】(Input 域 = 真实用户手势)→ 站点 onClick → input.click() → 触发选择器;
+ *     ③ 拦到 fileChooserOpened 的 backendNodeId → DOM.setFileInputFiles 喂文件(浏览器原生设置 = isTrusted=true)。
+ *   findButtonExpr:页面里定位上传按钮、scrollIntoView 后返回其中心【视口坐标】{x,y} 的 JS(找不到返回 null)。
+ */
+export async function kernelSetFileInputViaChooser(
+  accountId: string,
+  filePath: string,
+  findButtonExpr: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  if (!sessions.get(accountId)) return { ok: false, reason: 'no_session' };
+  const fsMod = require('fs');
+  if (!fsMod.existsSync(filePath)) return { ok: false, reason: 'file_not_found' };
+  const s = await getPage(accountId);
+  return withAutomationOperation(s, 'input', async () => {
+    try {
+      // ① 找上传按钮中心坐标(页面 JS 算 getBoundingClientRect 中心)。
+      const posRes: any = await send(s, 'Runtime.evaluate', { expression: findButtonExpr, returnByValue: true });
+      const pos = posRes?.result?.value;
+      if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') {
+        return { ok: false, reason: 'upload_button_not_found' };
+      }
+      // ② 开文件选择器拦截 + 武装等待者(onMessage 收到 fileChooserOpened 时 resolve)。
+      await send(s, 'Page.setInterceptFileChooserDialog', { enabled: true });
+      const chooserP = new Promise<any>((resolve, reject) => {
+        const timer = setTimeout(() => { s.fileChooserWaiter = null; reject(new Error('fileChooser_timeout')); }, 15000);
+        s.fileChooserWaiter = (params) => { clearTimeout(timer); resolve(params); };
+      });
+      // ③ 在按钮中心派可信鼠标点击(Input 域 = isTrusted=true 用户手势)→ 站点 onClick → input.click() → 弹选择器(被拦)。
+      await send(s, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: pos.x, y: pos.y });
+      await send(s, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: pos.x, y: pos.y, button: 'left', buttons: 1, clickCount: 1 });
+      await send(s, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: pos.x, y: pos.y, button: 'left', buttons: 0, clickCount: 1 });
+      // ④ 等 fileChooserOpened → setFileInputFiles 喂文件(原生设置,触发 isTrusted=true 的 change)。
+      let params: any;
+      try { params = await chooserP; }
+      catch (e: any) { try { await send(s, 'Page.setInterceptFileChooserDialog', { enabled: false }); } catch { /* ignore */ } return { ok: false, reason: String(e?.message || e).slice(0, 60) }; }
+      const backendNodeId = params?.backendNodeId;
+      if (!backendNodeId) { try { await send(s, 'Page.setInterceptFileChooserDialog', { enabled: false }); } catch { /* ignore */ } return { ok: false, reason: 'no_backendNodeId' }; }
+      await send(s, 'DOM.setFileInputFiles', { files: [filePath], backendNodeId });
+      try { await send(s, 'Page.setInterceptFileChooserDialog', { enabled: false }); } catch { /* ignore */ }
+      return { ok: true };
+    } catch (e: any) {
+      try { s.fileChooserWaiter = null; await send(s, 'Page.setInterceptFileChooserDialog', { enabled: false }); } catch { /* ignore */ }
+      return { ok: false, reason: 'chooser_inject_threw:' + String(e?.message || e).slice(0, 100) };
+    }
+
+  });
+}
+
+/**
+ * 往可编辑框「真键盘」打字(CDP Input 域,isTrusted=true)—— TikTok caption 专用:
+ *   合成打字(execCommand insertText,isTrusted=false)会被 webmssdk 识破 → 上传后「出错了」掐掉。
+ *   手动填描述是真键盘,所以没事。本函数复刻:可信点击聚焦 → 真键 Ctrl+A/Cmd+A 全选清空预填文件名 →
+ *   Input.insertText 原生提交文本(isTrusted=true)。selector 支持逗号多选,取首个匹配。
+ */
+export async function kernelTypeIntoEditorNative(
+  accountId: string,
+  selector: string,
+  text: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  if (!sessions.get(accountId)) return { ok: false, reason: 'no_session' };
+  const s = await getPage(accountId);
+  return withAutomationOperation(s, 'input', async () => {
+    try {
+      const findExpr = '(function(){var el=document.querySelector(' + JSON.stringify(selector) + ');if(!el)return null;'
+        + 'try{el.scrollIntoView({block:"center"});}catch(e){}var r=el.getBoundingClientRect();'
+        + 'if(r.width<1||r.height<1)return null;return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+Math.min(r.height/2,18))};})()';
+      const posRes: any = await send(s, 'Runtime.evaluate', { expression: findExpr, returnByValue: true });
+      const pos = posRes?.result?.value;
+      if (!pos || typeof pos.x !== 'number') return { ok: false, reason: 'editor_not_found' };
+      // 可信点击聚焦(Input 域 = isTrusted=true)。
+      await send(s, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: pos.x, y: pos.y });
+      await send(s, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: pos.x, y: pos.y, button: 'left', buttons: 1, clickCount: 1 });
+      await send(s, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: pos.x, y: pos.y, button: 'left', buttons: 0, clickCount: 1 });
+      await new Promise((r) => setTimeout(r, 200));
+      // 清掉 TikTok 预填的文件名:真键全选 → Backspace 删除。⚠️ 之前只发 keyDown A(modifiers:2)不生效,
+      //   DraftEditor 要【修饰键先真按下】才认全选 → 用完整序列(modifier rawKeyDown → A down/up → modifier up),
+      //   Ctrl+A 与 Cmd+A 各来一遍(内核按仿真 OS 认其一),再 Backspace 删掉选区。
+      const selectAll = async (mKey: string, mCode: string, mVk: number, mBit: number) => {
+        await send(s, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', modifiers: mBit, key: mKey, code: mCode, windowsVirtualKeyCode: mVk, nativeVirtualKeyCode: mVk });
+        await send(s, 'Input.dispatchKeyEvent', { type: 'keyDown', modifiers: mBit, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65 });
+        await send(s, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers: mBit, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65 });
+        await send(s, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers: 0, key: mKey, code: mCode, windowsVirtualKeyCode: mVk, nativeVirtualKeyCode: mVk });
+      };
+      await selectAll('Control', 'ControlLeft', 17, 2);
+      await selectAll('Meta', 'MetaLeft', 91, 8);
+      // Backspace 删除选区(真键)。
+      await send(s, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+      await send(s, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+      await new Promise((r) => setTimeout(r, 80));
+      // 原生提交文本(isTrusted=true)。
+      await send(s, 'Input.insertText', { text });
+      return { ok: true };
+    } catch (e: any) {
+      return { ok: false, reason: 'type_native_threw:' + String(e?.message || e).slice(0, 100) };
+    }
+
+  });
+}
+
+// 清空该号浏览器全部 cookie(断开关联用:登出但保留 profile/指纹/配置)。
+export async function kernelClearCookies(accountId: string, cleanupOwner?: object): Promise<void> {
+  try {
+    const s = await getPage(accountId, cleanupOwner);
+    const fence = getAccount(accountId)?.authority ? accountAuthority.captureAssociation(accountId) : undefined;
+    await cookieMutation(s, 'Network.clearBrowserCookies', {}, undefined, fence);
+    coworkLog('INFO', 'matrix-cookies', `[${diagnosticAccountAlias(accountId)}] clear browser cookies succeeded (explicit disconnect)`);
+  } catch (error) {
+    coworkLog('ERROR', 'matrix-cookies', `[${diagnosticAccountAlias(accountId)}] clear browser cookies failed (explicit disconnect)`);
+    throw error;
+  }
+}
+
+// ── 导入 cookie 登录:把外部(普通浏览器 Cookie-Editor 导出)的登录 cookie 灌进本号 profile ──
+//   行业标准做法:海外号(Google/Apple 登录)、已在其它浏览器登录过的号,不在指纹内核里跑 OAuth,而是注入已登录 cookie。
+//   cookie 项对齐 Cookie-Editor 导出格式({name,value,domain,path,secure,httpOnly,sameSite,expirationDate})。
+//   走 CDP Network.setCookie(与 checkKernelLogin 的 getAllCookies 同一套通道)。
+export async function kernelSetCookies(accountId: string, cookies: any[]): Promise<{ set: number; failed: number }> {
+  const incumbent = sessions.get(accountId);
+  const fence = getAccount(accountId)?.authority ? accountAuthority.captureAssociation(accountId) : undefined;
+  const s = await getPage(accountId);
+  if (incumbent !== s) throw new Error('navigation:cancelled');
+  let set = 0, failed = 0;
+  for (const c of (Array.isArray(cookies) ? cookies : [])) {
+    try {
+      const name = String((c && c.name) || '').trim();
+      if (!name) { failed++; continue; }
+      const p: any = { name, value: String((c && c.value) != null ? c.value : ''), path: (c && c.path) || '/', httpOnly: !!(c && c.httpOnly), secure: (c && c.secure) !== false };
+      const domain = String((c && c.domain) || '').trim();
+      if (domain) p.domain = domain; else if (c && c.url) p.url = c.url;
+      const ss = String((c && c.sameSite) || '').toLowerCase();
+      if (ss === 'no_restriction' || ss === 'none') p.sameSite = 'None';
+      else if (ss === 'lax') p.sameSite = 'Lax';
+      else if (ss === 'strict') p.sameSite = 'Strict';
+      if (typeof (c && c.expirationDate) === 'number') p.expires = c.expirationDate;
+      else if (typeof (c && c.expires) === 'number') p.expires = c.expires;
+      if (p.sameSite === 'None') p.secure = true; // SameSite=None 必须 Secure,否则被拒
+      const r = await cookieMutation(s, 'Network.setCookie', p, undefined, fence);
+      if (r && r.success === false) failed++; else set++;
+    } catch (error) {
+      if (getAccount(accountId)?.authority) throw error;
+      failed++;
+    }
+  }
+  return { set, failed };
+}
+
+// ── 登录态检测(读 cookie;httpOnly 也能经 CDP 读到,document.cookie 读不到) ──
+
+// 各平台「已登录」的标志性 cookie(命中任一即视为已登录)。2026-06-21 全平台真机 CDP 实测核对:
+//   kuaishou 原 web_st 是错的 → 真实 webday7_st;binance/youtube 原本没有 → 补上。
+const LOGIN_COOKIES: Record<string, string[]> = {
+  // ⚠️ 只认真正登录态的 session cookie。原来还带 sid_guard / passport_auth_status,但抖音对【未登录
+  // 游客】访问 douyin.com 也会下发这俩 → 一打开登录页就被误判「已关联」(跟小红书 web_session 同款坑)。
+  // sessionid / sessionid_ss 是登录后才有的会话令牌,游客没有。【须真机复核:游客态确认无这两个】。
+  douyin: ['sessionid', 'sessionid_ss'],
+  xhs: ['web_session'],
+  bilibili: ['SESSDATA', 'DedeUserID'],
+  shipinhao: ['sessionid', 'wxuin'],
+  kuaishou: ['kuaishou.server.webday7_st'],   // 主站 www.kuaishou.com 登录令牌(⚠️ 只认 webday7_st:userId 游客也有、登出后残留会误放行)
+  // 快手创作者中心 cp.kuaishou.com:独立登录态(主站登录不覆盖,实测)。cp 专属会话令牌。
+  kuaishou_creator: ['kuaishou.web.cp.api_st'],
+  toutiao: ['sessionid', 'sso_uid_tt'],
+  tiktok: ['sessionid', 'sid_tt'],
+  x: ['auth_token'],
+  binance: ['logined', 'p20t'],                          // 新增(实测)
+  youtube: ['LOGIN_INFO'],   // 只认 LOGIN_INFO:SID/SAPISID 是 Google 全站 cookie、游客也有,会把登出的 YT 号误判已登录
+  // ⚠️ 待 VPN 真机确认(2026-07-03 加):IG 登录态标志 cookie = sessionid + ds_user_id(后者明文=uid);
+  //   FB = c_user(明文=uid)+ xs。海外平台,须 VPN 真机核对 cookie 名。
+  instagram: ['sessionid', 'ds_user_id'],
+  facebook: ['c_user', 'xs'],
+  // Reddit 登录态:reddit_session(会话)+ token_v2(新版 JWT)。任一在即过快筛;活体/身份用 /api/me.json 确认。
+  reddit: ['reddit_session', 'token_v2'],
+  // ── 交易所广场三家(2026-07-31 真机勘察)──
+  // ⚠️ 这三家都是【游客也下发同名 cookie、靠值区分登录态】,所以必须写成 'name=value' 形式
+  //    (needHit 支持带值判据)。只写名字会把未登录的号误判成已登录。
+  gate: ['is_login=1'],     // 真机实测:登录态 is_login=1(明文,非 httpOnly)
+  bybit: ['isLogin=1'],     // 真机实测:登录态 isLogin=1(注意驼峰,与 Gate 的下划线写法不同)
+  // ⚠️ bitget 【故意不登记】—— 它的登录 cookie 还没真机确认(2026-08-03 复勘时浏览器侧读不到 cookie,
+  //    只确认了接口判据)。这里绝不能填占位值:快筛的语义是"一条都没命中就直接 return false",
+  //    填个假名字等于把 Bitget 号全部判成未登录、功能直接不可用。未确认前走 COOKIE_FASTPATH_EXEMPT
+  //    豁免 + ② 的接口判据(见 checkKernelLoginInner 的 bitget 分支,已是明确判据,不再是"默认放行")。
+};
+
+// Platform domains used by the existing login/home URLs. Same-name cookies from another site are unrelated.
+const LOGIN_DOMAINS: Record<string, string> = {
+  douyin: 'douyin.com', xhs: 'xiaohongshu.com', bilibili: 'bilibili.com',
+  shipinhao: 'weixin.qq.com', kuaishou: 'kuaishou.com', kuaishou_creator: 'kuaishou.com',
+  toutiao: 'toutiao.com', tiktok: 'tiktok.com', x: 'x.com', binance: 'binance.com',
+  youtube: 'youtube.com', instagram: 'instagram.com', facebook: 'facebook.com', reddit: 'reddit.com',
+  gate: 'gate.com', bybit: 'bybit.com', bitget: 'bitget.com', okx: 'okx.com',
+};
+
+// 跳过 ① cookie 快筛的平台 —— 只靠下面 ② 的 DOM/localStorage/接口正向判据。
+//   binance:重 WAF,session cookie 名多变,登录着也常没 logined/p20t,硬卡会误杀好号。
+//   bitget :登录 cookie 尚未真机确认(见上),先豁免;② 已有接口判据 + ③.0 严格兜底,不会再假放行。
+//   okx    :登录 cookie 尚未真机确认(同 bitget),先豁免;② 已有 DOM 判据 + ③.0 严格兜底。
+const COOKIE_FASTPATH_EXEMPT = new Set<string>(['binance', 'bitget', 'okx']);
+
+// These platforms require a positive page/API result; absent evidence is unknown.
+const STRICT_LOGIN_PLATFORMS = new Set<string>(['bitget', 'okx']);
+
+/** true=已确认登录; false=明确未登录; null=检测未完成/证据不足,不得改成已连接或过期。
+ *  统一活体校验(发布/涨粉/保活都调它)。分层:
+ *  ① cookie 快筛:标志性 cookie 不在 → 必然没登录(不开窗折腾);
+ *  ② 服务器活体确认:有认证接口的平台(小红书 /me、B站 /nav)直接问服务器,给明确答案就以它为准(最准);
+ *  ③ 通用兜底:没接口的平台,看【当前页是否被重定向到登录页】= 服务端判未登录(cookie 还在但已失效)。
+ *     仅当调用方已导航到【需登录才能进的页】(创作中心)时有意义;游客可看的首页 URL 不变 → 退回 cookie 结果。
+ *  关键认知:cookie 在 ≠ 登录有效(服务端可作废 session,cookie 仍在 profile 里)→ 必须有 ②/③ 的活体确认。
+ *  ⚠️ cookie 用 getAllCookies(读所有域),否则在 creator./cp./mp. 子域会漏掉挂在父域的登录 cookie。 */
+type LoginCheckReason = 'unsupported_platform' | 'page_unavailable' | 'page_not_ready' | 'wrong_host'
+  | 'cookies_unreadable_or_empty' | 'valid_platform_cookies_missing' | 'auth_cookie_missing'
+  | 'probe_error' | 'positive_marker_missing' | 'confirmed' | 'explicit_logout' | 'cookie_page_fallback'
+  | 'platform_restricted' | 'check_cancelled' | 'check_timeout';
+
+export async function checkKernelLogin(accountId: string, platform: string): Promise<boolean | null> {
+  const diagnostic: { reason: LoginCheckReason; restriction?: string } = { reason: 'page_unavailable' };
+  const startedAt = Date.now();
+  let attempts = 0, ok: boolean | null = null;
+  let lastUnknownReason: LoginCheckReason | undefined;
+  const originalSession = sessions.get(accountId);
+  const fence = getAccount(accountId)?.authority ? accountAuthority.captureAssociation(accountId) : undefined;
+  const connection = originalSession?.pageWs;
+  const isCurrent = () => sessions.get(accountId) === originalSession &&
+    (!connection || originalSession?.pageWs === connection) && (!fence || accountAuthority.isCurrentAssociation(fence));
+  if (platform === 'tiktok' && originalSession) {
+    const controller = new AbortController();
+    const timeout = new AbortController();
+    const operation = kernelSignal(originalSession);
+    const signal = AbortSignal.any([controller.signal, timeout.signal, ...(operation ? [operation] : [])]);
+    const timer = setTimeout(() => timeout.abort(), 24_000);
+    (originalSession.loginChecks ||= new Set()).add(controller);
+    try {
+      for (let index = 0; index <= 12; index++) {
+        signal.throwIfAborted();
+        if (!isCurrent()) throw new Error('session closed');
+        if (originalSession.loginRestriction && (originalSession.automation || originalSession.background)) { diagnostic.reason = 'platform_restricted'; break; }
+        attempts++;
+        ok = await waitForKernel(checkKernelLoginInner(accountId, platform, diagnostic, signal), signal);
+        if (!isCurrent()) throw new Error('session closed');
+        if (ok === null) lastUnknownReason = diagnostic.reason;
+        // Interactive login windows must be able to finish a user-handled challenge.
+        // Automated/background probes retain observed restrictions across calls.
+        if (diagnostic.restriction && (originalSession.automation || originalSession.background)) {
+          originalSession.loginRestriction = diagnostic.restriction;
+          const recovery = getAccount(accountId)?.recovery;
+          const coolingDown = diagnostic.restriction === 'rate_limited' && recovery?.reason === 'rate_limited'
+            && recovery.nextCheckAt > Date.now();
+          if (!coolingDown) setAccountStatus(accountId, 'limited', `页面需要人工检查：${diagnostic.restriction}`);
+        }
+        if (originalSession.loginRestriction && (originalSession.automation || originalSession.background)) {
+          ok = null; diagnostic.reason = 'platform_restricted'; break;
+        }
+        if (ok !== null || !['page_unavailable', 'page_not_ready', 'probe_error', 'positive_marker_missing',
+          'cookies_unreadable_or_empty', 'valid_platform_cookies_missing'].includes(diagnostic.reason)
+          || index === 12 || Date.now() - startedAt >= 24_000) break;
+        let pause: ReturnType<typeof setTimeout>;
+        try { await waitForKernel(new Promise<void>(resolve => { pause = setTimeout(resolve, 2000); }), signal); }
+        finally { clearTimeout(pause); }
+      }
+      signal.throwIfAborted();
+      if (!isCurrent()) throw new Error('session closed');
+      if (originalSession.loginRestriction && (originalSession.automation || originalSession.background)) {
+        ok = null; diagnostic.reason = 'platform_restricted';
+      }
+      if (ok === true && !originalSession.automation && !originalSession.background) delete originalSession.loginRestriction;
+    } catch {
+      ok = null;
+      const restriction = originalSession.automation ? automationSafety.blocked(accountId)?.code : undefined;
+      if (!originalSession.operationSignal?.aborted && restriction) {
+        originalSession.loginRestriction = restriction;
+        diagnostic.reason = 'platform_restricted';
+      } else diagnostic.reason = timeout.signal.aborted ? 'check_timeout' : 'check_cancelled';
+    } finally {
+      clearTimeout(timer);
+      originalSession.loginChecks?.delete(controller);
+    }
+  } else {
+    attempts = 1;
+    ok = await checkKernelLoginInner(accountId, platform, diagnostic);
+  }
+  // Keep one entry per live session; closing it releases the cache. No-session
+  // calls remain unknown without creating a poll log or a global account cache.
+  const session = sessions.get(accountId);
+  if (!isCurrent()) return null;
+  if (session && session === originalSession) {
+    const now = Date.now(), previous = session.lastLoginProbe;
+    if (!previous || previous.platform !== platform || previous.result !== ok
+      || previous.reason !== diagnostic.reason || now - previous.at >= 5 * 60 * 1000) {
+      session.lastLoginProbe = { platform, result: ok, reason: diagnostic.reason, at: now };
+      try {
+        if (platform === 'tiktok') session.navigation?.recordLogin(ok === null ? 'unknown' : ok ? 'confirmed' : 'signed_out', diagnostic.reason);
+        coworkLog('INFO', 'matrix-login', `[${diagnosticAccountAlias(accountId)}] login check`, {
+          platform, result: ok === null ? 'unknown' : ok, reason: diagnostic.reason,
+          attempts, elapsedMs: Date.now() - startedAt, lastUnknownReason,
+        });
+      } catch { /* Diagnostics must not change the login verdict. */ }
+    }
+  }
+  return ok;
+}
+
+async function checkKernelLoginInner(accountId: string, platform: string, diagnostic: { reason: LoginCheckReason; restriction?: string }, signal?: AbortSignal): Promise<boolean | null> {
+  const done = (result: boolean | null, reason: LoginCheckReason): boolean | null => { diagnostic.reason = reason; return result; };
+  const fence = getAccount(accountId)?.authority ? accountAuthority.captureAssociation(accountId) : undefined;
+  const evaluate = async (expression: string): Promise<any> => {
+    signal?.throwIfAborted();
+    if (!fence) return waitForKernel(kernelEval(accountId, expression), signal);
+    const s = sessions.get(accountId);
+    if (!s?.pageWs || s.navigation?.snapshot().state !== 'confirmed') throw new KernelNavigationError('ownership_unconfirmed');
+    const capability = {};
+    loginReadCapabilities.set(capability, { session: s, socket: s.pageWs, fence, expression, generation: s.navigation.snapshot().generation });
+    const result = await waitForKernel(send(s, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true },
+      12000, undefined, undefined, capability), signal);
+    return result?.result?.value;
+  };
+  if (!sessions.get(accountId)) return null;
+  try {
+    const domain = LOGIN_DOMAINS[platform];
+    if (!domain) return done(null, 'unsupported_platform');
+    signal?.throwIfAborted();
+    const s = await waitForKernel(getPage(accountId), signal);
+    const href = await evaluate('location.href');
+    let pageUrl: URL;
+    try { pageUrl = new URL(String(href || '')); } catch { return done(null, 'page_unavailable'); }
+    if (!/^https?:$/.test(pageUrl.protocol)) return done(null, 'page_unavailable');
+    const onPlatform = (host: string): boolean => host === domain || host.endsWith('.' + domain);
+    if (!onPlatform(pageUrl.hostname)) return done(null, 'wrong_host');
+    if (platform === 'tiktok') {
+      const restriction = await evaluate(AUTOMATION_RESTRICTION_EXPR);
+      if (typeof restriction !== 'string') return done(null, 'probe_error');
+      if (['captcha', 'login_wall', 'forbidden', 'account_flag', 'rate_limited'].includes(restriction)) {
+        diagnostic.restriction = restriction;
+        return done(null, 'platform_restricted');
+      }
+    }
+    if (!await evaluate('!!(document.body && document.body.childElementCount && document.readyState === "complete")')) return done(null, 'page_not_ready');
+    let cookies: any[] = [];
+    try { signal?.throwIfAborted(); const r = await waitForKernel(send(s, 'Network.getAllCookies', {}), signal); cookies = r?.cookies || []; } catch { /* fallback below */ }
+    if (!cookies.length) { try { signal?.throwIfAborted(); const r2 = await waitForKernel(send(s, 'Network.getCookies', {}), signal); cookies = r2?.cookies || []; } catch { /* No readable cookies means unknown, not logged out. */ } }
+    if (!cookies.length) return done(null, 'cookies_unreadable_or_empty');
+    cookies = cookies.filter((c: any) => c && String(c.value ?? '').length > 0
+      && (!c.expires || Number(c.expires) <= 0 || Number(c.expires) > Date.now() / 1000)
+      && onPlatform(String(c.domain || '').replace(/^\./, '').toLowerCase()));
+    if (!cookies.length) return done(null, 'valid_platform_cookies_missing');
+    const names = new Set<string>(cookies.map((c: any) => String(c.name)));
+    // cookie 名→值,供【带值判据】用(见下面 needHit)。
+    const valueByName = new Map<string, string>(cookies.map((c: any) => [String(c.name), String(c.value ?? '')]));
+    const need = LOGIN_COOKIES[platform] || [];
+    // LOGIN_COOKIES 的条目支持两种写法:
+    //   'sessionid'    —— 只要这个 cookie【存在】就算命中(绝大多数平台:登录才下发)
+    //   'is_login=1'   —— 必须存在【且值等于 1】才算命中
+    // 后者是给 Gate / Bybit 这类【游客也下发同名 cookie、靠值区分】的站点用的:它们登录态
+    // is_login=1 / isLogin=1,未登录是 0 —— 只按名字判会把未登录的号当成已登录放行,任务跑起来
+    // 才在发帖那步撞登录墙(用户看到的现象是"号明明没登录却被选中、白跑一轮")。
+    const needHit = (n: string): boolean => {
+      const eq = n.indexOf('=');
+      if (eq < 0) return names.has(n);
+      return valueByName.get(n.slice(0, eq)) === n.slice(eq + 1);
+    };
+    // ① cookie 快筛(binance 例外:重 WAF、session cookie 名多变,登录着也常没 logined/p20t → 硬卡会误判过期。
+    //    币安改成【不卡 cookie,交给下面 DOM/localStorage 正向判据】,绝不因 cookie 名对不上误杀好号)。
+    // ⚠️ cookies 读【空】≠ 没登录:CDP 抖动/页面未附着时 getAllCookies/getCookies 都可能空手而归,
+    //    上面已返回未知并保留原状态，不能把「读失败」当「未登录」或继续用 Cookie 兜底放行。
+    const hasLoginCookie = need.some(needHit);
+    if (!COOKIE_FASTPATH_EXEMPT.has(platform) && need.length > 0 && !hasLoginCookie) return done(false, 'auth_cookie_missing');
+    // ② 活体判定:对齐成熟开源 social-auto-upload(导航到创作/上传页 → 检测登录墙标记)。
+    //   【铁律:只在检到「明确未登录」证据(登录墙文字/元素、或接口明说未登录)时才判未登录;否则一律 "?" 交回 ③/cookie
+    //    → 绝不把登录着的好号误判过期】。有官方 isLogin 接口的(小红书/B站)用接口最准;其余用 social-auto-upload 的 DOM 标记。
+    //   ⚠️ DOM 标记须【已导航到创作页】后查(调用方 runMatrixPublish/taskRunner 发布前已导航 PUBLISHER_ANCHOR_URL=各创作页)。
+    let probe = '';
+    if (platform === 'xhs') {
+      // 小红书:/me 的 guest 标志(web_session 游客也下发 → 必须问接口)。guest:true=未登录,guest:false+user_id=已登录。
+      // ⚠️ 裸 fetch user/me 现在会被当【游客】返回 guest:true(接口要签名头 x-s/x-t)——
+      //   不能拿它当「未登录」证据(真机实测:页面登录着却被误判过期)。只信【正向】guest:false+user_id="1";
+      //   拿不到正向就查页面登录墙文字,有才判 "0",否则 "?" 交回兜底 —— 绝不误杀登录着的好号(铁律)。
+      probe = '(async function(){try{var r=await fetch("https://edith.xiaohongshu.com/api/sns/web/v2/user/me",{credentials:"include"});if(!r.ok)return "error";var j=await r.json();var d=(j&&j.data)||{};if(d.guest===false&&d.user_id)return "1";}catch(e){return "error";}try{var t=(document.body&&document.body.innerText)||"";if(/扫码登录|手机号登录|新用户.*扫码|登录后查看更多|登录发现更多/.test(t))return "0";}catch(e){return "error";}return "?";})()';
+    } else if (platform === 'bilibili') {
+      probe = '(async function(){try{var r=await fetch("https://api.bilibili.com/x/web-interface/nav",{credentials:"include"});if(!r.ok)return "error";var j=await r.json();var d=(j&&j.data)||{};if(d.isLogin===true)return "1";if(d.isLogin===false)return "0";return "error";}catch(e){return "error";}})()';
+    } else if (platform === 'toutiao') {
+      // 头条创作端:get_media_info 游客明说「user not login」(code 100004);登录态 code:0+data。
+      probe = '(async function(){try{var r=await fetch("https://mp.toutiao.com/mp/agw/media/get_media_info",{credentials:"include"});if(!r.ok)return "error";var j=await r.json();if(j){if(j.code===100004||/not login/i.test(String(j.message||"")))return "0";if(j.code===0&&j.data)return "1";}return "error";}catch(e){return "error";}})()';
+    } else if (platform === 'douyin') {
+      // social-auto-upload:creator.douyin.com 上传页未登录有「手机号登录/扫码登录」文字。登录着的页面没有。
+      probe = '(function(){try{var t=(document.body&&document.body.innerText)||"";if(/手机号登录|扫码登录|验证码登录|二维码登录|登录后即可/.test(t))return "0";return "?";}catch(e){return "error";}})()';
+    } else if (platform === 'kuaishou' || platform === 'kuaishou_creator') {
+      // 未登录判据:创作端 cp 落到「机构服务」;主站 www.kuaishou.com 登出显「立即登录/登录即可享受」(真机实测,原来漏了主站 → 误判已登录空搜)。
+      probe = '(function(){try{var t=(document.body&&document.body.innerText)||"";if(/机构服务/.test(t)||/扫码登录|手机号登录|立即登录|登录即可享受|登录后即可享受|登录发现更多/.test(t))return "0";return "?";}catch(e){return "error";}})()';
+    } else if (platform === 'shipinhao') {
+      // social-auto-upload:channels 发表页未登录有「扫码登录」,登录态有「发表视频」。
+      //   视频号是 wujie 重前端、跳登录页慢 → 靠调用方【先强制等 20s 让页面加载/跳转完】再查(见 runMatrixPublish),
+      //   这样这条 DOM 快照才可靠(否则赶在跳登录页前查会误判已登录)。
+      probe = '(function(){try{var t=(document.body&&document.body.innerText)||"";if(/扫码登录/.test(t))return "0";if(/发表视频/.test(t))return "1";return "?";}catch(e){return "error";}})()';
+    } else if (platform === 'tiktok') {
+      // Require a self navigation or an actionable Studio upload UI, not residual cookies alone.
+      probe = `(function(){try{
+        function visible(e){if(!e||!e.getClientRects().length)return false;var s=getComputedStyle(e);return s.visibility!=='hidden'&&s.display!=='none';}
+        if(/\\/(login|passport|signin|challenge|checkpoint|verify)(\\/|$)/i.test(location.pathname))return 'blocked:login';
+        if(document.querySelector('select[class*="SelectFormContainer"]'))return 'blocked:login';
+        if(Array.from(document.querySelectorAll('input[type="password"],input[autocomplete="one-time-code"]')).some(visible))return 'blocked:login';
+        if(Array.from(document.querySelectorAll('[role="dialog"],dialog')).some(function(e){return visible(e)&&/log\\s?in|sign\\s?in|sign\\s?up|登录|登入|注册/i.test(e.innerText||'');}))return 'blocked:login';
+        var restriction=${AUTOMATION_RESTRICTION_EXPR};
+        if(restriction)return restriction.indexOf('page_error:')===0?'?':'blocked:'+restriction;
+        var self=${TIKTOK_SELF_PROFILE_URL};
+        var nav=document.querySelector('[data-e2e="nav-profile"]');
+        if(self&&visible(nav))return '1';
+        if(/^\\/(?:tiktokstudio\\/)?upload\\/?$/.test(location.pathname)
+          &&Array.from(document.querySelectorAll('input[type="file"]')).some(function(e){return !e.disabled&&visible(e);}))return '1';
+        return '?';
+      }catch(e){return 'error';}})()`;
+    } else if (platform === 'binance') {
+      // 币安广场【正向优先】:登录态才有的 localStorage(operation_list_user_id / BN_FEED_KOL)或「分享您的洞见/
+      //   Share your」发帖框 → 明确判 "1"。这些是登录后才存在的强正向信号,拿它当权威(真机实测:登录着却被判过期,
+      //   根因是原来靠「顶部有登录/注册按钮」的反向扫描误命中促销位)。只在【登录墙文字】出现时才 "0",否则 "?"。
+      //   去掉原来的顶部 login/register CTA 扫描(误杀源)。
+      probe = '(function(){try{'
+        + 'try{if(localStorage.getItem("operation_list_user_id")||localStorage.getItem("BN_FEED_KOL"))return "1";}catch(e){}'
+        + 'var t=(document.body&&document.body.innerText)||"";'
+        + 'if(/分享您的洞见|分享你的洞见|Share your|发帖|发布动态/.test(t))return "1";'
+        + 'if(/Sign up to earn rewards|Join global crypto users|Discover real insights from verified|Log in to Binance|登录后即可|扫码登录|请先登录/i.test(t))return "0";'
+        + 'return "?";}catch(e){return "error";}})()';
+    } else if (platform === 'gate') {
+      // Gate 广场(2026-07-31 真机验):左侧导航「我的主页」登录后 href 才是 /zh/profile/{用户名};
+      //   未登录时拿不到用户名 → 找到「文案是我的主页且 href 带 /profile/」的链接 = 明确已登录。
+      //   ⚠️ 不能拿「发布」按钮/发帖框当正向判据 —— 真机实测【未登录页面照样渲染发帖框和发布按钮】,
+      //   点了才弹登录。负向只认明确的登录墙文字。
+      //   ⚠️ 2026-08-03 复勘:【原来那条「文案=我的主页」的判据已经失效】—— 真机(登录态)实测侧栏
+      //     那个链接是【纯图标、innerText 为空】(<a><div class="post-nav-item"><svg icon-CEX_Personal>),
+      //     文字只在宽屏展开时才有 → probe 一直回 "?",Gate 实际上全靠 ① 的 cookie is_login=1 单点judge。
+      //     改成【结构判据】:本人链接 = 带 .post-nav-item 的那个 /profile/ 链接;信息流里别人的链接
+      //     class 是 nickname、不含 post-nav-item,所以不会抓成别人的号。旧的文案判据保留做宽屏兼容。
+      probe = '(function(){try{'
+        + 'var as=document.querySelectorAll(\'a[href*="/profile/"]\');'
+        + 'for(var i=0;i<as.length;i++){if(as[i].querySelector(".post-nav-item"))return "1";}'
+        + 'for(var k=0;k<as.length;k++){if(/我的主页|My Profile/i.test((as[k].innerText||"").trim()))return "1";}'
+        + 'var t=(document.body&&document.body.innerText)||"";'
+        + 'if(/请先登录|扫码登录|登录后即可|Log ?in to continue/i.test(t))return "0";'
+        + 'return "?";}catch(e){return "error";}})()';
+    } else if (platform === 'bybit') {
+      // Bybit ByX(2026-08-03 真机勘察 · 登录态 + 游客态两态实测,取代原来的纯文字判据)。
+      //   判据 = 社区接口 POST /x-api/fht/social/v1/query/user/profile(空 body {} = 查【本人】):
+      //     登录 → ret_code:0 且 result.author_info.byx_uid 有值(实测 ZYE0NM)
+      //     游客 → 同样 HTTP 200:{"retCode":10007,"retMsg":"User authentication failed.","result":{}}
+      //   ⚠️ 两态的错误码字段名【不是同一个】:登录态回下划线 ret_code,游客态回驼峰 retCode
+      //     (两种响应出自不同网关层,实测如此)。所以正向认 author_info、负向认 retCode 10007,
+      //     别写成"没有 author_info 就是未登录" —— 那样限流/网关异常也会被判成未登录、好号被标过期。
+      //   ⚠️ 原来那对文字判据(前 2000 字找 Log In/Sign Up ↔ Deposit/Assets/Orders)【两态都不命中】:
+      //     真机实测登录态首屏是 Buy Crypto/Markets/Trade/ByX/Personal Center,游客态的 Log In 按钮
+      //     文字也不在 innerText 前段 → probe 恒回 "?",Bybit 一直只靠 ① 的 isLogin=1 cookie 单点判。
+      //     文字判据保留在最后做兜底(接口异常时仍有一线判据),但不再是主判据。
+      //   ⚠️ 必须 POST + content-type json + body "{}";GET 同一路径实测 404。
+      probe = '(async function(){try{'
+        + 'if(location.hostname.indexOf("bybit.com")<0)return "?";'
+        + 'var r=await fetch("/x-api/fht/social/v1/query/user/profile",{method:"POST",credentials:"include",headers:{accept:"application/json","content-type":"application/json"},body:"{}"});'
+        + 'if(!r.ok)return "error";'
+        + 'if(r.status===200){var j=await r.json();var a=j&&j.result&&j.result.author_info;'
+        + 'if(a&&a.byx_uid)return "1";'
+        + 'if(j&&(String(j.retCode)==="10007"||/authentication failed/i.test(String(j.retMsg||""))))return "0";}'
+        + 'var t=((document.body&&document.body.innerText)||"").slice(0,2000);'
+        + 'if(/\\bLog ?In\\b|\\bSign ?Up\\b/i.test(t))return "0";'
+        + 'if(/\\bDeposit\\b|\\bAssets\\b|\\bOrders\\b|充值|资产|订单/i.test(t))return "1";'
+        + 'return "?";}catch(e){return "error";}})()';
+    } else if (platform === 'bitget') {
+      // Bitget Insights(2026-08-03 真机勘察 · 未登录态实测)。
+      //   判据 = 自家接口 /v1/user/overview/userinfo(同域 GET、cookie 鉴权):
+      //     未登录 → HTTP 200 但 {"code":"00004","group":"common_token","msg":"Log in expired, please re-log in!"} ← 实测原文
+      //     登录   → 带 data 对象(Bitget 全站成功码 "00000")
+      //   ⚠️ 正向判据【故意不看具体字段名,只看 data 在不在】:登录态的 body 没拿到过(勘察时手上只有
+      //     未登录号),赌字段名 = 猜错就永远返回 "?" → 叠加下面 ③.0 的严格模式 = 【真登录的号也连不上】。
+      //     实测未登录 body 里【根本没有 data 键】,所以"有 data 就是登录"不会把游客放行。
+      //   ⚠️ 【为什么必须用接口、不能用侧栏 DOM】:真机实测 Bitget 未登录时侧栏照样渲染
+      //     「个人中心 / 设置 / 发布」,且 href 是固定的 /insights/profile(不像 Gate/OKX 那样带 uid)
+      //     —— 拿它当正向判据必然把游客判成已登录,正是本次「没登录却显示已连接」的同款陷阱。
+      //   跨域拿不到(实测 CORS 拒绝 + credentials),所以先判 hostname:不在 bitget 域上直接 "?"。
+      probe = '(async function(){try{'
+        + 'if(location.hostname.indexOf("bitget.com")<0)return "?";'
+        + 'var r=await fetch("/v1/user/overview/userinfo",{credentials:"include",headers:{accept:"application/json"}});'
+        + 'if(!r.ok)return "error";'
+        + 'var j=await r.json();'
+        + 'if(j&&String(j.code)==="00004")return "0";'
+        + 'var d=j&&j.data;'
+        + 'if(d&&typeof d==="object"&&Object.keys(d).length)return "1";'
+        + 'return "?";}catch(e){return "error";}})()';
+    } else if (platform === 'okx') {
+      // OKX 星球 Orbit(2026-08-03 真机勘察 · 登录态 + 游客态两态都实测)。
+      //   判据 = 侧栏导航「个人主页」链接的 href —— 【语言无关】,且顺带给出 uid:
+      //     游客 → /zh-hans/orbit/user/me         (class 还带 navItemDisabled)
+      //     登录 → /zh-hans/orbit/user/872870878072406018  ← 真机实测,尾段是纯数字 uid
+      //   同 Gate 的「我的主页 href 带用户名」路子。⚠️ 必须限定在导航项([class*=navItem])上取:
+      //     推荐关注/直播列表里全是同格式的【别人】的 /orbit/user/<数字> 链接,不限定就会拿别人的号当自己。
+      //   ⚠️ 不用接口:实测 /priapi/v5/content/ugc/* 在【登录态】也回 403(缺 OKX 防爬 header),
+      //     /priapi/v5/content/public/user-info 登录态回 code 50026 —— 两个都不能当判据。
+      //   ⚠️ 【别再试 SSR 兜底】(2026-08-03 实测已否掉):拉 /zh-hans/orbit 的 HTML 判 /orbit/user/<数字>
+      //     两头都错 —— ① 登录态带 cookie 拉到的 SSR 里侧栏【也是 /orbit/user/me】(uid 是客户端渲染后
+      //     才注入的,SSR 只有游客版) → 好号被判未登录;② 游客版 HTML 里【推荐关注/直播列表】本身就有
+      //     一堆别人的 /orbit/user/<数字> → 游客被判已登录。只能用实时 DOM,且必须在 orbit 页上查。
+      //   ⚠️ 侧栏是 SPA 渲染的,首查可能赶在渲染完之前 → 拿不到判据会被 ③.0 严格模式当成"未登录"。
+      //   🚨 2026-08-06 用户实测「OKX 跑的时候说登录过期,但号其实是好的」。原来 probe 只
+      //     「扫一次 + 等 1.5s + 再扫一次」,叠加 engageRunner 的 4.5s + 复判前 4s,整个判定窗口
+      //     只有约 11.5 秒 —— OKX 是重 SPA,再叠上代理/VPN,侧栏经常渲染不完,好号就被判过期、
+      //     还弹扫码窗骚扰用户。严格模式本身没错(它是 8/3「Bitget 没登录却显示已连接」的修法,
+      //     那次假绿的代价是白跑一轮 + 已计费),错在【没给判据足够时间拿到答案】。
+      //     改成轮询到有答案为止(最多 ~11s,每 900ms 一次):侧栏一渲染出来立刻返回,
+      //     登录态正常的号第一次扫就命中、不多花一毫秒;只有真拿不到才走到严格模式。
+      //   ⚠️ 拿不到答案时【带回诊断】(找到几个 navItem 链接、尾段长什么样、当前路径)。
+      //     原来一律返回裸 "?",于是「没渲染完」和「OKX 改了 href 格式」两种完全不同的原因
+      //     长得一模一样 —— 后者是【永久】误判(判据要求尾段是 6 位以上纯数字,格式一变就永远
+      //     拿不到答案),再怎么等也没用,只能靠这行日志认出来。
+      probe = '(async function(){try{'
+        + 'if(location.hostname.indexOf("okx.com")<0)return "?:not_okx_host";'
+        + 'var lastN=0,lastSegs="";'
+        + 'function scan(){var as=document.querySelectorAll(\'a[class*="navItem"][href*="/orbit/user/"]\');'
+        + ' lastN=as.length;var segs=[];'
+        + ' for(var i=0;i<as.length;i++){var h=(as[i].getAttribute("href")||"").split("?")[0];'
+        + '  var seg=h.replace(/\\/+$/,"").split("/").pop();segs.push(seg);'
+        + '  if(/^\\d{6,}$/.test(seg))return "1";'
+        + '  if(seg==="me")return "0";}'
+        + ' lastSegs=segs.slice(0,3).join(",");return "";}'
+        + 'for(var t=0;t<12;t++){var v=scan();if(v)return v;'
+        + ' await new Promise(function(r){setTimeout(r,900);});}'
+        + 'return "?:navItem="+lastN+(lastSegs?(" segs="+lastSegs):"")+" path="+location.pathname;'
+        + '}catch(e){return "?:err_"+String((e&&e.message)||e).slice(0,40);}})()';
+    } else if (platform === 'instagram') {
+      // IG:【语言无关】判据(UI 随 locale 变,不能靠文字)—— 登录墙有 username 输入框 / 或重定向到 /accounts/login。
+      //   登录态没有登录表单。只判 0,否则 "?" 交回 cookie。待 VPN 真机确认正向标记(如导航头像)。
+      //   ⚠️ 只查用户名框 + /accounts/login 不够:新号登录要过【验证码 / 二次校验】页,那儿两条都不命中
+      //     → "?" → ③ 兜底 return true → 判已登录、关掉窗口(用户 2026-08-06 实测)。补上
+      //     challenge/checkpoint/codeentry/two_factor 路径,以及可见的密码框/验证码输入框
+      //     —— 页面上还在要密码或验证码,就绝不可能是登录成功态。
+      probe = '(function(){try{'
+        + 'if(document.querySelector(\'input[name="username"]\'))return "0";'
+        + 'if(/\\/accounts\\/login|\\/challenge|\\/checkpoint|codeentry|two_factor|twofactor/i.test(location.pathname))return "0";'
+        + 'var e=document.querySelector(\'input[type="password"],input[autocomplete="one-time-code"],input[name*="verif" i],input[name*="code" i]\');'
+        + 'if(e&&e.offsetParent!==null)return "0";'
+        + 'return "?";}catch(e){return "error";}})()';
+    } else if (platform === 'facebook') {
+      // FB(2026-07-03 真机验):登录墙有 email 输入框 / 重定向 /login → "0";登录态有 [role=navigation]
+      //   + c_user 明文 cookie → 明确 "1"(真机实测 onLogin:false/hasNav:true)。都不是则 "?"。语言无关。
+      probe = '(function(){try{if(document.querySelector(\'input[name="email"]\')||/\\/login/.test(location.pathname))return "0";if(document.querySelector(\'[role="navigation"]\')&&document.cookie.indexOf("c_user=")>=0)return "1";return "?";}catch(e){return "error";}})()';
+    } else if (platform === 'reddit') {
+      // Reddit:/api/me.json 是 cookie 鉴权的 JSON 接口(不需 oauth)。登录态返回 {data:{name,...}} 或 {name,...};
+      //   未登录返回空 / 无 name。最准,语言无关。异常落 "?" 交回 cookie 快筛。
+      // ⚠️ 限流/出错(非 200)时 me.json 会返回无 name 的 body → 原来直接判 "0" 误杀活号(同 XHS 类)。加 r.ok 守卫:非 200 交回 "?"。
+      probe = '(async function(){try{var r=await fetch("/api/me.json",{credentials:"include",headers:{accept:"application/json"}});if(!r.ok)return "error";var j=await r.json();if(!j||j.error||j.errors)return "error";var d=(j&&j.data)||j||{};if(d&&d.name)return "1";return "0";}catch(e){return "error";}})()';
+    }
+    if (probe) {
+      try {
+        let v = await evaluate(probe);
+        // 【OKX 专属补救】它的判据是侧栏「个人主页」链接,【只有 orbit 页才有这个侧栏】。
+        //   扫码登录后浏览器往往停在账号中心 / 交易页(用户 2026-08-05 实拍:停在
+        //   okx.com/zh-hans/account/users),那里查不到判据 → 返回 "?" → 又因为 OKX 在
+        //   STRICT_LOGIN_PLATFORMS 里,"?" 直接判【未登录】→ 明明扫码登上了,卡片却一直显示
+        //   「尚未连接」,而且怎么重扫都一样(每次登完还是停在别的页)。
+        //   所以拿不到答案时,先把它导到 orbit 页再看一次。
+        //   ⚠️ 只在【当前不在 orbit 页】时才导航:互动任务本来就跑在 orbit 页上,那边 scan 直接有
+        //   答案,根本走不到这里,不会被打断。
+        // ⚠️ 判据现在会带诊断后缀("?:navItem=0 …"),所以别再用 v === '?' 比 —— 那样补救分支
+        //   永远进不去(这正是加诊断时最容易踩的一脚)。
+        // 🚨🚨 用户正在【手动登录】时绝不能碰他的页面。扫码/登录窗每 3s 轮询一次登录态,
+        //   而这段补救会把「okx.com 上但不在 /orbit」的页面直接导走 —— 登录页正好满足这个条件,
+        //   于是用户密码还没输完,页面就被刷回 orbit,来回几次根本登不上去
+        //   (用户 2026-08-06 实拍并明确抱怨)。判据拿不到答案是小事(最多多轮询一轮),
+        //   把人家正在填的表单冲掉是大事。两道守卫:
+        //     ① URL 像登录/验证页 → 不动;
+        //     ② 页面上有可见的密码框 / 验证码输入 → 不动(URL 认不出的登录弹窗也能兜住)。
+        if (String(v).charAt(0) === '?' && platform === 'okx') {
+          try {
+            const href = await evaluate('(function(){try{return location.href;}catch(e){return "";}})()');
+            const cur = typeof href === 'string' ? href : '';
+            // ⚠️ 只列【登录表单页】。别把 account/users、account/security 这类【登录成功后的
+            //   账号中心】算进来 —— 这段补救存在的理由恰恰就是「扫码登录后停在 account/users、
+            //   那儿查不到判据」(见上面注释),把它堵住等于让好号永远连不上
+            //   (2026-08-06 实测:已登录、页面停在 account/users,卡片一直「尚未连接」)。
+            //   真正在输密码的场景由下面那道【可见密码框】守卫兜住,它比 URL 准。
+            const looksLoginUrl = /\/(login|signin|sign-in|register|signup|passport)(\/|\?|#|$)/i.test(cur);
+            let userTyping = false;
+            try {
+              const t = await evaluate(
+                '(function(){try{var e=document.querySelector(\'input[type="password"],input[name*="verif" i],input[autocomplete="one-time-code"]\');'
+                + 'return !!(e&&e.offsetParent!==null);}catch(e){return false;}})()');
+              userTyping = t === true || t === 'true';
+            } catch { /* 读不到就按"没在输"处理,仍有 URL 那道守卫 */ }
+            if (looksLoginUrl || userTyping) {
+              coworkLog('INFO', 'kernelPool', `okx 判据无结果,但用户正在登录页${userTyping ? '(检到密码框)' : ''},不导航`);
+            } else if (cur.indexOf('okx.com') >= 0 && cur.indexOf('/orbit') < 0) {
+              await kernelNavigate(accountId, 'https://www.okx.com/zh-hans/orbit');
+              await new Promise((r) => setTimeout(r, 3500));   // 侧栏是 SPA 渲染,给它时间
+              v = await evaluate(probe);
+            } else if (cur.indexOf('/orbit') >= 0) {
+              // 已经在 orbit 页却轮询满 11s 还拿不到判据 = 侧栏很可能渲染卡住了(SPA 半死不活)。
+              //   重新导航一次给它一次重来的机会 —— 严格模式下这一步的代价是多花十几秒,
+              //   不做的代价是把好号判成过期 + 弹扫码窗。只重来一次,不循环。
+              await kernelNavigate(accountId, cur);
+              await new Promise((r) => setTimeout(r, 3500));
+              v = await evaluate(probe);
+            }
+          } catch { /* 导航失败就维持原答案,不改变判定 */ }
+        }
+        if (typeof v !== 'string') return done(null, 'probe_error');
+        if (v.startsWith('blocked:')) {
+          const restriction = v.slice('blocked:'.length);
+          diagnostic.restriction = ['captcha', 'forbidden', 'account_flag', 'rate_limited'].includes(restriction) ? restriction : 'login_wall';
+          return done(null, 'platform_restricted');
+        }
+        if (v === '1') return done(true, 'confirmed'); if (v === '0') return done(false, 'explicit_logout');
+        if (v === 'error' || String(v).startsWith('?:err_')) return done(null, 'probe_error');
+      } catch { return done(null, 'probe_error'); }
+    }
+    // No cookie-only fallback for TikTok or platforms with unreliable cookie names.
+    if (STRICT_LOGIN_PLATFORMS.has(platform) || platform === 'tiktok') return done(null, 'positive_marker_missing');
+    // Preserve other platforms' existing cookie + loaded-page fallback, but never on a read failure.
+    try {
+      const href = await evaluate('location.href');
+      if (!/^https?:\/\//i.test(String(href || ''))) return done(null, 'page_unavailable');
+      // 🚨 除登录页外,还必须认【验证/二次校验页】:challenge / checkpoint / 验证码输入 / 两步验证。
+      //   用户 2026-08-06 实测(IG 新号):停在验证码输入页时,probe 给不出答案 → 这条正则又不含
+      //   challenge → ③ 直接 return true 判已登录 → 扫码轮询收工、finally 关掉窗口,人验证码还没输完;
+      //   卡片翻「已连接」但身份读不出来,永远是空的。这类页面【绝不可能是登录成功态】,一律判未登录。
+      if (/(login|passport|signin|sign-in|account\/security|challenge|checkpoint|codeentry|two_factor|twofactor|\/verify)/i.test(String(href || ''))) return done(false, 'explicit_logout');
+    } catch { return done(null, 'page_unavailable'); }
+    return done(hasLoginCookie ? true : null, hasLoginCookie ? 'cookie_page_fallback' : 'positive_marker_missing');
+  } catch { return done(null, 'page_unavailable'); }
+}
+
+/**
+ * 把内核当前的【会话 cookie】固化为持久 cookie 写回 → 强制落盘到 userDataDir。
+ *
+ * 【为什么需要】扫码登录设的 sessionid/sessionid_ss 等常是【会话 cookie】(session=true、
+ *   无 expires),Chromium 只把它们留在【内存】,不写磁盘 cookie 库。登录窗被强杀(手动关窗 /
+ *   下次开同号时对残留进程 SIGKILL / 关闭超时兜底 kill)时来不及优雅刷盘 → 内存里的 sessionid
+ *   随进程消失。之后任务【新起内核】读磁盘 cookie(没 sessionid)→ checkKernelLogin cookie 快筛
+ *   直接判未登录 → 好号被误标「登录过期」。这正是「重连成功、一跑任务又提示未登录」的根因。
+ *
+ * 【做法】读全部 cookie,对会话/无过期的补一个远期 expires(180 天)后 Network.setCookies 写回。
+ *   持久 cookie 会进 Chromium 的 SQLite cookie 库并落盘,新起内核就能读到 → 登录态跨进程保持。
+ *   全程 try/catch,任何失败都不影响主流程(最坏退回原行为)。返回固化的 cookie 数(便于日志/自检)。
+ */
+export async function persistKernelCookies(accountId: string, signal?: AbortSignal): Promise<number> {
+  const s = sessions.get(accountId);
+  if (!s) return 0;
+  try {
+    signal?.throwIfAborted();
+    const fence = getAccount(accountId)?.authority ? accountAuthority.captureAssociation(accountId) : undefined;
+    const r = await waitForKernel(send(s, 'Network.getAllCookies', {}), signal);
+    signal?.throwIfAborted();
+    if (sessions.get(accountId) !== s) return 0;
+    const cookies: any[] = r?.cookies || [];
+    const far = Math.floor(Date.now() / 1000) + 180 * 24 * 3600;
+    const toSet = cookies
+      .filter((c) => c && c.name && (c.session === true || !c.expires || Number(c.expires) <= 0))
+      .map((c) => {
+        const p: any = {
+          name: String(c.name), value: String(c.value ?? ''),
+          domain: c.domain, path: c.path || '/',
+          secure: !!c.secure, httpOnly: !!c.httpOnly, expires: far,
+        };
+        // sameSite 必须是合法枚举;None 必须 secure,否则 setCookies 整批可能被拒。
+        if (c.sameSite === 'Strict' || c.sameSite === 'Lax') p.sameSite = c.sameSite;
+        else if (c.sameSite === 'None') { p.sameSite = 'None'; p.secure = true; }
+        return p;
+      });
+    if (!toSet.length) return 0;
+    signal?.throwIfAborted();
+    await cookieMutation(s, 'Network.setCookies', { cookies: toSet }, signal, fence);
+    return toSet.length;
+  } catch { return 0; }
+}
+
+// 读登录后的真实身份(昵称 / 平台号 / uid / 头像)。【昵称不在 cookie】—— 登录 cookie 是 httpOnly
+// 令牌;昵称要从各平台的页面 SSR / 接口读,uid 部分在明文 cookie、部分在页面。来源全部 2026-06-21
+// 真机 CDP 实测确定(见 reference_matrix_account_identity_sources)。
+export interface KernelIdentity { uid?: string; nickname?: string; displayId?: string; avatar?: string; observed?: { connectionEpoch: string; generation: number } }
+
+// 各平台「读身份」的页面表达式(在内核页里 eval;async 的靠 awaitPromise 兜)。返回 JSON 字符串。
+// Only the signed-in user's profile navigation is an identity source; feed authors are not.
+const TIKTOK_SELF_PROFILE_URL = `(function(){try{
+  var p=document.querySelector('[data-e2e="nav-profile"]');
+  var a=p&&(p.getAttribute('href')?p:p.querySelector('a[href]'));
+  if(!a)return '';
+  var u=new URL(a.getAttribute('href'),location.href);
+  if(u.protocol!=='https:'||!['www.tiktok.com','tiktok.com'].includes(u.hostname)||!/^\\/@[a-zA-Z0-9_.]+\\/?$/.test(u.pathname))return '';
+  return u.origin+u.pathname.replace(/\\/$/,'');
+}catch(e){return '';}})()`;
+
+const IDENTITY_EXPR: Record<string, string> = {
+  // 抖音:RENDER_DATA(SSR JSON)。nickname/uid/抖音号/头像。本人块可能是【驼峰】命名(头像兜底命中 avatarUrl 即印证),
+  //   所以抖音号同时认 unique_id/short_id(蛇形)与 uniqueId/shortId(驼峰)、short_id 兼容带引号或纯数字;
+  //   且 displayId 只在【本人昵称附近 ±1500 的块】里找(不全局乱抓推荐流里别人的号)。抓不到时回传 _dbg 本人块片段供定位。
+  douyin: '(function(){try{var el=document.getElementById("RENDER_DATA");var d="";try{d=decodeURIComponent((el&&el.textContent)||"");}catch(e){d=(el&&el.textContent)||"";}var n=d.match(/"nickname":"([^"]{1,40})"/),u=d.match(/"uid":"(\\d{6,25})"/),a=d.match(/"avatar_thumb":\\{"uri":"[^"]*","url_list":\\["([^"]+)"/)||d.match(/"avatarUrl":"([^"]+)"/);var ni=n?d.indexOf(n[0]):-1;var blk=ni>=0?d.slice(Math.max(0,ni-1500),ni+1500):d;var s=blk.match(/"unique_id":"([^"]{1,40})"/)||blk.match(/"uniqueId":"([^"]{1,40})"/),s2=blk.match(/"short_id":"?(\\d{3,40})"?/)||blk.match(/"shortId":"?(\\d{3,40})"?/);var did=(s&&s[1])||(s2&&s2[1])||null;var dbg=did?null:blk.slice(0,600);return JSON.stringify({nickname:n&&n[1],uid:u&&u[1],displayId:did,avatar:a&&(a[1]||"").replace(/\\\\u002F/g,"/"),_dbg:dbg});}catch(e){return "{}";}})()',
+  // 小红书:裸 fetch /me 已要签名头 x-s/x-t,没签名会被当【游客】返回 guest:true → 登录着也读不到身份
+  //   (登录 probe 早已因此不信 guest 字段,身份读取 2026-08-12 补上同款修复,不然「连接成功但没昵称」)。三层:
+  //   ① fetch /me 只信【正向】guest:false+user_id(签名放开/放行时字段最全:nickname/red_id/user_id/images);
+  //   ② 页面 SSR 状态 __INITIAL_STATE__.user 里的本人对象 —— 只点名查 userInfo/self/loginUser/me 这几个 key
+  //      并解一层 Vue ref 包裹(_value/_rawValue),字段兼容驼峰/蛇形双写。⚠️ 绝不做全树盲扫:user 子树里可能
+  //      挂着「看过的别人主页」的用户对象,盲扫会把别人的号当成本人(见身份来源 reference 的血泪教训)。
+  //   ③ 都拿不到 → 回传 _dbg(guest 标志 + user 子树 key 列表)进日志,照真机补字段用。
+  xhs: '(async function(){var dbg="";function pick(o){if(!o||typeof o!=="object")return null;var w=o._value||o._rawValue;if(w&&typeof w==="object")o=w;var nick=o.nickname||o.nickName;var rid=o.redId||o.red_id;if(nick&&rid)return{nickname:nick,displayId:String(rid),uid:String(o.userId||o.user_id||""),avatar:o.images||o.imageb||o.avatar||null};return null;}try{var r=await fetch("https://edith.xiaohongshu.com/api/sns/web/v2/user/me",{credentials:"include"});var j=await r.json();var d=(j&&j.data)||{};if(d.guest===false&&d.user_id)return JSON.stringify({nickname:d.nickname,displayId:d.red_id,uid:d.user_id,avatar:d.images||d.imageb});dbg+="me.guest="+d.guest+";";}catch(e){dbg+="me.err;";}try{var st=window.__INITIAL_STATE__;var u=st&&st.user;if(u){var names=["userInfo","self","loginUser","me","userinfo"];for(var i=0;i<names.length;i++){var hit=pick(u[names[i]]);if(hit)return JSON.stringify(hit);}dbg+="user.keys="+Object.keys(u).slice(0,12).join(",");}else{dbg+="noInitialState";}}catch(e){dbg+="state.err";}return JSON.stringify({_dbg:dbg});})()',
+  // B站:nav 接口最干净。uname/mid/face。
+  bilibili: '(async function(){try{var r=await fetch("https://api.bilibili.com/x/web-interface/nav",{credentials:"include"});var j=await r.json();var d=(j&&j.data)||{};if(!d.isLogin)return "{}";var mid=String(d.mid||"");return JSON.stringify({nickname:d.uname,uid:mid,displayId:mid,avatar:(d.face||"").replace(/^http:/,"https:")});}catch(e){return "{}";}})()',
+  // 推特X(真机实测 2026-06-22):本人 handle 从左侧导航 [data-testid="AppTabBar_Profile_Link"] 的 href 取
+  //   (任何登录页都在 → 比抓「第一个头像容器」稳:status/profile 页第一个是别人);再按 handle 精确取
+  //   [data-testid="UserAvatar-Container-<handle>"] 的 img.alt=昵称、img.src=头像(pbs.twimg.com,https);
+  //   uid 从 twid=u%3D<id> cookie。找不到导航时回落第一个头像容器。
+  x: '(function(){try{var prof=document.querySelector(\'[data-testid="AppTabBar_Profile_Link"]\');var handle=prof?((prof.getAttribute("href")||"").replace(/^\\//,"")||null):null;var avc=handle?document.querySelector(\'[data-testid="UserAvatar-Container-\'+handle+\'"]\'):null;if(!avc)avc=document.querySelector(\'[data-testid^="UserAvatar-Container-"]\');var avatar=null,nickname=null;if(avc){if(!handle)handle=((avc.getAttribute("data-testid")||"").match(/UserAvatar-Container-(.+)/)||[])[1]||null;var img=avc.querySelector("img");if(img){avatar=img.src||null;nickname=img.getAttribute("alt")||null;}if(!avatar){var nn=avc.querySelectorAll("*");for(var i=0;i<nn.length;i++){var bg=getComputedStyle(nn[i]).backgroundImage;var m=bg&&bg.match(/url\\((.+?)\\)/);if(m){avatar=m[1].replace(/[\\x22\\x27]/g,"");break;}}}}var uid=(document.cookie.match(/twid=u%3D(\\d+)/)||[])[1]||null;return JSON.stringify({nickname:nickname,displayId:handle?("@"+handle):null,uid:uid,avatar:avatar});}catch(e){return "{}";}})()',
+  // TikTok(真机实测 2026-06-22):__UNIVERSAL_DATA__ 的 SSR scope 现在恒空(旧 app-context 法已废)。
+  //   改读【个人主页 DOM】(由 IDENTITY_NAV_HINT 先跳 /@<号>):data-e2e="user-title"=昵称(如"Mochi Monkey")、
+  //   "user-subtitle"=TikTok号、"user-avatar" img=头像。本人导航、当前 URL、主页账号三者必须一致;
+  //   缺少确认则不更新身份。uid 用 uniqueId(TikTok 数字 uid 要签名接口,不取)。
+  tiktok: `(function(){try{
+    var self=${TIKTOK_SELF_PROFILE_URL};
+    if(!self||location.origin+location.pathname.replace(/\\/$/,'')!==self)return '{}';
+    var uid=new URL(self).pathname.slice(2);
+    var subtitle=document.querySelector('[data-e2e="user-subtitle"]');
+    if(!subtitle||(subtitle.textContent||'').trim().replace(/^@/,'').toLowerCase()!==uid.toLowerCase())return '{}';
+    var title=document.querySelector('[data-e2e="user-title"]');
+    var avatar=document.querySelector('[data-e2e="user-avatar"] img');
+    return JSON.stringify({uid:uid,displayId:'@'+uid,nickname:title?(title.textContent||'').trim()||null:null,avatar:avatar?avatar.src||null:null});
+  }catch(e){return '{}';}})()`,
+  // 快手:window.INIT_STATE 里的 profile 对象(信息流页 /new-reco 就有,真机实测 2026-06-22)。
+  //   userName=昵称, userDefineId=快手号, userId=uid, userHead=头像。(键名被 +1 凯撒位移混淆,靠值里有 userName+userId 定位。)
+  kuaishou: '(function(){try{var s=window.INIT_STATE||{};for(var k in s){var v=s[k];if(v&&typeof v==="object"&&v.userName&&v.userId){return JSON.stringify({nickname:v.userName,displayId:v.userDefineId||null,uid:String(v.userId),avatar:v.userHead||null});}}return "{}";}catch(e){return "{}";}})()',
+  // 快手创作者中心(cp.kuaishou.com):cp 接口需页面签名(裸 fetch 返回 result:10001/500002)、localStorage 也空;
+  //   身份在【Vue store】里(页面用签名接口拿到后缓存)。真机实测 2026-06-23:#app.__vue__.$store.state.user =
+  //   { userName(昵称), userKwaiId(快手号), userId(uid), userAvatar(头像 yximgs), logined }。读它最稳。
+  kuaishou_creator: '(function(){try{var app=document.querySelector("#app")||document.querySelector("[id*=app]")||document.body.firstElementChild;var vue=app&&(app.__vue__||(app.__vue_app__&&app.__vue_app__._instance&&app.__vue_app__._instance.proxy));var store=vue&&(vue.$store||(vue.$root&&vue.$root.$store));var st=store&&store.state;var u=st&&st.user;if(!(u&&(u.userName||u.userAvatar))&&st){for(var k in st){var v=st[k];if(v&&typeof v==="object"&&(v.userName||v.userAvatar)&&(v.userId||v.userKwaiId)){u=v;break;}}}if(u&&(u.userName||u.userAvatar)){return JSON.stringify({nickname:u.userName||null,displayId:u.userKwaiId||null,uid:u.userId?String(u.userId):null,avatar:u.userAvatar||null});}return "{}";}catch(e){return "{}";}})()',
+  // 头条:mp.toutiao.com 创作端 SSR script JSON 里的账号对象(真机实测 2026-06-22)。
+  //   页面有多个用户对象(feed 作者等),必须锚定【同时含 screen_name + https_avatar_url + id_str】的账号块,
+  //   否则乱扫抓到别人。nickname=screen_name, avatar=https_avatar_url, 头条号ID/uid=id_str。
+  toutiao: '(function(){try{var h=document.documentElement.innerHTML;var re=/"screen_name":"([^"]{1,40})"/g,m,best=null;while((m=re.exec(h))){var s=m.index;var blk=h.slice(Math.max(0,s-700),s+200);if(/https_avatar_url/.test(blk)){var a=(blk.match(/"https_avatar_url":"([^"]+?)"/)||blk.match(/"avatar_url":"([^"]+?)"/)||[])[1]||null;var id=(blk.match(/"id_str":"(\\d{6,25})"/)||[])[1]||null;best={nickname:m[1],avatar:a,id:id};break;}}if(!best){var n=(h.match(/"screen_name":"([^"]{1,40})"/)||[])[1];best={nickname:n||null,avatar:null,id:null};}return JSON.stringify({nickname:best.nickname,displayId:best.id,uid:best.id,avatar:best.avatar});}catch(e){return "{}";}})()',
+  // 视频号:助手页(channels.weixin.qq.com)调 auth_data 接口拿当前 finder(真机实测 2026-06-22)。
+  //   finderUser.nickname=昵称, uniqId=视频号ID(sph...), headImgUrl=头像, finderUsername=内部 v2_..@finder。
+  shipinhao: '(async function(){try{var r=await fetch("/cgi-bin/mmfinderassistant-bin/auth/auth_data",{method:"POST",headers:{"content-type":"application/json"},credentials:"include",body:JSON.stringify({scene:7,timestamp:Date.now()})});var j=await r.json();var f=(j&&j.data&&j.data.finderUser)||{};if(!f.nickname&&!f.uniqId)return "{}";return JSON.stringify({nickname:f.nickname||null,displayId:f.uniqId||null,uid:f.uniqId||f.finderUsername||null,avatar:f.headImgUrl||null});}catch(e){return "{}";}})()',
+  // 币安广场(真机实测 2026-06-22):昵称+头像不在 DOM、私有接口要签名,但页面把广场创作者信息缓存进了
+  //   localStorage『BN_FEED_KOL』(单条 = 本人:displayName=广场创作者名/avatar=头像,与签名接口返回的本人头像一致);
+  //   uid 在 localStorage『operation_list_user_id』。squareUid 从『__FEED_POST_COACH_HISTORY__<squareUid>__』键名取。
+  //   → 全部读 localStorage,不碰签名接口。
+  binance: '(function(){try{var uid=null;try{uid=localStorage.getItem("operation_list_user_id")||null;}catch(e){}var nick=null,av=null;try{var kol=JSON.parse(localStorage.getItem("BN_FEED_KOL")||"{}");var ks=Object.keys(kol);if(ks.length){var e0=kol[ks[0]]||{};nick=e0.displayName||null;av=e0.avatar||null;}}catch(e){}return JSON.stringify({uid:uid,nickname:nick,avatar:av,displayId:uid});}catch(e){return "{}";}})()',
+  // YouTube:innertube account_menu 接口(和 YouTube 自家 JS 一样,SAPISID cookie 算 SAPISIDHASH 鉴权)。
+  // activeAccountHeaderRenderer 里有 频道名(accountName)/handle(channelHandle,@xx)/头像;接口失败回落 masthead 头像。
+  youtube: '(async function(){try{function gc(n){var m=document.cookie.match(new RegExp("(^|; )"+n+"=([^;]+)"));return m?decodeURIComponent(m[2]):null;}var cfg=(window.ytcfg&&ytcfg.data_)||{};var out={};var apiKey=cfg.INNERTUBE_API_KEY,ctx=cfg.INNERTUBE_CONTEXT;if(apiKey&&ctx){var origin="https://www.youtube.com";var hdr={"Content-Type":"application/json"};var sapisid=gc("SAPISID")||gc("__Secure-3PAPISID")||gc("__Secure-1PAPISID");if(sapisid){var t=Math.floor(Date.now()/1000);var buf=await crypto.subtle.digest("SHA-1",new TextEncoder().encode(t+" "+sapisid+" "+origin));var hex=Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0");}).join("");hdr["Authorization"]="SAPISIDHASH "+t+"_"+hex;hdr["X-Origin"]=origin;hdr["X-Goog-AuthUser"]="0";}var r=await fetch(origin+"/youtubei/v1/account/account_menu?prettyPrint=false",{method:"POST",credentials:"include",headers:hdr,body:JSON.stringify({context:ctx})});var j=await r.json();var acts=(j&&j.actions)||[],h=null;for(var i=0;i<acts.length;i++){var p=acts[i]&&acts[i].openPopupAction&&acts[i].openPopupAction.popup&&acts[i].openPopupAction.popup.multiPageMenuRenderer;if(p&&p.header&&p.header.activeAccountHeaderRenderer){h=p.header.activeAccountHeaderRenderer;break;}}if(h){out.nickname=(h.accountName&&h.accountName.simpleText)||null;out.displayId=(h.channelHandle&&h.channelHandle.simpleText)||null;var th=h.accountPhoto&&h.accountPhoto.thumbnails;out.avatar=(th&&th.length&&th[th.length-1].url)||null;}}if(!out.avatar){var img=document.querySelector("#avatar-btn img, button#avatar-btn img, ytd-topbar-menu-button-renderer img");out.avatar=(img&&img.src)||out.avatar||null;}return JSON.stringify(out);}catch(e){return "{}";}})()',
+  // ⚠️ TODO(VPN 真机调):IG/FB 昵称/头像的确切来源要登录态 DOM 才能定。uid 已由 UID_COOKIE 从明文
+  //   cookie 补(IG=ds_user_id、FB=c_user),所以即使这里抓不到昵称,账号也能建(uid 做去重键,昵称可手动改)。
+  //   下面是【best-effort 占位】:IG 从导航头像 img.alt / og:title 试,FB 从 og:title / 头像试;抓不到回 {}。
+  // IG(2026-07-05 真机验,英文界面):首页 feed og:title=null、feed 里混着推荐用户头像 → 旧 best-effort 抓空。
+  //   可靠源 = 右栏账号切换卡「Switch/切换」按钮那行(本人 username 链接 + 头像);兜底 og:title(profile 页)+
+  //   alt 以 username 开头的 profile picture 图。uid 由 UID_COOKIE(ds_user_id)补,这里不取。
+  instagram: '(function(){try{var nick=null,av=null,uname=null;var sw=null,bs=document.querySelectorAll(\'div[role="button"],button\');for(var i=0;i<bs.length;i++){var t=(bs[i].textContent||"").trim();if(t==="Switch"||t==="切换"){sw=bs[i];break;}}if(sw){var row=sw;for(var d=0;d<5&&row.parentElement;d++){row=row.parentElement;var lk=row.querySelector(\'a[href^="/"]\');var im=row.querySelector(\'img[alt*="profile picture"],img[alt*="头像"]\');if(lk&&im){uname=(lk.getAttribute("href")||"").replace(/\\//g,"")||null;av=im.src||null;break;}}}if(!uname){var og=document.querySelector(\'meta[property="og:title"]\');if(og){var c=og.getAttribute("content")||"";var mm=c.match(/@([A-Za-z0-9._]+)/);if(mm)uname=mm[1];if(!nick)nick=(c.split("(")[0]||"").trim()||null;}}if(!av&&uname){var ims=document.querySelectorAll(\'img[alt*="profile picture"]\');for(var k=0;k<ims.length;k++){if((ims[k].alt||"").indexOf(uname)===0){av=ims[k].src;break;}}}nick=nick||uname;return JSON.stringify({nickname:nick,displayId:uname,avatar:av});}catch(e){return "{}";}})()',
+  // FB(2026-07-03 真机验):uid=c_user 明文 cookie;昵称在【自己主页 profile.php?id=<c_user>】的 og:title(首页 feed
+  //   ogTitle 为 null,故靠 IDENTITY_SELF_URL 先跳主页再读),兜底 h1 / document.title(去掉"(N)"和"| Facebook");
+  //   头像=fbcdn 里 t1.30497-1(FB 头像路径)的 <image xlink:href>(首页/主页都有,与 rsrc.php UI 精灵、t39 帖图区分)。
+  facebook: '(function(){try{var uid=(document.cookie.match(/c_user=(\\d+)/)||[])[1]||null;var BAD=/^(通知|通知消息|Notifications|Facebook|Meta|首页|主页|Home|Marketplace|市场|菜单|Menu|动态消息|News Feed|好友|Friends|视频|Video|个人主页)$/i;function clean(s){s=(s||"").replace(/^\\(\\d+\\)\\s*/,"").replace(/\\s*[|\\-\\u2013]\\s*Facebook.*$/i,"").trim();return s;}var cands=[];var ogt=document.querySelector(\'meta[property="og:title"]\');if(ogt)cands.push(clean(ogt.getAttribute("content")));var h1s=document.querySelectorAll("h1");for(var hk=0;hk<h1s.length;hk++)cands.push(clean((h1s[hk].textContent||"").slice(0,60)));cands.push(clean(document.title));var nick=null;for(var i=0;i<cands.length;i++){var c=cands[i];if(c&&!BAD.test(c)&&c.length>=2&&c.length<=60){nick=c;break;}}var freq={};function add(u){if(!u||!/fbcdn|scontent/.test(u)||!/t39\\.30808-1|t1\\.30497/.test(u))return;var key=u.split("?")[0];freq[key]=(freq[key]||0)+1;}var ims=document.querySelectorAll("image");for(var a=0;a<ims.length;a++)add(ims[a].getAttribute("xlink:href")||ims[a].getAttribute("href")||"");var igs=document.querySelectorAll("img");for(var b=0;b<igs.length;b++)add(igs[b].src||"");var av=null,best=0;for(var kk in freq){if(freq[kk]>best){best=freq[kk];av=kk;}}if(!av){var ogi=document.querySelector(\'meta[property="og:image"]\');if(ogi)av=(ogi.getAttribute("content")||"").trim()||null;}return JSON.stringify({nickname:nick,uid:uid,displayId:uid,avatar:av});}catch(e){return "{}";}})()',
+  // Reddit:/api/me.json(cookie 鉴权)一把出 name(用户名)/ id(t2 uid)/ icon_img|snoovatar_img(头像)。
+  //   头像 URL 里的 &amp; 要还原成 &。displayId = u/<name>。同 xhs/B站 的「问接口」路子,最稳。
+  reddit: '(async function(){try{var r=await fetch("/api/me.json",{credentials:"include",headers:{accept:"application/json"}});var j=await r.json();var d=(j&&j.data)||j||{};if(!d.name)return "{}";var av=String(d.snoovatar_img||d.icon_img||"").replace(/&amp;/g,"&").split("?")[0];return JSON.stringify({nickname:d.name,displayId:"u/"+d.name,uid:d.id?("t2_"+d.id):d.name,avatar:av});}catch(e){return "{}";}})()',
+  // Gate 广场(2026-08-03 真机实测,登录态 DOM。实测号:huolongyema / UID 5052):
+  //   昵称/displayId = 侧栏【本人主页】链接 href 的 /profile/<用户名> 段(URL 编码要 decode:
+  //     中文昵称形如 /zh/profile/%E8%B5%B5%E5%85%AC%E5%AD%90HODL1)。Gate 广场的显示名就是这个名字
+  //     (信息流里别人的 class="nickname" 文字与其 href 段一一对应),所以不用另找昵称元素。
+  //   ⚠️ 本人链接必须靠【结构】认:选带 .post-nav-item 的那个 —— 页面上有 20+ 个同格式的 /profile/
+  //     链接全是信息流里【别人】的号(class="nickname"),按顺序取第一个必然抓错人。
+  //   uid = 顶栏账户卡的「UID: 5052」文本(class 是 CSS Modules 哈希 uid-XXXX,所以用文本正则兜)。
+  //   头像 = gavatar.staticimgs.com 域的 img(Gate 头像专用 CDN,比哈希 class 稳)。
+  gate: '(function(){try{var link=null;var as=document.querySelectorAll(\'a[href*="/profile/"]\');for(var i=0;i<as.length;i++){if(as[i].querySelector(".post-nav-item")){link=as[i];break;}}var name=null;if(link){var h=(link.getAttribute("href")||"").split("?")[0].replace(/\\/+$/,"");var seg=h.split("/profile/")[1]||"";if(seg){try{name=decodeURIComponent(seg);}catch(e){name=seg;}}}var uid=null;var ns=document.querySelectorAll(\'[class*="uid"]\');for(var k=0;k<ns.length;k++){var m=((ns[k].innerText||"").trim()).match(/^UID[:\\uFF1A]\\s*(\\d{2,})$/);if(m){uid=m[1];break;}}var av=null;var im=document.querySelector(\'img[src*="gavatar."]\');if(im)av=im.src||null;if(!name&&!uid)return "{}";return JSON.stringify({nickname:name,displayId:name,uid:uid||name,avatar:av});}catch(e){return "{}";}})()',
+  // OKX 星球(2026-08-03 真机实测,登录态 DOM):
+  //   uid  = 侧栏「个人主页」导航项 href 尾段的纯数字(游客是 /orbit/user/me,所以拿到数字必是本人);
+  //   昵称/头像 = 侧栏底部用户卡 [class*="userCard"] 里的 [class*="userName"] 文字 + img。
+  //   ⚠️ class 是 CSS Modules 哈希(userName-zU0Fi / userCard-BZe7q),【只能用前缀 *= 匹配】,
+  //     OKX 每次发版哈希都会变,写死全名下次发版就读不到。
+  //   ⚠️ uid 必须限定在 navItem 上取:推荐关注/直播列表里全是同格式的别人的 /orbit/user/<数字>。
+  okx: '(function(){try{var uid=null;var as=document.querySelectorAll(\'a[class*="navItem"][href*="/orbit/user/"]\');for(var i=0;i<as.length;i++){var seg=((as[i].getAttribute("href")||"").split("?")[0]).replace(/\\/+$/,"").split("/").pop();if(/^\\d{6,}$/.test(seg)){uid=seg;break;}}var nick=null,av=null;var card=document.querySelector(\'[class*="userCard"]\');if(card){var ne=card.querySelector(\'[class*="userName"]\');if(ne)nick=(ne.innerText||"").trim()||null;var im=card.querySelector("img");if(im)av=im.src||null;}return JSON.stringify({uid:uid,displayId:uid,nickname:nick,avatar:av});}catch(e){return "{}";}})()',
+  // Bitget Insights:同 checkKernelLogin 用的那个接口(/v1/user/overview/userinfo,同域 cookie 鉴权)。
+  //   【2026-08-03 登录态真机实测,字段名已确定】(此前是猜的,一个都没猜中):
+  //     data.displayName  = 广场显示名(实测 BGUSER-YSMJ8R75;data.userName 同值)
+  //     data.encryptUserId= 广场 uid(20 位 hex,与广场主页 URL /insights/user/<hex> 同格式)
+  //     data.userAvatar   = 头像(img.bgstatic.com)
+  //   ⚠️⚠️ 【绝不能碰的字段】data.userInfo 里:nickName 实测装的是【掩码邮箱】而不是昵称,
+  //     realName / givenName 装的是【KYC 实名】(实测确有真人姓名)。把这些取来当昵称 = 把用户的
+  //     实名/邮箱显示在账号卡上。只用上面 data 顶层那三个字段,别为了"兜底"去扫 userInfo。
+  bitget: '(async function(){try{if(location.hostname.indexOf("bitget.com")<0)return "{}";var r=await fetch("/v1/user/overview/userinfo",{credentials:"include",headers:{accept:"application/json"}});var j=await r.json();if(!j||String(j.code)==="00004")return "{}";var d=j.data||{};var uid=d.encryptUserId||null;var nick=d.displayName||d.userName||null;var av=d.userAvatar||null;if(!uid&&!nick)return "{}";return JSON.stringify({uid:uid,displayId:nick,nickname:nick,avatar:av});}catch(e){return "{}";}})()',
+  // Bybit ByX(2026-08-03 登录态真机实测):同 probe 用的社区接口(POST,空 body = 查本人)。
+  //   result.author_info:byx_uid = ByX 广场号(实测 ZYE0NM,做 displayId + uid);
+  //   username = 广场显示名(没设过 ByX 昵称的号,这里回落成【掩码邮箱】—— 是掩码不是明文,可以显示);
+  //   avatar_url 该号为空串 → 落 null(卡片回退首字母,不留空)。
+  //   ⚠️ author_info.user_id 实测恒为 "0"(空 body 查本人时不填),【不能拿它当 uid】—— 那样所有 Bybit
+  //     号的 uid 都会是 0,去重逻辑 findAccountByUid 会把两个不同的真实账号判成同一个。用 byx_uid。
+  bybit: '(async function(){try{if(location.hostname.indexOf("bybit.com")<0)return "{}";var r=await fetch("/x-api/fht/social/v1/query/user/profile",{method:"POST",credentials:"include",headers:{accept:"application/json","content-type":"application/json"},body:"{}"});var j=await r.json();var a=j&&j.result&&j.result.author_info;if(!a||!a.byx_uid)return "{}";return JSON.stringify({uid:String(a.byx_uid),displayId:String(a.byx_uid),nickname:a.username||null,avatar:a.avatar_url||null});}catch(e){return "{}";}})()',
+};
+// uid 在明文 cookie 里的平台(页面 expr 拿不到 uid 时,从 cookie 补)。
+const UID_COOKIE: Record<string, string> = { kuaishou: 'userId', toutiao: 'sso_uid_tt', bilibili: 'DedeUserID', instagram: 'ds_user_id', facebook: 'c_user' };
+
+// 有些平台首页 feed 上【没有本人信息】(乱扫 nickname 会抓到推荐流里别人的号 → 见 reference 的血泪教训),
+// 必须先导航到「自己主页」再读身份。URL 用明文 cookie 里的 uid 拼。这是对齐抖音「在带本人 SSR 的页面读」
+// 的统一做法:抖音/小红书/B站/YouTube 的源(RENDER_DATA / /me / /nav / account_menu)本身就含本人,无需跳;
+// 快手 feed 不含本人 → 跳 profile/<uid>(cookie 有 uid);TikTok 首页 SSR 已空、昵称只在主页 DOM → 见 IDENTITY_NAV_HINT。
+const IDENTITY_SELF_URL: Record<string, (uid: string) => string> = {
+  kuaishou: (uid) => `https://www.kuaishou.com/profile/${uid}`,
+  // FB 首页 feed 没本人昵称(og:title=null)→ 跳自己主页读(uid=c_user 明文 cookie)。真机验 2026-07-03。
+  facebook: (uid) => `https://www.facebook.com/profile.php?id=${uid}`,
+};
+
+// 同上,但「自己主页 URL」cookie 里没有、要【从当前页面读】出来(如 TikTok 的号在左侧导航栏链接里)。
+// 这个 expr 在当前页跑、返回要跳的完整 URL(读不到返回空串 → 不跳,按当前页读)。跳过去后同样轮询 expr。
+const IDENTITY_NAV_HINT: Record<string, string> = {
+  // TikTok:左侧导航「主页」链接 = /@<号> → 跳过去才有 user-title(昵称)等 profile DOM(首页 feed 没有)。
+  tiktok: TIKTOK_SELF_PROFILE_URL,
+};
+
+export async function kernelReadIdentity(accountId: string, platform: string,
+  reviewNavigate?: (url: string) => Promise<void>): Promise<KernelIdentity> {
+  const navigate = (url: string) => reviewNavigate ? reviewNavigate(url) : kernelNavigate(accountId, url);
+  try {
+    const s = await getPage(accountId);
+    const out: KernelIdentity = {};
+    const fence = getAccount(accountId)?.authority ? accountAuthority.captureAssociation(accountId) : undefined;
+    const socket = s.pageWs;
+    const current = () => sessions.get(accountId) === s && s.pageWs === socket &&
+      (!fence || accountAuthority.isCurrentAssociation(fence));
+    let lastRead: KernelIdentity['observed'];
+    let identityEvidence: KernelIdentity['observed'];
+    let cookieEvidence: KernelIdentity['observed'];
+    const matchesCurrentRoot = (evidence: KernelIdentity['observed']) => {
+      const root = s.navigation?.snapshot();
+      return current() && !!evidence && root?.state === 'confirmed' &&
+        evidence.connectionEpoch === root.connectionEpoch && evidence.generation === root.generation;
+    };
+    const readIdentity = async (expression: string): Promise<any> => {
+      if (!fence) return kernelEval(accountId, expression);
+      const observation = s.navigation?.snapshot();
+      if (!current() || observation?.state !== 'confirmed' || !socket) throw new KernelNavigationError('ownership_unconfirmed');
+      const capability = {};
+      loginReadCapabilities.set(capability, { session: s, socket, generation: observation.generation, expression, fence });
+      const result = await send(s, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true },
+        12000, undefined, undefined, capability);
+      if (!current() || s.navigation?.snapshot().generation !== observation.generation) {
+        throw new KernelNavigationError('ownership_unconfirmed');
+      }
+      lastRead = { connectionEpoch: observation.connectionEpoch, generation: observation.generation };
+      return result?.result?.value;
+    };
+    const expr = IDENTITY_EXPR[platform];
+    // 先取明文 cookie 里的 uid(快手等要用它拼自己主页 URL;也作 uid 兜底)。
+    let cookieUid: string | undefined;
+    if (UID_COOKIE[platform]) {
+      try {
+        const root = s.navigation?.snapshot();
+        const evidence = root?.state === 'confirmed'
+          ? { connectionEpoch: root.connectionEpoch, generation: root.generation } : undefined;
+        const cr = await send(s, 'Network.getAllCookies', {});
+        const c = (cr?.cookies || []).find((x: any) => String(x.name) === UID_COOKIE[platform]);
+        if (c && (!fence || matchesCurrentRoot(evidence))) {
+          cookieUid = String(c.value);
+          cookieEvidence = evidence;
+        }
+      } catch { /* ignore */ }
+    }
+    // 首页无本人信息的平台(快手):先跳到 profile/<uid> 那页再读 —— 否则在推荐 feed 上读到空/别人的号。
+    // 主页是 SPA,本人信息【异步渲染】,固定等待不稳 → 轮询到读出昵称/平台号/头像再停(最多 ~9s)。
+    const selfUrl = IDENTITY_SELF_URL[platform];
+    if (selfUrl && cookieUid && expr) {
+      try { if (!fence || current()) await navigate(selfUrl(cookieUid)); } catch { if (reviewNavigate) return {}; }
+      for (let i = 0; i < 6; i++) {
+        await sleep(1500);
+        // ⚠️ 只等【nickname】,不能用 displayId —— FB/IG 的 displayId=uid(明文 cookie)恒有值,
+        //   会第一轮就退出、没等主页名字(og:title)异步渲染出来 → 读到导航里的「通知」(用户实测)。
+        try { const probe = JSON.parse((await readIdentity(expr)) || '{}'); if (probe && probe.nickname) break; } catch { /* 还没渲染好,继续等 */ }
+      }
+    }
+    // 自己主页 URL 不在 cookie、要从当前页读出来的平台(TikTok):先读导航栏拿到 /@号 → 跳过去 → 轮询到昵称出来。
+    const navHint = IDENTITY_NAV_HINT[platform];
+    if (navHint && expr && !(selfUrl && cookieUid)) {
+      try {
+        // 导航栏是 CSR 异步渲染的(TikTok 重 SPA),首次读常为空 → 轮询等它出来(最多 ~10s)再拿自己主页 URL。
+        let url = '';
+        for (let i = 0; i < 10 && !url; i++) {
+          try { const u = await readIdentity(navHint); if (u && typeof u === 'string' && u) url = u; } catch { /* 继续等 */ }
+          if (!url) await sleep(1000);
+        }
+        if (platform === 'tiktok' && !url) return {};
+        if (url) {
+          if (fence && !matchesCurrentRoot(lastRead)) return {};
+          await navigate(url);
+          // 跳到自己主页后,等 user-title(昵称)等 profile DOM 渲染出来(最多 ~12s)。
+          for (let i = 0; i < 8; i++) {
+            await sleep(1500);
+            try { const probe = JSON.parse((await readIdentity(expr)) || '{}'); if (probe && probe.nickname) break; } catch { /* 还没渲染好,继续等 */ }
+          }
+        }
+      } catch {
+        if (platform === 'tiktok') return {}; // Never identify the author of the page left behind after navigation fails.
+        /* 其它平台读不到导航/导航失败 → 按当前页读 */
+      }
+    }
+    let lastDbg: string | undefined;
+    if (expr) {
+      // ⚠️ 单次读在【登录刚成功】时常拿空:扫码连接首读时,抖音/小红书/B站等的 SSR(RENDER_DATA)/CSR 还没把
+      //   本人信息渲染出来 → 读到空,要等用户手动「刷新信息」才出。改成轮询到读出再停(最多 ~12s):已经在上面
+      //   selfUrl/navHint 分支轮询拿到的平台(快手/TikTok)这里第一次就 break、不增耗时;抖音等给它时间等渲染。
+      for (let i = 0; i < 8; i++) {
+        try {
+          const o = JSON.parse((await readIdentity(expr)) || '{}');
+          if (o && typeof o === 'object') {
+            if (fence && (o.uid || o.nickname || o.displayId || o.avatar)) {
+              if (!matchesCurrentRoot(lastRead)) return {};
+              if (identityEvidence && !matchesCurrentRoot(identityEvidence)) {
+                delete out.uid; delete out.nickname; delete out.displayId; delete out.avatar;
+              }
+              identityEvidence = lastRead;
+            }
+            out.uid = o.uid || out.uid; out.nickname = o.nickname || out.nickname;
+            out.displayId = o.displayId || out.displayId; out.avatar = o.avatar || out.avatar;
+            if (o._dbg) lastDbg = String(o._dbg);
+          }
+        } catch { /* 还没渲染好,继续等 */ }
+        // 等【真正的 nickname】再停 —— 不能靠 displayId(FB/IG 的 displayId=uid 恒有值 → 会没等名字渲染就退,
+        //   读到导航「通知」);没 nickname 的极少数平台轮询满(~12s)后落 uid/avatar 兜底,不会误存错名字。
+        if (out.nickname) {
+          // 抖音号(displayId)可能比昵称晚渲染:缺号时再多等几轮(最多 ~6s);其它平台拿到昵称就停。
+          if (!(platform === 'douyin' && !out.displayId && i < 4)) break;
+        } else if (out.avatar && i >= 5) {
+          break; // 轮询大半天只拿到头像、始终没昵称 → 别再干等,用头像+uid 收尾
+        }
+        await sleep(1500);
+      }
+      // 抖音抓到了昵称却没抓到抖音号 → 把本人块片段记一条,便于按真实键名精修(不写进身份)。
+      if (platform === 'douyin' && out.nickname && !out.displayId && lastDbg) {
+        coworkLog('INFO', 'matrix-identity', 'douyin displayId miss');
+      }
+    }
+    // uid 兜底:用 cookie 里的 uid(getAllCookies 跨域)。
+    if (!out.uid && cookieUid && (!fence || matchesCurrentRoot(cookieEvidence) || matchesCurrentRoot(identityEvidence))) {
+      out.uid = cookieUid;
+      identityEvidence ??= cookieEvidence;
+    }
+    // 读不到任何身份 → 记一条诊断(带 expr 回传的 _dbg,便于后续按真实结构补),不影响登录。
+    if (!out.nickname && !out.uid) coworkLog('INFO', 'matrix-identity', `identity empty for ${platform}`);
+    if (!fence) return out;
+    if (!matchesCurrentRoot(identityEvidence)) return {};
+    return { ...out, observed: identityEvidence };
+  } catch { return {}; }
+}
+
+// ── 生命周期 ──
+
+export function getSession(accountId: string): KernelSession | undefined {
+  return sessions.get(accountId);
+}
+
+/** 该号的「使用互斥锁」当前是否被某个流程持有(=正在跑任务/保活/刷新信息)。
+ *  给交互入口(扫码连接/导入 cookie/刷新信息)做忙碌预检:直接告知「正在执行任务」,
+ *  而不是在 acquireLease 上无限期排队让 UI 看起来卡死。 */
+export function isAccountBusy(accountId: string): boolean {
+  return leaseHeld.has(accountId);
+}
+
+export type KernelLeaseReceipt = Readonly<{
+  id: string; accountId: string; sessionInstanceId: string; profile: string; incarnation?: string; epoch?: string; storeId?: string;
+}>;
+const kernelLeases = new WeakMap<KernelLeaseReceipt, { session: KernelSession; owner?: () => void; signal?: AbortSignal }>();
+
+export async function acquireKernel(opts: LaunchKernelOptions): Promise<KernelLeaseReceipt> {
+  const account = getAccount(opts.accountId);
+  const fence = account?.authority && accountAuthority.captureAssociation(opts.accountId);
+  const session = await launchKernel(opts);
+  const receipt = Object.freeze({ id: randomUUID(), accountId: opts.accountId,
+    sessionInstanceId: session.diagnosticsId, profile: session.userDataDir, incarnation: account?.authority?.incarnation, epoch: fence?.epoch, storeId: fence?.storeId });
+  kernelLeases.set(receipt, { session, owner: opts.skipLease ? undefined : leaseHeld.get(opts.accountId), signal: opts.signal });
+  if (fence && !isKernelLeaseCurrent(receipt)) {
+    releaseKernel(receipt);
+    throw new KernelNavigationError('cancelled');
+  }
+  return receipt;
+}
+
+const kernelLeaseScope = new AsyncLocalStorage<KernelLeaseReceipt>();
+export async function withKernelLease<T>(lease: KernelLeaseReceipt, run: () => Promise<T>): Promise<T> {
+  if (!isKernelLeaseCurrent(lease)) throw new KernelNavigationError('cancelled');
+  return kernelLeaseScope.run(lease, run);
+}
+
+export function isKernelLeaseCurrent(receipt: KernelLeaseReceipt | undefined): boolean {
+  if (!receipt) return false;
+  const lease = kernelLeases.get(receipt);
+  if (!lease || lease.signal?.aborted || sessions.get(receipt.accountId) !== lease.session ||
+      lease.session.diagnosticsId !== receipt.sessionInstanceId) return false;
+  if (!receipt.epoch) return true;
+  const fence = accountAuthority.captureAssociation(receipt.accountId);
+  return !!fence && fence.storeId === receipt.storeId && fence.epoch === receipt.epoch && fence.incarnation === receipt.incarnation;
+}
+
+export function releaseKernel(receipt: KernelLeaseReceipt): 'released' | 'alreadyReleased' {
+  const held = kernelLeases.get(receipt);
+  if (!held) return 'alreadyReleased';
+  kernelLeases.delete(receipt);
+  const current = sessions.get(receipt.accountId);
+  if (current !== held.session || current.diagnosticsId !== receipt.sessionInstanceId) {
+    if (held.owner) releaseLease(receipt.accountId, held.owner);
+    return 'alreadyReleased';
+  }
+  closeKernel(receipt.accountId, { expected: held.session, skipLease: !held.owner || leaseHeld.get(receipt.accountId) !== held.owner });
+  return 'released';
+}
+
+const cleanupProofs = new WeakMap<accountAuthority.ProfileCleanupProof, { profile: string; identity: string; owner: object }>();
+
+export function authenticProfileCleanupProof(proof: accountAuthority.ProfileCleanupProof): boolean {
+  const registered = cleanupProofs.get(proof);
+  return !!registered && profileCleanupOwners.get(registered.profile) === registered.owner &&
+    ![...sessions.values()].some(s => profileKey(s.userDataDir) === registered.profile) &&
+    !profileCookieQueue.has(registered.identity) && !profileCookieQueue.has(registered.profile);
+}
+
+/** Explicit disconnect only. Failure leaves the committed profile isolation intact. */
+export async function cleanupProfileCookies(opts: LaunchKernelOptions): Promise<boolean> {
+  const account = getAccount(opts.accountId);
+  const cleanup = account?.authority?.cleanup;
+  const fence = accountAuthority.captureAssociation(opts.accountId);
+  if (!cleanup || !fence || account?.userDataDir !== opts.userDataDir) return false;
+  let profile: string;
+  let identity: ReturnType<typeof accountAuthority.assertProfileAccess>;
+  try {
+    identity = accountAuthority.assertProfileAccess(opts.accountId, opts.userDataDir, undefined, true);
+    profile = profileKey(opts.userDataDir);
+  } catch { return false; }
+  if (profileCleanupOwners.has(profile)) return false;
+  const owner = {};
+  profileCleanupOwners.set(profile, owner);
+  const deadline = AbortSignal.timeout(45_000);
+  const exited = async (process: ChildProcess | null | undefined): Promise<boolean> => {
+    if (!process) return false;
+    const until = Date.now() + 3500;
+    while (process.exitCode === null && !process.signalCode && Date.now() < until && !deadline.aborted) {
+      await waitForKernel(sleep(50), deadline);
+    }
+    return process.exitCode === 0 && !process.signalCode;
+  };
+  const isolatedReadback = async (clear: boolean) => {
+    if (!accountAuthority.isCurrentAssociation(fence) || sessions.has(opts.accountId) || launching.has(opts.accountId)) return;
+    accountAuthority.assertProfileAccess(opts.accountId, opts.userDataDir, identity.key, true);
+    const receipt = await acquireKernel({ ...opts, cleanupOwner: owner, manual: true, headless: true,
+      signal: deadline, skipLease: false, startUrl: undefined });
+    const instance = sessions.get(opts.accountId);
+    let empty = false;
+    try {
+      if (!instance || instance.diagnosticsId !== receipt.sessionInstanceId || refCount.get(opts.accountId) !== 1) return;
+      const s = await getPage(opts.accountId, owner);
+      const tabs = await devFetchJson(`http://127.0.0.1:${s.debugPort}/json/list`, 1500, deadline);
+      // Only a single blank page can provide this profile-specific proof.
+      if (s !== instance || !Array.isArray(tabs) || tabs.length !== 1 || tabs[0].type !== 'page'
+          || tabs[0].url !== 'about:blank' || !accountAuthority.isCurrentAssociation(fence)) return;
+      if (clear) await kernelClearCookies(opts.accountId, owner);
+      const cookies = await send(s, 'Network.getAllCookies', {}, 3000);
+      empty = Array.isArray(cookies?.cookies) && cookies.cookies.length === 0 && accountAuthority.isCurrentAssociation(fence);
+    } finally { releaseKernel(receipt); }
+    if (!empty || !await exited(instance?.process) || sessions.has(opts.accountId)) return;
+    return { instance: receipt.sessionInstanceId, count: 0, exited: true } as const;
+  };
+  try {
+    const incumbent = profileReservations.get(profile);
+    if ((incumbent && incumbent !== opts.accountId) || [...sessions.values()].some(s => profileKey(s.userDataDir) === profile)) return false;
+    const previous = closingProcs.get(opts.accountId);
+    if (previous && !await exited(previous)) return false;
+    if (!accountAuthority.profilePriorOwnerExited(opts.accountId, opts.userDataDir)) return false;
+    const clearing = await isolatedReadback(true);
+    if (!clearing) return false;
+    const readback = await isolatedReadback(false);
+    if (!readback) return false;
+    accountAuthority.assertProfileAccess(opts.accountId, opts.userDataDir, identity.key, true);
+    const proof = Object.freeze({ fence, profile: opts.userDataDir, cleanupId: cleanup.id,
+      clearing: Object.freeze(clearing), readback: Object.freeze(readback) });
+    cleanupProofs.set(proof, { profile, identity: identity.key, owner });
+    try { return accountAuthority.commitProfileCleanup(proof); }
+    finally { cleanupProofs.delete(proof); }
+  } finally {
+    if (profileCleanupOwners.get(profile) === owner) profileCleanupOwners.delete(profile);
+  }
+}
+
+export function listSessions(): string[] {
+  return Array.from(sessions.keys());
+}
+
+export function closeKernel(accountId: string, opts?: { force?: boolean; skipLease?: boolean; expected?: KernelSession }): void {
+  if (opts?.expected && sessions.get(accountId) !== opts.expected) return;
+  if (opts?.force || !opts?.skipLease) sessions.get(accountId)?.detachOperationSignal?.();
+  if (opts?.force || !opts?.skipLease) {
+    automationSafety.end(accountId);
+    const activeSession = sessions.get(accountId);
+    if (activeSession) activeSession.automation = false;
+  }
+  // 释放「使用互斥锁」:本流程对该号的操作结束 → 让排队的下一个流程能进(不受 refcount/下面早返回影响)。
+  // ⚠️ skipLease 起的流程(openLogin/导入 cookie 等)关闭时必须传 skipLease:true —— 它没占过锁,
+  //   这里无条件 releaseLease 会把【别的流程正持有的锁】弹掉,放行排队者与持有者并发驱动同一页面。
+  // Emergency callers use skipLease:true: the owning launch/runner releases
+  // in catch/finally, so its later cleanup cannot release a newer owner.
+  if (!opts?.skipLease) releaseLease(accountId);
+  // 引用计数 -1:还有别的流程在用(>0)就【不关】,只有归 0(或 force)才真关 → 防误关在用的窗。
+  const n = Math.max(0, (refCount.get(accountId) || 1) - 1);
+  refCount.set(accountId, n);
+  const s = sessions.get(accountId);
+  if (!s) return;
+  if (!opts?.force && n > 0) {
+    coworkLog('INFO', 'kernelPool', `kernel ${diagnosticAccountAlias(accountId)} 还有 ${n} 个流程在用,暂不关闭`);
+    return;
+  }
+  refCount.delete(accountId);
+  // 优雅关闭:CDP Browser.close 让 Chromium 正常退出(写「干净退出」标记)→ 下次启动不弹
+  //   「未正确关闭 / 恢复页面」、也不会损坏 profile。失败/超时再强杀兜底(防卡住不退)。
+  let graceful = false;
+  try {
+    if (s.pageWs && s.pageWs.readyState === WebSocket.OPEN) { sendNoWait(s, 'Browser.close'); graceful = true; }
+  } catch { /* ignore */ }
+  const proc = s.process;
+  // 记进「将死表」:重开同号时 doLaunch 会先确保它退出(见 closingProcs 注释)。进程真正退出后自动摘除。
+  if (proc && proc.exitCode === null) {
+    closingProcs.set(accountId, proc);
+    proc.once('exit', () => { if (closingProcs.get(accountId) === proc) closingProcs.delete(accountId); });
+  }
+  setTimeout(() => { try { if (proc && !proc.killed && proc.exitCode === null) proc.kill(); } catch { /* ignore */ } }, graceful ? 4000 : 0);
+  failSession(s, 'kernel closed');
+  sessions.delete(accountId);
+  coworkLog('INFO', 'kernelPool', `closing kernel ${diagnosticAccountAlias(accountId)}${graceful ? ' (graceful)' : ' (kill)'}`);
+}
+
+export function closeAllKernels(): void {
+  // app 退出 / 急停:无视引用计数,全部强关。
+  // External stop only: each owning runner/launch still releases its lease in finally/catch.
+  for (const [id, instance] of sessions) closeKernel(id, { expected: instance, force: true, skipLease: true });
+}
+
+/**
+ * 同步【立即强杀】所有内核子进程 —— sidecar 收到终止信号 / app 退出时用。
+ * closeKernel/closeAllKernels 经 setTimeout 才真正 kill,但 process.exit 不会等定时器触发 →
+ * 必须在这里同步 SIGKILL,否则内核成孤儿窗口(mac 无 Win32 Job Object 兜底,不随 sidecar 死)。
+ */
+export function killAllKernelsSync(): void {
+  stopWindowGuards(); // 同步停轮询 + 释放系统保活(process.exit 不会等定时器自停)。
+  for (const id of Array.from(sessions.keys())) {
+    try { sessions.get(id)?.process?.kill('SIGKILL'); } catch { /* ignore */ }
+    sessions.delete(id);
+  }
+  for (const [id, proc] of Array.from(closingProcs.entries())) {
+    try { proc.kill('SIGKILL'); } catch { /* ignore */ }
+    closingProcs.delete(id);
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}

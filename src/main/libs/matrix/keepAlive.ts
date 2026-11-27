@@ -1,0 +1,223 @@
+/**
+ * 矩阵号「主动保活续期」。
+ *
+ * 原理:滑动会话平台(抖音/B站/快手/小红书/X/TikTok)每次带登录态访问,服务器会重发续期 cookie;矩阵内核是
+ * 持久 profile(--user-data-dir),续期 cookie 会被存下来。所以定期让【超过 N 天没活跃】的 idle 号悄悄访问一次
+ * 平台主页,就把会话续上了;顺带 checkKernelLogin 复验,真过期的标 login_required(后台静默,不弹窗)。
+ *
+ * 边界(诚实):
+ *   · 视频号/微信扫码 token 硬过期,保活续不了(且漏 B 修好前检测也不准)→ 对它无效,只能重扫;
+ *   · 只在 app 开着时跑(矩阵本来如此);app 长期不开,会话照样自然到期。
+ *
+ * 节流设计:
+ *   · 真访问受【lastAliveAt 超过 ALIVE_THRESHOLD(3 天)】门槛,常跑任务的号 markAccountAlive 后进不了名单;
+ *   · 每 60s 扫描本地状态和到期时间 + app 启动扫一次，仅对到期账号做实际复查;
+ *   · 串行 + 随机抖动,跳过正被占用(getSession 存活)的号,不并发不抢;
+ *   · headless 优先(不打扰),失败回退可见窗 —— 但一律 background:true【静默】:起来即最小化、不抢焦点、
+ *     防最小化守卫跳过(用户反馈「没点连接却总弹窗」→ 保活/复验永不往用户脸上弹;要用户扫码的
+ *     reloginPrompt 才置顶)。成功更新 lastAliveAt,失败标 login_required + 推 SSE;
+ *   · login_required 复验每号 24h 至多一次(lastLoginRecheckAt 节流):真过期的号复验注定失败,
+ *     原来每 12h + 每次开 app 都白开一轮窗。
+ */
+
+import { listAccounts, getAccount, selectAvailability, captureAssociation, isCurrentAssociation, confirmAvailability, accountEventVersion, setAccountStatus, markAccountAlive, markAccountRecovery, markAccountCooldown, markLoginRecheck, accountBadgeLabel, platformKey } from './accountManager';
+import { launchKernel, kernelNavigate, kernelEval, checkKernelLogin, closeKernel, getSession, acquireKernel, releaseKernel, persistKernelCookies } from './kernelPool';
+import { AUTOMATION_RESTRICTION_EXPR } from './automationSafety';
+import { loginUrlFor } from './reloginPrompt';
+import { coworkLog } from '../coworkLogger';
+
+// ⚠️ 续期门槛:超过这么久没活跃就主动续(尽量让登录态别过期)。5 天→3 天:更早续上,覆盖 cookie 寿命较短的平台
+//   (固定天数仍不贴各平台真实 TTL,精准做法是按 cookie expires 续(可选增强))。每 60s 扫描到期账号。
+const ALIVE_THRESHOLD_MS = 3 * 24 * 60 * 60 * 1000;  // 3 天没活跃就保活续期
+const SCAN_INTERVAL_MS = 60_000;                    // 只比较本地时间；技术故障按各自退避时间复查
+const RECHECK_MIN_INTERVAL_MS = 24 * 60 * 60 * 1000; // login_required 复验节流:每号 24h 至多一次
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// 动态 require 避免与 sidecar-server 静态循环依赖;SSE 不可用不致命(状态已落盘)。
+function emitAccount(data: Record<string, unknown>): void {
+  try { const { broadcastSSE } = require('../../sidecar-server'); broadcastSSE('matrix:account', data); } catch { /* ignore */ }
+}
+
+function awaitingFirstLogin(a: NonNullable<ReturnType<typeof getAccount>>): boolean {
+  return !a.boundUid && !a.lastAliveAt && !a.authority?.verified;
+}
+
+let sweeping = false;
+let scheduled = false;
+
+/** 扫一遍名单,对「idle 且超 3 天没活跃且没被占用」的号逐个保活。串行 + 抖动。同时只跑一遍(去重)。 */
+export async function runKeepAliveSweep(): Promise<void> {
+  if (sweeping) return;
+  sweeping = true;
+  try {
+    const now = Date.now();
+    const due = listAccounts().filter((a) =>
+      !awaitingFirstLogin(a) && !a.bindingConflict && !a.chargeUncertain && !a.manualDisconnect && !getSession(a.id)
+      && (!a.authority || selectAvailability(a.id,'probe')?.probeEligible)
+      && (
+        (a.status === 'limited' && (!!a.recovery && a.recovery.nextCheckAt <= now || !!a.authority && selectAvailability(a.id,'probe')?.probeEligible))
+        // idle 且超 3 天没活跃 → 常规保活续期
+        || (a.status === 'idle' && (now - (a.lastAliveAt || 0)) > ALIVE_THRESHOLD_MS)
+        // login_required → 复验(误标自愈)。runner 预检单次误判(慢代理/导航失败/CDP 抖动)
+        // 标红后,原来没有任何机制再查一遍 → 好号永久红(用户实测「好多号显示过期、点开却登录着」)。
+        // 复验成功走 markAccountAlive → login_required 翻回 idle;真过期的复验仍失败,保持红,无副作用。
+        // ⚠️ 用户【主动断开】的号除外(manualDisconnect):cookie 已清、永远验不过,复验只会白开窗。
+        // ⚠️ 24h 节流(lastLoginRecheckAt):真过期的号复验注定失败,原来每 12h + 每次开 app 都重来一轮。
+        || (a.status === 'login_required' && !a.manualDisconnect
+            && (now - (a.lastLoginRecheckAt || 0)) > RECHECK_MIN_INTERVAL_MS)
+      ),
+    );
+    for (const acc of due) {
+      // 串行期间状态/占用可能变 → 临用前再确认一次。
+      const cur = getAccount(acc.id);
+      if (!cur || awaitingFirstLogin(cur) || cur.bindingConflict || cur.chargeUncertain || cur.manualDisconnect || getSession(acc.id)
+        || (cur.authority && !selectAvailability(cur.id,'probe')?.probeEligible)
+        || (cur.status !== 'idle' && cur.status !== 'login_required'
+          && !(cur.status === 'limited' && (cur.recovery && cur.recovery.nextCheckAt <= Date.now() || cur.authority && selectAvailability(cur.id,'probe')?.probeEligible)))) continue;
+      await keepAliveOne(acc.id);
+      await sleep(8000 + Math.floor(Math.random() * 7000)); // 抖动 8~15s,别形成机器人式规律
+    }
+  } catch { /* best-effort,不抛 */ } finally {
+    sweeping = false;
+  }
+}
+
+/** 对一个号:headless 访问平台主页续 cookie + 复验登录态;成功更新 lastAliveAt,失败标 login_required。完后关窗。 */
+async function keepAliveOne(accountId: string): Promise<void> {
+  const acc = getAccount(accountId);
+  if (!acc || awaitingFirstLogin(acc) || acc.bindingConflict || acc.chargeUncertain || acc.manualDisconnect) return;
+  // 复验节流时间戳在【尝试时】就记(不等结果):失败/异常同样算「查过了」,24h 内不再对它开窗。
+  if (acc.status === 'login_required') { try { markLoginRecheck(acc.id); } catch { /* ignore */ } }
+  const pk = platformKey(acc);
+  // The manual login page is not positive login evidence. Probe TikTok's normal page.
+  const home = pk === 'tiktok' ? 'https://www.tiktok.com/' : loginUrlFor(acc.platform, acc.loginScope);
+  const fence = acc.authority ? captureAssociation(accountId) : undefined;
+  if (fence?.attemptId || (acc.authority && !selectAvailability(accountId, 'probe')?.probeEligible)) return;
+  let launched = false;
+  let receipt: Awaited<ReturnType<typeof acquireKernel>> | undefined;
+  let ownedSession: ReturnType<typeof getSession>;
+  const current = () => !fence || (isCurrentAssociation(fence) && (!launched || getSession(accountId) === ownedSession));
+  const acquire = async (options: Parameters<typeof launchKernel>[0]): Promise<void> => {
+    if (fence) {
+      receipt = await acquireKernel(options);
+      ownedSession = getSession(accountId);
+      if (ownedSession?.diagnosticsId !== receipt.sessionInstanceId || !current()) throw Error('navigation:cancelled');
+    } else await launchKernel(options);
+    launched = true;
+  };
+  const release = () => {
+    if (receipt) { releaseKernel(receipt); receipt = undefined; }
+    else if (launched) closeKernel(accountId);
+    launched = false;
+  };
+  let headless = true;
+  try {
+    // headless 优先(不打扰);指纹内核 headless 跑不通时回退可见窗,但 background:true 静默(最小化、不弹脸)。
+    try {
+      await acquire({
+        accountId: acc.id, kernelVersion: acc.kernelVersion, userDataDir: acc.userDataDir,
+        fingerprint: acc.fingerprint, proxy: acc.proxy, groupTitle: accountBadgeLabel(acc), headless: true, background: true,
+      });
+      launched = true;
+    } catch {
+      if (!current() || receipt) return;
+      headless = false;
+      await acquire({
+        accountId: acc.id, kernelVersion: acc.kernelVersion, userDataDir: acc.userDataDir,
+        fingerprint: acc.fingerprint, proxy: acc.proxy, groupTitle: accountBadgeLabel(acc), background: true,
+      });
+      launched = true;
+    }
+    if (!home || !current()) return;
+    await kernelNavigate(acc.id, home);
+    await sleep(4000); // 等服务器下发续期 cookie 落盘
+    // A read-only recovery probe must not clear a platform restriction just because cookies survive.
+    const recoveryPageReady = async (): Promise<boolean> => {
+      if (!current()) return false;
+      const saved = getAccount(acc.id);
+      if (!saved || saved.bindingConflict || saved.manualDisconnect || saved.chargeUncertain
+        || saved.status === 'banned' || (saved.status === 'limited' && !saved.recovery && !saved.authority)) return false;
+      if (saved.recovery?.reason === 'rate_limited' && saved.recovery.nextCheckAt > Date.now()) return false;
+      if (!acc.recovery && pk !== 'tiktok') return true;
+      const restriction = await kernelEval(acc.id, AUTOMATION_RESTRICTION_EXPR);
+      if (!current()) return false;
+      if (['captcha', 'login_wall', 'forbidden', 'account_flag', 'rate_limited'].includes(restriction)) {
+        setAccountStatus(acc.id, 'limited', `页面需要人工检查：${restriction}`);
+        return false;
+      }
+      if (typeof restriction !== 'string' || restriction.startsWith('page_error:')) {
+        markAccountRecovery(acc.id, '页面检测失败'); return false;
+      }
+      return true;
+    };
+    if (!await recoveryPageReady()) return;
+    let ok: boolean | null = null;
+    try { ok = await checkKernelLogin(acc.id, pk); } catch { /* Keep an inconclusive result unknown. */ }
+    if (!current()) return;
+    if (ok !== true && !await recoveryPageReady()) return;
+    // 复验(2026-07-05,治小红书等「账号标过期、点开内核页面却登录着」的误报):headless 下部分平台
+    // 会被风控降级当游客(如小红书 /me 返回 guest)→ 单次「未登录」不可信。换【可见后台窗】重开重验
+    // (background:true 静默最小化,不打扰),仍未登录才标 login_required —— 宁可这轮漏标(保持 idle,
+    // 下轮再查),绝不误杀登录着的好号。
+    if (headless && (ok === false || (pk === 'tiktok' && ok === null))) {
+      coworkLog('INFO', 'matrix-keepalive', 'retry login probe in visible background window', { platform: pk, result: ok === null ? 'unknown' : ok });
+      try { release(); } catch { /* ignore */ }
+      launched = false; // 已关;下面重开若失败(kernelPool 已回退计数/锁),finally 不能再 closeKernel(会错放别的流程)
+      try {
+        await acquire({
+          accountId: acc.id, kernelVersion: acc.kernelVersion, userDataDir: acc.userDataDir,
+          fingerprint: acc.fingerprint, proxy: acc.proxy, groupTitle: accountBadgeLabel(acc), background: true,
+        });
+        launched = true;
+        await kernelNavigate(acc.id, home);
+        await sleep(6000);
+        if (!await recoveryPageReady()) return;
+        try { ok = await checkKernelLogin(acc.id, pk); } catch { ok = null; }
+      } catch (error) {
+        // Let the outer handler retain the observed HTTP decision from the second window too.
+        if (typeof (error as { code?: string })?.code === 'string') throw error;
+        ok = null;
+      }
+    }
+    if (!current() || !await recoveryPageReady()) return; // A retry or slow page may have navigated to a new challenge.
+    if (ok === true) {
+      if (fence) {
+        await persistKernelCookies(acc.id);
+        if (!current() || !confirmAvailability(fence, true)) return;
+      }
+      markAccountAlive(acc.id);
+      try { const { probeAndSaveHealth } = await import('./proxyBridge'); await probeAndSaveHealth(acc); } catch { /* 代理探测失败不影响保活 */ }
+    } else if (ok === false) {
+      if (fence) {
+        if (!confirmAvailability(fence, false)) return;
+        emitAccount({ id: acc.id, status: getAccount(acc.id)?.status, ...accountEventVersion(acc.id) });
+      } else {
+        setAccountStatus(acc.id, 'login_required');
+        emitAccount({ id: acc.id, status: 'login_required' });
+      } // 静默标记;弹窗留给下次真发布
+    } else {
+      markAccountRecovery(acc.id, 'login_unknown');
+    }
+  } catch (error) {
+    if (!current()) return;
+    const { code, until } = (error || {}) as { code?: string; until?: number };
+    if (code === 'http_429') markAccountCooldown(acc.id, until || Date.now() + 30 * 60_000);
+    else if (code === 'http_403') setAccountStatus(acc.id, 'limited', '平台拒绝访问（HTTP 403）');
+    else if (code === 'http_407') setAccountStatus(acc.id, 'limited', '代理要求认证（HTTP 407）');
+    else if (code === 'http_error') setAccountStatus(acc.id, 'limited', '主页面返回 HTTP 错误');
+    else if (code && ['http_5xx', 'connection', 'dns', 'tunnel', 'tls', 'proxy', 'timeout', 'protocol', 'target_closed', 'browser_error'].includes(code)) {
+      markAccountRecovery(acc.id, `network_error:navigation:${code}`);
+    } else if (!code) markAccountRecovery(acc.id, 'network_error:网络或浏览器连接失败');
+  } finally {
+    try { release(); } catch { /* ignore */ }
+  }
+}
+
+/** 启动主动保活调度:立即扫描 + 每 60s 筛选到期账号。重复调用只生效一次。 */
+export function startKeepAliveScheduler(): void {
+  if (scheduled) return;
+  scheduled = true;
+  void runKeepAliveSweep();
+  setInterval(() => { void runKeepAliveSweep(); }, SCAN_INTERVAL_MS);
+}

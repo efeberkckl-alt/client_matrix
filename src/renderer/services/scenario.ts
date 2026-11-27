@@ -1,0 +1,1410 @@
+/**
+ * Scenario service — thin renderer-side wrapper around window.electron.scenario.
+ *
+ * All scenario logic (discovery, extraction, composition, risk guard, draft
+ * upload) lives in the main process. This file only exposes convenient
+ * async methods so React components don't have to reach into window.electron
+ * directly.
+ */
+
+import type {
+  ScenarioManifestIPC,
+  ScenarioTaskIPC,
+  ScenarioDraftIPC,
+  ScenarioRunOutcome,
+  ScenarioPlatform,
+  ScenarioWorkflowType,
+  ScenarioTaskRun,
+  ScenarioRunProgress,
+  XhsLoginStatus,
+} from '../types/scenario';
+import { MATRIX_EDITION } from '../matrixEdition';
+import { DEFAULT_SCENARIOS } from '../data/defaultScenarios';
+import { noobClawAuth } from './noobclawAuth';
+
+// 矩阵操作前置:未登录 NoobClaw 账号则弹登录窗,返回 false(拦在建/改/删/运行任务前)。
+function ensureMatrixLogin(): boolean {
+  if (noobClawAuth.getState().isAuthenticated) return true;
+  noobClawAuth.requireLoginUI();
+  return false;
+}
+
+export type Scenario = ScenarioManifestIPC;
+export type Task = ScenarioTaskIPC;
+export type Draft = ScenarioDraftIPC;
+export type RunOutcome = ScenarioRunOutcome;
+
+// ─────────────────────────────────────────────────────────────────────────
+// 矩阵号(MATRIX_EDITION)适配层
+//
+// 真 ScenarioView 那套页面(列表/详情/进度/运行记录)全靠 scenarioService 这层
+// 取数。矩阵号自成运行时(指纹内核池 + engageRunner + 本地 taskStore/runStore),
+// 接口在 window.electron.matrix.*。这里把矩阵的数据形状【转换】成旧页面期望的
+// ScenarioTaskIPC / ScenarioRunProgress / 运行记录,使真页面一行不改即可渲染矩阵
+// 数据。详见记忆 project_matrix_reuse_scenario_pages。
+// ─────────────────────────────────────────────────────────────────────────
+
+const MX = (): any => (window as any).electron?.matrix;
+const pad2 = (n: number) => String(n).padStart(2, '0');
+const hhmmss = (ts: number) => { const d = new Date(ts); return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`; };
+
+// 矩阵 8 个「互动涨粉」平台 → 后端 backend/matrix/scenarios 的剧本 id(币安是 binance_square_auto_engage)。
+// 之前 mxTaskToScenario 把所有平台任务都写成 'douyin_auto_engage' → ScenarioView 按
+// scenario.platform 过滤 tab 时,非抖音任务全被归到抖音 tab、对应平台 tab 显示为空,
+// 但 saveTask 是按真实 platform 存的 → 再建会撞 duplicate_type。这里按真实 platform 映射修正。
+const MATRIX_ENGAGE_SCENARIO_ID: Record<string, string> = {
+  douyin: 'douyin_auto_engage', xhs: 'xhs_auto_engage', kuaishou: 'kuaishou_auto_engage',
+  bilibili: 'bilibili_auto_engage', x: 'x_auto_engage', binance: 'binance_square_auto_engage',
+  youtube: 'youtube_auto_engage', tiktok: 'tiktok_auto_engage',
+  // ⚠️ 新平台必须补进来:缺了会兜底成 douyin_auto_engage → 卡片/详情/运行记录全按「抖音」渲染(用户实测)。
+  facebook: 'facebook_auto_engage', reddit: 'reddit_auto_engage', instagram: 'instagram_auto_engage',
+  gate: 'gate_auto_engage', bitget: 'bitget_auto_engage', bybit: 'bybit_auto_engage', okx: 'okx_auto_engage',
+};
+const MATRIX_ENGAGE_ID_TO_PLATFORM: Record<string, string> =
+  Object.fromEntries(Object.entries(MATRIX_ENGAGE_SCENARIO_ID).map(([p, id]) => [id, p]));
+// 平台展示名/图标:给客户端快照里缺失的 engage 场景兜底。打包快照只从 backend/scenarios 生成,
+// 而 xhs_auto_engage 只在 backend/matrix/scenarios → 快照里没有,不补就 lookup 不到 platform → tab 仍为空。
+const MATRIX_ENGAGE_META: Record<string, { name_zh: string; icon: string }> = {
+  douyin: { name_zh: '抖音 互动涨粉', icon: '🎶' }, xhs: { name_zh: '小红书 互动涨粉', icon: '📕' },
+  kuaishou: { name_zh: '快手 互动涨粉', icon: '⚡' }, bilibili: { name_zh: '哔哩哔哩 互动涨粉', icon: '📺' },
+  x: { name_zh: '推特 互动涨粉', icon: '🐦' }, binance: { name_zh: '币安广场互动涨粉', icon: '🤝' },
+  youtube: { name_zh: 'YouTube 互动涨粉', icon: '▶️' }, tiktok: { name_zh: 'TikTok 互动涨粉', icon: '🎬' },
+  facebook: { name_zh: 'Facebook 互动涨粉', icon: '👥' }, reddit: { name_zh: 'Reddit 互动涨粉', icon: '🟠' },
+  instagram: { name_zh: 'Instagram 互动涨粉', icon: '📷' },
+  gate: { name_zh: 'Gate广场 互动涨粉', icon: '🟦' }, bitget: { name_zh: 'Bitget Insight 互动涨粉', icon: '🔵' },
+  bybit: { name_zh: 'Bybit Byx 互动涨粉', icon: '🟠' }, okx: { name_zh: 'OKX星球 互动涨粉', icon: '⚫' },
+};
+const engageScenarioIdForPlatform = (platform?: string): string =>
+  (platform && MATRIX_ENGAGE_SCENARIO_ID[platform]) || 'douyin_auto_engage';
+
+// 「自动回复粉丝」剧本(backend/matrix/scenarios/<platform>_reply_fans_comment)。目前 4 个平台有
+// 剧本(xhs 逐篇笔记进详情页;抖音/快手/哔哩哔哩创作中心评论管理集中回复)。同 engage 一样需要补快照,
+// 否则 reply_fan 任务的 scenario_id 在 listScenarios 里 lookup 不到 platform → 任务 tab 为空。
+const MATRIX_REPLY_SCENARIO_ID: Record<string, string> = {
+  xhs: 'xhs_reply_fans_comment', douyin: 'douyin_reply_fans_comment', kuaishou: 'kuaishou_reply_fans_comment',
+  bilibili: 'bilibili_reply_fans_comment', toutiao: 'toutiao_reply_fans_comment',
+  shipinhao: 'shipinhao_reply_fans_comment',
+};
+const MATRIX_REPLY_ID_TO_PLATFORM: Record<string, string> =
+  Object.fromEntries(Object.entries(MATRIX_REPLY_SCENARIO_ID).map(([p, id]) => [id, p]));
+const MATRIX_REPLY_META: Record<string, { name_zh: string; icon: string }> = {
+  xhs: { name_zh: '小红书 自动回复粉丝', icon: '💌' }, douyin: { name_zh: '抖音 自动回复粉丝', icon: '💌' },
+  kuaishou: { name_zh: '快手 自动回复粉丝', icon: '💌' }, bilibili: { name_zh: '哔哩哔哩 自动回复粉丝', icon: '💌' },
+  toutiao: { name_zh: '头条号 自动回复粉丝', icon: '💌' }, shipinhao: { name_zh: '视频号 自动回复粉丝', icon: '💌' },
+};
+
+// 「视频无水印下载」剧本(backend/matrix/scenarios/<platform>_video_download)。单账号工具任务:
+// 选 1 个号 + 粘贴多个链接,逐个下载。目前仅抖音。同样需补快照,否则任务 scenario_id lookup 不到 platform。
+const MATRIX_DOWNLOAD_SCENARIO_ID: Record<string, string> = {
+  douyin: 'douyin_video_download', kuaishou: 'kuaishou_video_download',
+  bilibili: 'bilibili_video_download', tiktok: 'tiktok_video_download',
+  xhs: 'xhs_video_download',
+  // youtube:下载向导已支持(yt-dlp 无账号模式),缺映射会让 updateTask 兜底把平台改写成 douyin(审计发现)。
+  youtube: 'youtube_video_download',
+};
+const MATRIX_DOWNLOAD_ID_TO_PLATFORM: Record<string, string> =
+  Object.fromEntries(Object.entries(MATRIX_DOWNLOAD_SCENARIO_ID).map(([p, id]) => [id, p]));
+const MATRIX_DOWNLOAD_META: Record<string, { name_zh: string; icon: string }> = {
+  douyin: { name_zh: '抖音 视频无水印下载', icon: '⬇️' }, kuaishou: { name_zh: '快手 视频无水印下载', icon: '⬇️' },
+  bilibili: { name_zh: '哔哩哔哩 视频无水印下载', icon: '⬇️' }, tiktok: { name_zh: 'TikTok 视频无水印下载', icon: '⬇️' },
+  xhs: { name_zh: '小红书 视频无水印下载', icon: '⬇️' },
+  youtube: { name_zh: 'YouTube 视频无水印下载', icon: '⬇️' },
+};
+
+// 「图文创作」剧本(backend/matrix/scenarios/<platform>_image_text)。N 个号各自按身份生成图文+配图+发布。
+// 目前仅抖音(小红书第二步)。同样需补快照,否则任务 scenario_id lookup 不到 platform。
+const MATRIX_IMAGETEXT_SCENARIO_ID: Record<string, string> = {
+  douyin: 'douyin_image_text', xhs: 'xhs_image_text', shipinhao: 'shipinhao_image_text',
+  toutiao: 'toutiao_image_text',
+};
+const MATRIX_IMAGETEXT_ID_TO_PLATFORM: Record<string, string> =
+  Object.fromEntries(Object.entries(MATRIX_IMAGETEXT_SCENARIO_ID).map(([p, id]) => [id, p]));
+const MATRIX_IMAGETEXT_META: Record<string, { name_zh: string; icon: string }> = {
+  douyin: { name_zh: '抖音 图文创作', icon: '📝' }, xhs: { name_zh: '小红书 图文创作', icon: '📝' },
+  shipinhao: { name_zh: '视频号 图文创作', icon: '📝' }, toutiao: { name_zh: '头条号 图文创作', icon: '📝' },
+};
+
+// 「爆款批量仿写」剧本(backend/matrix/scenarios/<platform>_viral_production_career)。目前仅小红书。
+const MATRIX_VIRAL_SCENARIO_ID: Record<string, string> = {
+  xhs: 'xhs_viral_production_career',
+};
+const MATRIX_VIRAL_ID_TO_PLATFORM: Record<string, string> =
+  Object.fromEntries(Object.entries(MATRIX_VIRAL_SCENARIO_ID).map(([p, id]) => [id, p]));
+const MATRIX_VIRAL_META: Record<string, { name_zh: string; icon: string }> = {
+  xhs: { name_zh: '小红书 爆款批量仿写', icon: '🔥' },
+};
+
+// 「自动发推」剧本(backend/matrix/scenarios/x_post)。N 个号各自 AI 原创一条推 + 可选配图 → 发到各自时间线。目前仅推特。
+const MATRIX_TWEET_SCENARIO_ID: Record<string, string> = {
+  x: 'x_post',
+};
+const MATRIX_TWEET_ID_TO_PLATFORM: Record<string, string> =
+  Object.fromEntries(Object.entries(MATRIX_TWEET_SCENARIO_ID).map(([p, id]) => [id, p]));
+const MATRIX_TWEET_META: Record<string, { name_zh: string; icon: string }> = {
+  x: { name_zh: '推特 自动发推', icon: '🐦' },
+};
+
+// 「币安广场自动发帖」剧本(backend/matrix/scenarios/binance_post)。N 号各自抓 web3 资讯 AI 原创一条币安广场图文 + 可选配图 → 发币安广场。目前仅币安。
+// ⚠️ 交易所广场四家共用这套发帖链路(runner 按 platform 推剧本 id `${platform}_post`)。
+//    只登记 binance 的话:① 用 scenario_id 建/编辑 gate_post 任务时匹配不到这张表 → 落到兜底
+//    被改成 engage、binancePost 配置丢失;② 下面的 synthBinance 补不出剧本快照 → 任务归不到
+//    对应平台 tab、卡片名回退。
+const MATRIX_BINANCE_SCENARIO_ID: Record<string, string> = {
+  binance: 'binance_post',
+  gate: 'gate_post', bitget: 'bitget_post', bybit: 'bybit_post', okx: 'okx_post',
+};
+const MATRIX_BINANCE_ID_TO_PLATFORM: Record<string, string> =
+  Object.fromEntries(Object.entries(MATRIX_BINANCE_SCENARIO_ID).map(([p, id]) => [id, p]));
+const MATRIX_BINANCE_META: Record<string, { name_zh: string; icon: string }> = {
+  binance: { name_zh: '币安广场 自动发帖', icon: '📊' },
+  gate: { name_zh: 'Gate广场 自动发帖', icon: '🟦' }, bitget: { name_zh: 'Bitget Insight 自动发帖', icon: '🔵' },
+  bybit: { name_zh: 'Bybit Byx 自动发帖', icon: '🟠' }, okx: { name_zh: 'OKX星球 自动发帖', icon: '⚫' },
+};
+
+// 「币安广场批量搬运」剧本(backend/matrix/scenarios/binance_repost)。1 源平台采集号搜+下 → N 币安号各领一条仿写发。发布目标=币安,scenario_id 固定 'binance_repost'(非平台后缀)。
+// 交易所广场四家的搬运剧本 id 同样是 `${platform}_repost`。⚠️ 判定搬运任务时必须认全这 5 个,
+//   只认 'binance_repost' 会让四家的搬运任务被当成 engage → 配置丢失 + 卡片显示成互动涨粉。
+const MATRIX_REPOST_IDS = new Set(['binance_repost', 'gate_repost', 'bitget_repost', 'bybit_repost', 'okx_repost']);
+const repostPlatformFromId = (id: string): string => String(id || '').replace(/_repost$/, '') || 'binance';
+const MATRIX_REPOST_META: Record<string, string> = {
+  binance: '币安广场 批量搬运', gate: 'Gate广场 批量搬运', bitget: 'Bitget Insight 批量搬运',
+  bybit: 'Bybit Byx 批量搬运', okx: 'OKX星球 批量搬运',
+};
+
+// ── 交易所广场(gate / okx / bitget / bybit)的任务徽章 ──
+// 这 4 家各有 engage / post / repost 三个剧本 = 12 个 scenario_id,而 MyTasksPage /
+// RunHistoryPage / TaskDetailPage 里那三条【写死的平台链条】一个都没登记它们 →
+// 一路 fallthrough 到链尾的小红书默认值:OKX 的互动任务卡片显示成「小红书 · 互动涨粉」、
+// 详情页显示「直接发布到 小红书」(2026-08-03 用户实拍)。
+// 标签用【已有的】平台名 key + 动作名 key 拼出来,9 种语言全覆盖,不必为 12 个剧本
+// 各补 9 条文案。以后再加交易所只改这张表,三个页面不用动。
+export const EXCHANGE_SQUARE_META: Record<string, { platKey: string; icon: string; color: string }> = {
+  gate: { platKey: 'scenarioPlatformGate', icon: '🟦', color: 'text-sky-500 bg-sky-500/10 border-sky-500/30' },
+  okx: { platKey: 'scenarioPlatformOkx', icon: '⚫', color: 'text-slate-400 bg-slate-500/10 border-slate-500/30' },
+  bitget: { platKey: 'scenarioPlatformBitget', icon: '🔵', color: 'text-blue-500 bg-blue-500/10 border-blue-500/30' },
+  bybit: { platKey: 'scenarioPlatformBybit', icon: '🟠', color: 'text-orange-500 bg-orange-500/10 border-orange-500/30' },
+};
+// 动作名复用现成的卡片标题 key:互动涨粉 / 自动发帖 / 批量搬运(9 语言都有)。
+const EXCHANGE_ACTION_KEY: Record<string, string> = {
+  auto_engage: 'svCardEngageTitle', post: 'svCardBinancePostTitle', repost: 'svCardRepostTitle',
+};
+/** scenario_id → 徽章信息;不是交易所广场剧本返回 null(调用方继续走自己的链条)。 */
+export function exchangeSquareBadge(scenarioId?: string):
+  { platform: string; platKey: string; actionKey: string; icon: string; color: string } | null {
+  const m = /^(gate|okx|bitget|bybit)_(auto_engage|post|repost)$/.exec(String(scenarioId || ''));
+  if (!m) return null;
+  const meta = EXCHANGE_SQUARE_META[m[1]];
+  return { platform: m[1], platKey: meta.platKey, actionKey: EXCHANGE_ACTION_KEY[m[2]], icon: meta.icon, color: meta.color };
+}
+/** 平台名的 i18n key(给「直接发布到 X」这类文案用);不是交易所返回 null。 */
+export function exchangeSquarePlatformKey(platform?: string, scenarioId?: string): string | null {
+  const p = platform && EXCHANGE_SQUARE_META[platform] ? platform : (exchangeSquareBadge(scenarioId)?.platform || '');
+  return (p && EXCHANGE_SQUARE_META[p]?.platKey) || null;
+}
+
+// 「举报」剧本(backend/matrix/scenarios/<platform>_report)。白名单功能(admin 配 UID 才可见),目前仅抖音。
+//   单账号、1-4 条链接、手动触发。同样补快照,否则 scenario_id lookup 不到 platform、任务卡不出现。
+export const MATRIX_REPORT_SCENARIO_ID: Record<string, string> = { douyin: 'douyin_report' };
+const MATRIX_REPORT_ID_TO_PLATFORM: Record<string, string> =
+  Object.fromEntries(Object.entries(MATRIX_REPORT_SCENARIO_ID).map(([p, id]) => [id, p]));
+const MATRIX_REPORT_META: Record<string, { name_zh: string; icon: string }> = {
+  douyin: { name_zh: '抖音Report', icon: '📋' },
+};
+/** 矩阵任务 → 旧 ScenarioTaskIPC(赛道/关键词在账号上,task 这两个字段留空;
+ *  配额映射到 daily_*_min/max 这套 douyin_auto_engage 字段)。 */
+export function mxTaskToScenario(t: any): ScenarioTaskIPC {
+  const q = t?.quota || {};
+  // 「自动回复粉丝」(type='reply_fan')任务:映射到对应平台的 *_reply_fans_comment 剧本 +
+  //   track='reply_fan_comment',并带上引流语/概率 —— TaskDetailPage 靠这两个判定 isReplyFan
+  //   并展示引流配置(funnel_phrase/funnel_probability);否则会被当互动任务、引流配置丢失。
+  const isReply = t?.type === 'reply_fan';
+  const isEngage = t?.type === 'engage';
+  const isDownload = t?.type === 'video_download';
+  const isImageText = t?.type === 'image_text';
+  const isViral = t?.type === 'viral_rewrite';
+  const isTweet = t?.type === 'x_post';
+  const isBinancePost = t?.type === 'binance_post';
+  const isFacebookPost = t?.type === 'facebook_post';
+  const isRedditPost = t?.type === 'reddit_post';
+  const isInstagramPost = t?.type === 'instagram_post';
+  const isRepost = t?.type === 'binance_repost';
+  const isLead = t?.type === 'lead_engage';
+  const isReport = t?.type === 'report';
+  const isCommentLike = t?.type === 'comment_like';   // 评论区点赞评论(tiktok_comment_like)
+  const isBlock = t?.type === 'block';                // 批量拉黑(douyin_block)
+  const isFolderPost = t?.type === 'folder_post';     // 文件夹定时发布(客户端 runner,无后端剧本)
+  const reportItems: any[] = Array.isArray(t?.reportItems) ? t.reportItems : [];
+  const fn = t?.funnel || {};
+  const dlUrls: string[] = Array.isArray(t?.urls) ? t.urls : [];
+  return {
+    id: t.id,
+    // name 必须透传:scenarioInputToMxSave 各分支是 input.name || 硬编码默认名,不带的话
+    // updateTask 兜底会把任务改名(engage 分支恒「抖音互动」,无视平台)。审计发现的潜伏坑。
+    name: t.name,
+    // 任务真实 platform 必须透传:ScenarioView 矩阵模式按 t.platform 过滤 tab(FB/Reddit/Ins 剧本
+    //   不在客户端注册表里,scenario_id 映射不到)。之前没带 → 过滤后所有任务全部隐身(用户实测)。
+    platform: t.platform,
+    // 按任务真实 platform + 类型映射剧本 id(原来写死 douyin/engage → 非抖音 tab 看不到任务、回复粉丝错显成互动)。
+    scenario_id: isFolderPost ? `${t.platform}_folder_post` : isBlock ? `${t.platform}_block` : isCommentLike ? `${t.platform}_comment_like` : isReport ? `${t.platform}_report` : isReply ? `${t.platform}_reply_fans_comment` : isDownload ? `${t.platform}_video_download` : isImageText ? `${t.platform}_image_text` : isViral ? `${t.platform}_viral_production_career` : isRepost ? `${t.platform}_repost` : isLead ? `${t.platform}_lead_engage` : (isTweet || isBinancePost || isFacebookPost || isRedditPost || isInstagramPost) ? `${t.platform}_post` : engageScenarioIdForPlatform(t.platform),
+    track: isFolderPost ? 'folder_post' : isBlock ? 'block' : isCommentLike ? 'comment_like' : isReport ? 'report' : isReply ? 'reply_fan_comment' : isDownload ? 'video_download' : isImageText ? 'image_text' : isViral ? 'viral_production' : isTweet ? 'x_post' : isBinancePost ? 'binance_post' : isFacebookPost ? 'facebook_post' : isRedditPost ? 'reddit_post' : isInstagramPost ? 'instagram_post' : isRepost ? 'binance_repost' : isLead ? 'lead_engage' : 'matrix',
+    // 定向获客配置透传(详情页/编辑回填 + updateTask 兜底不丢配置)。
+    lead_engage: isLead ? t.leadEngage : undefined,
+    // 举报:条目 + 执行锁时间透传(详情页展示「已执行,不可再运行」、编辑回填)。
+    report_items: isReport ? reportItems : undefined,
+    report_executed_at: isReport ? (t.reportExecutedAt || null) : undefined,
+    report_results: isReport ? (t.reportResults || []) : undefined,
+    report_dry_run_at: isReport ? (t.reportDryRunAt || null) : undefined,
+    report_dry_run_results: isReport ? (t.reportDryRunResults || []) : undefined,
+    // image_text / viral_rewrite / x_post / binance_post / facebook_post / reddit_post / instagram_post / binance_repost 配置透传(详情页/编辑回填 + updateTask 兜底不丢配置)。
+    imageText: isImageText ? t.imageText : undefined,
+    viralRewrite: isViral ? t.viralRewrite : undefined,
+    tweetPost: isTweet ? t.tweetPost : undefined,
+    binancePost: isBinancePost ? t.binancePost : undefined,
+    facebookPost: isFacebookPost ? t.facebookPost : undefined,
+    redditPost: isRedditPost ? t.redditPost : undefined,
+    instagramPost: isInstagramPost ? t.instagramPost : undefined,
+    binanceRepost: isRepost ? t.binanceRepost : undefined,
+    // viral_rewrite 也摊平 AI 风格/发布给详情页(它也走 AI 生图 + 发布)。
+    ...(isViral && t.viralRewrite ? { ai_image_style: t.viralRewrite.aiImageStyle || '', auto_publish: !!t.viralRewrite.autoPublish, auto_upload: !!t.viralRewrite.autoPublish } : {}),
+    // 摊平给详情页 ConfigCard 读(它读 use_real_photos / real_photo_count / ai_image_style 这套老字段)。
+    //   之前只传 imageText 对象 → 详情页读 task.use_real_photos=undefined → 选了网络图也恒显「AI 生图」。
+    use_real_photos: isImageText ? !!(t.imageText && t.imageText.useRealPhotos) : undefined,
+    real_photo_count: (isImageText && t.imageText && typeof t.imageText.imageCount === 'number') ? t.imageText.imageCount : undefined,
+    ai_image_style: (isImageText && t.imageText) ? (t.imageText.aiImageStyle || '') : undefined,
+    auto_publish: isImageText ? !!(t.imageText && t.imageText.autoPublish) : undefined,
+    auto_upload: isImageText ? !!(t.imageText && t.imageText.autoPublish) : undefined,
+    keywords: [],
+    persona: '',
+    // video_download:粘贴的链接清单(详情页/编辑回填用),daily_count = 链接数。
+    urls: (isDownload || isCommentLike) ? dlUrls : undefined,
+    // comment_like:每号本次最多点赞数(详情页展示 + 编辑回填)。
+    comment_like_max: isCommentLike ? (t.commentLikeMax || 100) : undefined,
+    comment_mode: isCommentLike ? (t.commentMode || 'precise') : undefined,
+    comment_posts: isCommentLike ? t.commentPosts : undefined,
+    custom_comment_policy: isCommentLike ? t.customCommentPolicy : undefined,
+    comment_do_like: isCommentLike ? t.commentDoLike !== false : undefined,
+    comment_do_reply: isCommentLike ? t.commentDoReply !== false : undefined,
+    comment_video_limit: isCommentLike ? t.commentVideoLimit : undefined,
+    comment_replies_per_video: isCommentLike ? t.commentRepliesPerVideo : undefined,
+    // block:名单 + 关键词(详情页展示 + 编辑回填)。
+    block_targets: isBlock ? (Array.isArray(t.blockTargets) ? t.blockTargets : []) : undefined,
+    block_keywords: isBlock ? (Array.isArray(t.blockKeywords) ? t.blockKeywords : []) : undefined,
+    block_mode: isBlock ? (t.blockMode || undefined) : undefined,
+    block_targets_by_account: isBlock ? (t.blockTargetsByAccount || undefined) : undefined,
+    // folder_post:各号时段 + 浮动(详情页展示 + 编辑回填 + updateTask 兜底不丢配置)。
+    folder_post: isFolderPost ? t.folderPost : undefined,
+    daily_count: (isDownload || isCommentLike) ? (dlUrls.length || 1) : isReport ? (reportItems.length || 1) : 1,
+    variants_per_post: 1,
+    daily_time: '',
+    run_interval: t.frequency,
+    enabled: !!t.enabled,
+    active: !!t.enabled,
+    next_planned_run_at: t.nextPlannedRunAt,
+    retry_count: t.retryCount,
+    last_error: t.lastError,
+    recovery_paused: t.recoveryPaused,
+    daily_like_min: q.daily_like_min, daily_like_max: q.daily_like_max,
+    daily_follow_min: q.daily_follow_min, daily_follow_max: q.daily_follow_max,
+    daily_comment_min: q.daily_comment_min, daily_comment_max: q.daily_comment_max,
+    // 海外平台「强制评论语言」:必须透传,否则详情页 langTag 读不到(t.comment_lang)永远不显示;
+    // 且经 updateTask 兜底写回时会把已存的语言抹掉(用户实测:币安/TikTok/YouTube 详情页都看不到)。
+    comment_lang: q.comment_lang,
+    // 刷剧模式:同 comment_lang 一样必须透传,否则详情页读不到 t.engage_mode 永远不显示模式,
+    // 且 updateTask 兜底写回时会把已存的模式抹掉(与 comment_lang 完全同类的坑)。
+    engage_mode: q.engage_mode,
+    // 收藏配额 + 精准模式配置:与 comment_lang / engage_mode 完全同类的坑 ——
+    //   不在这里透传,详情页读不到,而且 updateTask 兜底写回时会把已存的值抹掉。
+    daily_favorite_min: q.daily_favorite_min, daily_favorite_max: q.daily_favorite_max,
+    max_comment_per_work: q.max_comment_per_work,
+    precise_urls: q.precise_urls, precise_like: q.precise_like,
+    precise_favorite: q.precise_favorite, precise_follow: q.precise_follow,
+    precise_comment: q.precise_comment,
+    // 回复粉丝 + 互动(评论引流)都带引流尾巴配置(供详情页展示 + 编辑回填)。
+    // 互动任务的引流:评论时由后端剧本按概率把引流语接在评论尾巴(engageRunner 只透传)。
+    funnel_phrase: (isReply || isEngage || isLead) ? (fn.funnel_phrase || '') : undefined,
+    funnel_probability: (isReply || isEngage || isLead) ? (typeof fn.funnel_probability === 'number' ? fn.funnel_probability : 0) : undefined,
+    // 各账号独立引流语:必须透传,否则 updateTask 兜底(如 MyTasksPage 改启用)会把它抹掉(与 comment_lang 同类坑)。
+    funnel_by_account: (isReply || isEngage || isLead) ? (t.funnelByAccount || undefined) : undefined,
+    // AI改写引流语(共用那份,存在 task.funnel 里)+ AI自主评论(任务级):同上必须透传,缺省 = 开。
+    funnel_rewrite: (isReply || isEngage || isLead) ? (fn.funnel_rewrite === false ? false : undefined) : undefined,
+    ai_comment: (isReply || isEngage || isLead) ? (t.ai_comment === false ? false : undefined) : undefined,
+    // 单个用户评论最大回复数（仅抖音回复粉丝）—— 同上，必须透传。
+    max_reply_per_comment: isReply ? (t as any).maxReplyPerComment : undefined,
+    // 每号本次运行最多回复几条(仅抖音回复粉丝)—— 同上,必须透传。
+    max_replies_per_run: isReply ? (t as any).maxRepliesPerRun : undefined,
+    account_ids: t.accountIds || [],
+    created_at: t.createdAt || 0,
+    updated_at: t.createdAt || 0,
+  } as any;
+}
+
+/** 旧 createTask/updateTask 入参(ScenarioTaskIPC 形状)→ 矩阵 saveTask 入参。 */
+function scenarioInputToMxSave(input: any, id?: string): any {
+  const accountIds: string[] = input.account_ids || [];
+  // 举报(scenario_id 以 _report 结尾):保持 type='report' + 透传条目;频率/启用恒为「仅手动一次」。
+  if (typeof input.scenario_id === 'string' && input.scenario_id.endsWith('_report')) {
+    const pPlatform = MATRIX_REPORT_ID_TO_PLATFORM[input.scenario_id] || 'douyin';
+    const items: any[] = Array.isArray(input.report_items) ? input.report_items : [];
+    return {
+      id,
+      platform: pPlatform,
+      type: 'report',
+      name: input.name || `抖音Report · ${items.length} 条`,
+      accountIds,                 // 抖音Report 可多选执行账号(2026-10-18)
+      quota: {},
+      reportItems: items,
+      concurrency: 1,
+      frequency: 'once',
+      enabled: false,
+    };
+  }
+  // 回复粉丝任务(scenario_id 以 _reply_fans_comment 结尾):保持 type='reply_fan' + 透传引流尾巴,
+  // 否则经 updateTask(如 MyTasksPage 改启用)兜底回 type='engage' → 任务被错改成互动、引流配置丢。
+  if (typeof input.scenario_id === 'string' && input.scenario_id.endsWith('_reply_fans_comment')) {
+    const rPlatform = MATRIX_REPLY_ID_TO_PLATFORM[input.scenario_id] || 'xhs';
+    return {
+      id,
+      platform: rPlatform,
+      type: 'reply_fan',
+      name: input.name || (accountIds.length ? `${rPlatform}回复粉丝 · ${accountIds.length} 个号` : `${rPlatform}回复粉丝`),
+      accountIds,
+      quota: {},
+      funnel: {
+        funnel_phrase: input.funnel_phrase || '',
+        funnel_probability: typeof input.funnel_probability === 'number' ? input.funnel_probability : 0,
+        ...(input.funnel_rewrite === false ? { funnel_rewrite: false } : {}),
+      },
+      ai_comment: input.ai_comment,   // undefined 时 taskStore 保留旧值
+      // 各账号独立引流语写回(undefined 时 taskStore 保留旧值,不误清)。
+      funnelByAccount: input.funnel_by_account,
+      // 同上：不写回的话，在「我的任务」里改个启用开关都会把它抹掉。
+      maxReplyPerComment: (input as any).max_reply_per_comment,
+      maxRepliesPerRun: (input as any).max_replies_per_run,
+      concurrency: accountIds.length,
+      frequency: input.run_interval || 'daily_random',
+      enabled: input.enabled !== false,
+    };
+  }
+  // 定向获客任务(scenario_id 以 _lead_engage 结尾):保持 type='lead_engage' + 透传 leadEngage,
+  // 否则经 updateTask(如 MyTasksPage 改启用/删除)兜底会被改成 engage、获客配置全丢。
+  if (typeof input.scenario_id === 'string' && input.scenario_id.endsWith('_lead_engage')) {
+    const lPlatform = input.platform || String(input.scenario_id).replace(/_lead_engage$/, '') || 'tiktok';
+    return {
+      id,
+      platform: lPlatform,
+      type: 'lead_engage',
+      name: input.name || (accountIds.length ? `TikTok 定向获客 · ${accountIds.length} 个号` : 'TikTok 定向获客'),
+      accountIds,
+      quota: {},
+      leadEngage: input.lead_engage,   // undefined 时 taskStore 保留旧值,不误清
+      // 引流语同样要回写,否则 updateTask 兜底(如列表里改启用)会把它抹掉。
+      funnel: {
+        funnel_phrase: input.funnel_phrase || '',
+        funnel_probability: typeof input.funnel_probability === 'number' ? input.funnel_probability : 0,
+        ...(input.funnel_rewrite === false ? { funnel_rewrite: false } : {}),
+      },
+      ai_comment: input.ai_comment,   // undefined 时 taskStore 保留旧值
+      funnelByAccount: input.funnel_by_account,
+      concurrency: accountIds.length,
+      frequency: input.run_interval || 'daily_random',
+      enabled: input.enabled !== false,
+    };
+  }
+  // 文件夹定时发布(scenario_id 以 _folder_post 结尾):保持 type='folder_post' + 透传时段配置,否则 updateTask 兜底会改成 engage。
+  if (typeof input.scenario_id === 'string' && input.scenario_id.endsWith('_folder_post')) {
+    const fPlatform = input.platform || String(input.scenario_id).replace(/_folder_post$/, '') || 'douyin';
+    return {
+      id, platform: fPlatform, type: 'folder_post', name: input.name || '抖音文件夹定时发布', accountIds, quota: {},
+      folderPost: (input as any).folder_post,
+      concurrency: accountIds.length || 1, frequency: 'daily_random', enabled: input.enabled !== false,
+    };
+  }
+  // 批量拉黑(scenario_id 以 _block 结尾):保持 type='block' + 透传名单/关键词,否则 updateTask 兜底会改成 engage、名单丢失。
+  if (typeof input.scenario_id === 'string' && input.scenario_id.endsWith('_block')) {
+    const bPlatform = input.platform || String(input.scenario_id).replace(/_block$/, '') || 'douyin';
+    return {
+      id,
+      platform: bPlatform,
+      type: 'block',
+      name: input.name || '抖音批量拉黑',
+      accountIds,
+      quota: {},
+      blockTargets: Array.isArray((input as any).block_targets) ? (input as any).block_targets : [],
+      blockKeywords: Array.isArray((input as any).block_keywords) ? (input as any).block_keywords : [],
+      blockMode: (input as any).block_mode,
+      blockTargetsByAccount: (input as any).block_targets_by_account,
+      concurrency: (input as any).concurrency || 1,
+      frequency: input.run_interval || 'once',
+      enabled: input.enabled !== false,
+    };
+  }
+  // 评论区点赞评论(scenario_id 以 _comment_like 结尾):保持 type='comment_like' + 透传 urls / commentLikeMax,
+  // 否则经 updateTask 兜底(如列表里改启用)会被改成 engage、链接清单丢失。
+  if (typeof input.scenario_id === 'string' && input.scenario_id.endsWith('_comment_like')) {
+    const cPlatform = input.platform || String(input.scenario_id).replace(/_comment_like$/, '') || 'tiktok';
+    const urls: string[] = Array.isArray(input.urls) ? input.urls : [];
+    return {
+      id,
+      platform: cPlatform,
+      type: 'comment_like',
+      name: input.name || `TikTok 评论区点赞评论 · ${urls.length} 条`,
+      accountIds,
+      quota: {},
+      urls,
+      commentLikeMax: (input as any).comment_like_max,
+      commentMode: input.comment_mode,
+      commentPosts: input.comment_posts,
+      customCommentPolicy: input.custom_comment_policy,
+      commentDoLike: (input as any).comment_do_like,
+      commentDoReply: (input as any).comment_do_reply,
+      commentVideoLimit: (input as any).comment_video_limit,
+      commentRepliesPerVideo: (input as any).comment_replies_per_video,
+      concurrency: (input as any).concurrency || 1,
+      frequency: input.run_interval || 'once',
+      enabled: input.enabled !== false,
+    };
+  }
+  // 视频下载任务(scenario_id 以 _video_download 结尾):保持 type='video_download' + 透传 urls,
+  // 否则经 updateTask 兜底会被改成 engage、链接清单丢失。
+  if (typeof input.scenario_id === 'string' && input.scenario_id.endsWith('_video_download')) {
+    const dPlatform = MATRIX_DOWNLOAD_ID_TO_PLATFORM[input.scenario_id] || 'douyin';
+    const urls: string[] = Array.isArray(input.urls) ? input.urls : [];
+    return {
+      id,
+      platform: dPlatform,
+      type: 'video_download',
+      name: input.name || (urls.length ? `${dPlatform}视频下载 · ${urls.length} 条` : `${dPlatform}视频下载`),
+      accountIds,                 // 单账号(数组长度 1)
+      quota: {},
+      urls,
+      concurrency: 1,             // 单账号顺序下载,不多开
+      frequency: input.run_interval || 'once',
+      enabled: input.enabled !== false,
+    };
+  }
+  // 图文创作任务(scenario_id 以 _image_text 结尾):保持 type='image_text' + 透传 imageText 配置,
+  // 否则经 updateTask 兜底会被改成 engage、图文配置丢失。
+  if (typeof input.scenario_id === 'string' && input.scenario_id.endsWith('_image_text')) {
+    const iPlatform = MATRIX_IMAGETEXT_ID_TO_PLATFORM[input.scenario_id] || 'douyin';
+    return {
+      id,
+      platform: iPlatform,
+      type: 'image_text',
+      name: input.name || (accountIds.length ? `${iPlatform}图文创作 · ${accountIds.length} 个号` : `${iPlatform}图文创作`),
+      accountIds,
+      quota: {},
+      imageText: input.imageText,
+      concurrency: accountIds.length,
+      frequency: input.run_interval || 'daily_random',
+      enabled: input.enabled !== false,
+    };
+  }
+  // 爆款仿写任务(scenario_id 以 _viral_production_career 结尾):保持 type='viral_rewrite' + 透传 viralRewrite。
+  if (typeof input.scenario_id === 'string' && input.scenario_id.endsWith('_viral_production_career')) {
+    const vPlatform = MATRIX_VIRAL_ID_TO_PLATFORM[input.scenario_id] || 'xhs';
+    return {
+      id,
+      platform: vPlatform,
+      type: 'viral_rewrite',
+      name: input.name || (accountIds.length ? `${vPlatform}爆款仿写 · ${accountIds.length} 个号` : `${vPlatform}爆款仿写`),
+      accountIds,
+      quota: {},
+      viralRewrite: input.viralRewrite,
+      concurrency: accountIds.length,
+      frequency: input.run_interval || 'daily_random',
+      enabled: input.enabled !== false,
+    };
+  }
+  // 自动发推任务(scenario_id = x_post):保持 type='x_post' + 透传 tweetPost,否则经 updateTask 兜底会被改成 engage、配置丢失。
+  if (typeof input.scenario_id === 'string' && MATRIX_TWEET_ID_TO_PLATFORM[input.scenario_id]) {
+    const xPlatform = MATRIX_TWEET_ID_TO_PLATFORM[input.scenario_id];
+    return {
+      id,
+      platform: xPlatform,
+      type: 'x_post',
+      name: input.name || (accountIds.length ? `推特发推 · ${accountIds.length} 个号` : '推特发推'),
+      accountIds,
+      quota: {},
+      tweetPost: input.tweetPost,
+      concurrency: accountIds.length,
+      frequency: input.run_interval || 'daily_random',
+      enabled: input.enabled !== false,
+    };
+  }
+  // 币安广场发帖任务(scenario_id = binance_post):保持 type='binance_post' + 透传 binancePost,否则经 updateTask 兜底会被改成 engage、配置丢失。
+  if (typeof input.scenario_id === 'string' && MATRIX_BINANCE_ID_TO_PLATFORM[input.scenario_id]) {
+    const bnPlatform = MATRIX_BINANCE_ID_TO_PLATFORM[input.scenario_id];
+    return {
+      id,
+      platform: bnPlatform,
+      type: 'binance_post',
+      name: input.name || (accountIds.length ? `币安广场发帖 · ${accountIds.length} 个号` : '币安广场发帖'),
+      accountIds,
+      quota: {},
+      binancePost: input.binancePost,
+      concurrency: accountIds.length,
+      frequency: input.run_interval || 'daily_random',
+      enabled: input.enabled !== false,
+    };
+  }
+  // Facebook 发帖任务(scenario_id = facebook_post):保持 type='facebook_post' + 透传 facebookPost,否则兜底会被改成 engage、数据源配置丢失。
+  if (input.scenario_id === 'facebook_post') {
+    return {
+      id,
+      platform: 'facebook',
+      type: 'facebook_post',
+      name: input.name || (accountIds.length ? `Facebook 发帖 · ${accountIds.length} 个号` : 'Facebook 发帖'),
+      accountIds,
+      quota: {},
+      facebookPost: input.facebookPost,
+      concurrency: accountIds.length,
+      frequency: input.run_interval || 'daily_random',
+      enabled: input.enabled !== false,
+    };
+  }
+  // Reddit 发帖任务(scenario_id = reddit_post):保持 type='reddit_post' + 透传 redditPost。
+  if (input.scenario_id === 'reddit_post') {
+    return {
+      id,
+      platform: 'reddit',
+      type: 'reddit_post',
+      name: input.name || (accountIds.length ? `Reddit 发帖 · ${accountIds.length} 个号` : 'Reddit 发帖'),
+      accountIds,
+      quota: {},
+      redditPost: input.redditPost,
+      concurrency: accountIds.length,
+      frequency: input.run_interval || 'daily_random',
+      enabled: input.enabled !== false,
+    };
+  }
+  // Instagram 发帖任务(scenario_id = instagram_post):保持 type='instagram_post' + 透传 instagramPost。
+  if (input.scenario_id === 'instagram_post') {
+    return {
+      id,
+      platform: 'instagram',
+      type: 'instagram_post',
+      name: input.name || (accountIds.length ? `Instagram 发帖 · ${accountIds.length} 个号` : 'Instagram 发帖'),
+      accountIds,
+      quota: {},
+      instagramPost: input.instagramPost,
+      concurrency: accountIds.length,
+      frequency: input.run_interval || 'daily_random',
+      enabled: input.enabled !== false,
+    };
+  }
+  // 币安广场搬运任务(scenario_id = binance_repost):保持 type='binance_repost' + 透传 binanceRepost,否则经 updateTask 兜底会被改成 engage、配置丢失。
+  if (MATRIX_REPOST_IDS.has(String(input.scenario_id || ''))) {
+    const _rp = repostPlatformFromId(String(input.scenario_id || ''));
+    return {
+      id,
+      platform: _rp,
+      type: 'binance_repost',
+      name: input.name || (accountIds.length ? `${MATRIX_REPOST_META[_rp] || '批量搬运'} · ${accountIds.length} 个号` : (MATRIX_REPOST_META[_rp] || '批量搬运')),
+      accountIds,
+      quota: {},
+      binanceRepost: input.binanceRepost,
+      concurrency: 1,
+      frequency: input.run_interval || 'daily_random',
+      enabled: input.enabled !== false,
+    };
+  }
+  // 真实 platform 从 scenario_id 反推(原来写死 douyin)。matrix engage 主路径走 ScenarioView.saveMatrixTask
+  // 直传 platform、不经此函数;这里是 scenarioService.create/updateTask 的兜底,保持平台一致。
+  const platform = MATRIX_ENGAGE_ID_TO_PLATFORM[input.scenario_id] || 'douyin';
+  return {
+    id,
+    platform,
+    type: 'engage',
+    name: input.name || (accountIds.length ? `抖音互动 · ${accountIds.length} 个号` : '抖音互动'),
+    accountIds,
+    quota: {
+      daily_like_min: input.daily_like_min, daily_like_max: input.daily_like_max,
+      daily_follow_min: input.daily_follow_min, daily_follow_max: input.daily_follow_max,
+      daily_comment_min: input.daily_comment_min, daily_comment_max: input.daily_comment_max,
+      // 评论语言必须跟着写回,否则 MyTasksPage 开关任务等 updateTask 路径会把它抹掉。
+      comment_lang: input.comment_lang,
+      // 刷剧模式同理:不写回则 updateTask 兜底会把已存的 engage_mode 抹成关键词搜索模式。
+      engage_mode: input.engage_mode,
+      // 收藏配额 + 精准模式配置,同上必须写回。
+      daily_favorite_min: input.daily_favorite_min, daily_favorite_max: input.daily_favorite_max,
+      max_comment_per_work: input.max_comment_per_work,
+      precise_urls: input.precise_urls, precise_like: input.precise_like,
+      precise_favorite: input.precise_favorite, precise_follow: input.precise_follow,
+      precise_comment: input.precise_comment,
+    },
+    // 互动评论引流:透传引流配置,否则经 updateTask 兜底(如 MyTasksPage 改启用)会把 funnel 丢掉。
+    // 老任务 / 未填 → funnel_phrase 为 undefined → 存 {'',0} 视作未配,评论纯 AI(向后兼容)。
+    funnel: {
+      funnel_phrase: input.funnel_phrase || '',
+      funnel_probability: typeof input.funnel_probability === 'number' ? input.funnel_probability : 0,
+      ...(input.funnel_rewrite === false ? { funnel_rewrite: false } : {}),
+    },
+    ai_comment: input.ai_comment,   // undefined 时 taskStore 保留旧值
+    // 各账号独立引流语写回(undefined 时 taskStore 保留旧值,不误清)。
+    funnelByAccount: input.funnel_by_account,
+    concurrency: accountIds.length,
+    frequency: input.run_interval || 'daily_random',
+    enabled: input.enabled !== false,
+  };
+}
+
+function mxRunStatusOf(r: any): ScenarioTaskRun['status'] {
+  if (r.running) return 'running';
+  if (r.state === 'failed') return 'failed';
+  if (r.state === 'stopped' || r.state === 'skipped') return 'skipped';
+  if (r.state === 'success') return 'ok';
+  if (r.success > 0) return 'ok';        // 全成/部分成功都按 ok 计入累计
+  if (r.failed > 0) return 'failed';
+  return 'skipped';
+}
+
+/** 矩阵运行记录 → 旧 ScenarioTaskRun(getTaskStats / runStatus 用,驱动累计统计)。 */
+function mxRunToTaskRun(r: any): ScenarioTaskRun {
+  const t = r.totals || {};
+  return {
+    task_id: r.taskId,
+    started_at: r.startedAt,
+    ended_at: r.finishedAt,
+    status: mxRunStatusOf(r),
+    // post(图文发帖)/download(视频下载)仅当运行记录里有该键才带上 → engage 不受影响、不会多出 📤0/⬇️0。
+    // 定向获客的两维同理:只有运行记录里真有该键才带上,不污染别的任务类型。
+    //   漏带的话详情页那两张卡的「上次/累计」永远是 0(sidecar 已经把它们汇总进 totals 了)。
+    action_counts: {
+      like: t.like || 0, follow: t.follow || 0, comment: t.comment || 0,
+      // 收藏漏了的话,历史运行记录页永远看不到 ⭐(sidecar 早就汇总进 totals 了)。
+      ...(typeof t.favorite === 'number' ? { favorite: t.favorite } : {}),
+      ...(typeof t.post === 'number' ? { post: t.post } : {}),
+      ...(typeof t.download === 'number' ? { download: t.download } : {}),
+      ...(typeof t.lead_new === 'number' ? { lead_new: t.lead_new } : {}),
+      ...(typeof t.lead_engaged === 'number' ? { lead_engaged: t.lead_engaged } : {}),
+      // 批量拉黑:只有真的拉黑过才带(totals 里所有任务都有 block:0,不带 0 免得别的任务多出一个 0)。
+      ...(Number(t.block) > 0 ? { block: Number(t.block) } : {}),
+    },
+    // 累计/上次消耗:从运行记录的 cost 取(老记录无 cost → 0)。
+    tokens_used: Number(r.cost?.credits) || 0,
+    cost_usd: Number(r.cost?.usd) || 0,
+  };
+}
+
+/** 矩阵运行记录 → 旧「富运行记录」(RunHistoryPage / RunRecordDetailPage 用)。 */
+// 运行记录按【任务类型 + 平台】还原 scenario_snapshot。原来写死 engage「互动涨粉」→ 回复粉丝/图文/下载/
+//   仿写/发推/发帖等所有非 engage 任务的运行记录都错显成「互动涨粉」(用户实测抖音回复粉丝跑完看不到自己的记录)。
+//   id/名字/图标对齐 listScenarios 的 synth 快照;老记录无 type → default 回退 engage(与旧行为一致,无害)。
+function mxRunScenarioSnapshot(type: string | undefined, platform: string): { id: string; name_zh: string; name_en: string; icon: string; platform: string } {
+  const p = platform || 'douyin';
+  const mk = (id: string, name_zh: string, icon: string) => ({ id, name_zh, name_en: '', icon, platform: p });
+  switch (type) {
+    case 'reply_fan':      return mk(`${p}_reply_fans_comment`, MATRIX_REPLY_META[p]?.name_zh || '自动回复粉丝', MATRIX_REPLY_META[p]?.icon || '💌');
+    case 'comment_like':   return mk(`${p}_comment_like`, 'TikTok 评论区点赞评论', '💗');
+    case 'block':          return mk(`${p}_block`, '抖音批量拉黑', '🚫');
+    case 'folder_post':    return mk(`${p}_folder_post`, '抖音文件夹定时发布', '📅');
+    case 'report':         return mk(`${p}_report`, MATRIX_REPORT_META[p]?.name_zh || '抖音Report', MATRIX_REPORT_META[p]?.icon || '📋');
+    case 'video_download': return mk(`${p}_video_download`, MATRIX_DOWNLOAD_META[p]?.name_zh || '视频下载', MATRIX_DOWNLOAD_META[p]?.icon || '⬇️');
+    case 'image_text':     return mk(`${p}_image_text`, MATRIX_IMAGETEXT_META[p]?.name_zh || '图文创作', MATRIX_IMAGETEXT_META[p]?.icon || '📝');
+    case 'viral_rewrite':  return mk(`${p}_viral_production_career`, MATRIX_VIRAL_META[p]?.name_zh || '爆款仿写', MATRIX_VIRAL_META[p]?.icon || '🔥');
+    case 'x_post':         return mk(`${p}_post`, MATRIX_TWEET_META[p]?.name_zh || '自动发推', MATRIX_TWEET_META[p]?.icon || '🐦');
+    case 'binance_post':   return mk(`${p}_post`, MATRIX_BINANCE_META[p]?.name_zh || '币安广场发帖', MATRIX_BINANCE_META[p]?.icon || '📊');
+    case 'facebook_post':  return mk(`${p}_post`, 'Facebook 自动发帖', '📘');
+    case 'reddit_post':    return mk(`${p}_post`, 'Reddit 自动发帖', '👽');
+    case 'instagram_post': return mk(`${p}_post`, 'Instagram 自动发帖', '📸');
+    case 'binance_repost': return mk(`${p}_repost`, MATRIX_REPOST_META[p] || '批量搬运', '♻️');
+    default:               return mk(engageScenarioIdForPlatform(p), MATRIX_ENGAGE_META[p]?.name_zh || '互动涨粉', MATRIX_ENGAGE_META[p]?.icon || '🤝');
+  }
+}
+
+function mxRunToRecord(r: any): any {
+  const t = r.totals || {};
+  // 🚨 正在跑的那条(sidecar 按实时进度合成,带 running:true)必须映射成 'running',否则会掉进
+  //   下面的三分支被当成【已完成】—— failed=0 → 'done' → 卡片显示「✅ 成功」,既不发光也没进度
+  //   (用户 2026-08-06 实拍)。RunHistoryPage 本来就支持 'running'(⏳ + 绿色脉冲),缺的只是这一步映射。
+  const status = r.running ? 'running'
+    : r.state === 'stopped' || r.state === 'skipped' ? 'stopped'
+    : r.state === 'failed' ? 'error'
+    : (r.failed > 0 && r.success === 0 ? 'error' : r.failed > 0 ? 'partial' : 'done');
+  const items: any[] = Array.isArray(r.items) ? r.items : [];
+  // ⚠️ step 字段必须给:RunRecordDetailPage 按 log.step 分组(Object.keys→Number),
+  // 缺了 step 会得到 key='undefined'→Number('undefined')=NaN→stepGroups[NaN]=undefined→
+  // `logs.length` 整块崩(「渲染错误 MainView:matrixRuns — undefined is not an object 'logs.length'」)。
+  // 矩阵是逐号互动、没有多步骤概念,统一归到第 1 步。
+  const step_logs = items.map((it) => ({
+    time: hhmmss(r.finishedAt || r.startedAt),
+    step: 1,
+    status: it.state === 'success' || it.state === 'skipped' ? 'done' : it.state === 'failed' ? 'error' : 'running',
+    // 原来直接把内部枚举(success/failed/skipped/running)甩给用户。在跑的那条尤其难看:
+    //   每个号显示一行光秃秃的「running」,看不出在干什么 —— 换成人话。
+    message: `[${it.displayName || it.accountId}] ${
+      it.state === 'success' ? '成功' : it.state === 'failed' ? '失败' : it.state === 'skipped' ? '跳过' : '进行中'
+    }${it.counts ? ` 赞${it.counts.like || 0}/关${it.counts.follow || 0}/评${it.counts.comment || 0}` : ''}${it.reason ? ` (${it.reason})` : ''}`,
+  }));
+  // 运行记录按真实 platform + 任务类型还原 scenario_snapshot(原来只按 platform 写死 engage → 回复粉丝等非
+  //   engage 任务的记录全错显成「互动涨粉」)。
+  const rPlatform = r.platform || 'douyin';
+  return {
+    id: r.id,
+    task_id: r.taskId,
+    scenario_snapshot: mxRunScenarioSnapshot(r.type, rPlatform),
+    task_snapshot: { track: 'matrix', name: r.taskName, account_ids: items.map((it) => it.accountId) },
+    started_at: r.startedAt,
+    // 在跑的那条没有结束时间(合成时给的 0)→ 传 undefined,免得界面把耗时算成 1970 年至今。
+    finished_at: r.running ? undefined : r.finishedAt,
+    status,
+    error: r.reason,
+    result: {
+      action_counts: {
+        like: t.like || 0, follow: t.follow || 0, comment: t.comment || 0,
+        ...(typeof t.favorite === 'number' ? { favorite: t.favorite } : {}),
+        ...(typeof t.post === 'number' ? { post: t.post } : {}),
+        ...(typeof t.download === 'number' ? { download: t.download } : {}),
+        ...(Number(t.block) > 0 ? { block: Number(t.block) } : {}),
+      },
+      // 在跑的那条带上目标值,列表就能渲染「11/32」这种 X/Y 进度 —— 老 scenario 页正是靠
+      //   action_counts + action_targets 显示实时进度的(见 RunHistoryPage 里那段注释)。
+      //   已完成的记录不带(它的 targets 没落盘),保持原样。
+      action_targets: r.running && r.targets
+        ? { like: r.targets.like || 0, follow: r.targets.follow || 0, comment: r.targets.comment || 0, favorite: r.targets.favorite || 0 }
+        : {},
+      tokens_used: Number(r.cost?.credits) || 0, cost_usd: Number(r.cost?.usd) || 0, collected_count: 0, draft_count: 0,
+    },
+
+    // 在跑的那条:三项计数都还是 0(号都是 running 态),只报「成功0·失败0·跳过0」像白跑了一趟。
+    //   把【进行中几个号】排在最前,状态一眼能看出来。
+    summary: (() => {
+      const inflight = items.filter((it) => it.state !== 'success' && it.state !== 'failed' && it.state !== 'skipped').length;
+      const tail = `成功 ${r.success || 0} · 失败 ${r.failed || 0} · 跳过 ${r.skipped || 0}（共 ${items.length} 个号）`;
+      return r.running && inflight > 0 ? `进行中 ${inflight} · ${tail}` : `${tail}${r.reason ? ` · ${r.reason}` : ''}`;
+    })(),
+    step_logs,
+  };
+}
+
+/** 矩阵实时进度 → 旧 ScenarioRunProgress(真 TaskDetailPage 每 2s 轮询渲染)。 */
+function mxProgressToScenario(taskId: string, resp: any): ScenarioRunProgress | null {
+  const p = resp?.progress;
+  if (!p || p.taskId !== taskId) return null;
+  const status: ScenarioRunProgress['status'] = p.status === 'running' ? 'running' : p.status === 'error' ? 'error' : p.status === 'done' ? 'done' : 'idle';
+  const running = status === 'running';
+  // startedAt 要透传:TaskDetailPage 靠它分辨「这条终态是不是【上一次】运行的残影」。
+  //   点运行后 sidecar 写入 running 占位前有 IPC 排队窗口(sidecar 忙时可达数秒),期间轮询
+  //   读到的还是上次的 done → 弹「运行完成」误导用户(3.4.26 在 sidecar 端堵了占位窗口,
+  //   但 IPC 排队这段堵不到,必须渲染端配合判断)。
+  const allLogs: Array<{ ts: number; accountId: string; msg: string }> = Array.isArray(p.logs) ? p.logs : [];
+  const mapped = allLogs.map((l, i) => ({
+    time: hhmmss(l.ts),
+    status: (running && i === allLogs.length - 1) ? ('running' as const) : ('done' as const),
+    message: `[${l.accountId}] ${l.msg}`,
+  }));
+  // 3 步与 STEP_NAMES_DOUYIN_AUTO_ENGAGE 对齐;互动全过程归到第 2 步(逐个互动)。
+  const steps: any[] = [
+    { name: '', status: 'done', logs: [] },
+    { name: '', status: running ? 'running' : status === 'error' ? 'error' : 'done', logs: mapped },
+    { name: '', status: status === 'done' ? 'done' : 'waiting', logs: [] },
+  ];
+  const apOf = (tg: any, dn: any): Record<string, { done: number; target: number }> => {
+    const ap: Record<string, { done: number; target: number }> = {};
+    // 定向获客的 lead_new / lead_engaged 也要出现在实时进度里,否则详情页那两张卡的
+    //   「本次」永远是 0。判据允许 target 缺席:剧本要跑到 STEP1 才下发分母,在那之前
+    //   只有 done 也得显示出来。
+    // ⚠️ 别再手抄键名 —— favorite 就是这么漏的:剧本上报了「藏1」、sidecar 也存了,
+    //   偏偏在这一行被截住,详情页「本次运行进度」永远画 ⭐ 0/0(用户 2026-08-26 实测)。
+    //   逐 key 走 targets ∪ done 的并集,以后加动作维度这里不用再改。
+    const allKeys = new Set([...Object.keys(tg || {}), ...Object.keys(dn || {})]);
+    for (const k of allKeys) {
+      if ((tg || {})[k] > 0 || (dn || {})[k] > 0) ap[k] = { done: (dn || {})[k] || 0, target: (tg || {})[k] || 0 };
+    }
+    return ap;
+  };
+  const action_progress = apOf(p.targets, p.done);
+  // 每个账号独立进度(详情页聚合进度下方逐号展示)。
+  const pa = p.perAccount || {};
+  const accounts = Object.keys(pa).map((id) => {
+    const a = pa[id];
+    return {
+      id, name: a.displayName || id, status: a.status || 'running',
+      action_progress: apOf(a.targets, a.done),
+      logs: (a.logs || []).map((l: any, i: number) => ({ time: hhmmss(l.ts), status: (running && i === (a.logs.length - 1) ? 'running' : 'done') as any, message: l.msg })),
+    };
+  });
+  // 本次消耗:💎 = p.cost.credits(钱包真实扣的积分),$ = p.cost.usd(后端按 token_price_per_million 算好)。
+  // 之前没映射 → TaskDetailPage 的「本次消耗」恒显 0,即使钱已经扣了。
+  const cost = p.cost || { credits: 0, usd: 0 };
+  return { taskId, status, currentStep: status === 'done' ? 3 : 2, steps, error: p.error, action_progress, accounts, tokens_used: Number(cost.credits) || 0, cost_usd: Number(cost.usd) || 0, startedAt: Number(p.startedAt) || 0 } as any;
+}
+
+class ScenarioService {
+  // ── Catalogue ──
+
+  async listScenarios(): Promise<Scenario[]> {
+    // 矩阵号:用打包内置的场景快照,并补齐快照里缺失的 engage 场景(主要是 xhs_auto_engage —
+    // 快照只从 backend/scenarios 生成,而它只在 backend/matrix/scenarios)。否则按 scenario.platform
+    // 过滤任务 tab 时,小红书等平台 lookup 不到 platform → tab 永远为空。
+    if (MATRIX_EDITION) {
+      const have = new Set(DEFAULT_SCENARIOS.map((s) => s.id));
+      const synth = Object.entries(MATRIX_ENGAGE_SCENARIO_ID)
+        .filter(([, sid]) => !have.has(sid))
+        .map(([platform, sid]) => ({
+          id: sid, version: '1.0.0', platform, workflow_type: 'auto_reply', category: 'engagement',
+          name_zh: MATRIX_ENGAGE_META[platform]?.name_zh || sid, name_en: '',
+          icon: MATRIX_ENGAGE_META[platform]?.icon || '🤝',
+        }));
+      // 同理补「自动回复粉丝」剧本快照,让 reply_fan 任务能按 platform 归到对应 tab。
+      const synthReply = Object.entries(MATRIX_REPLY_SCENARIO_ID)
+        .filter(([, sid]) => !have.has(sid))
+        .map(([platform, sid]) => ({
+          id: sid, version: '1.0.0', platform, workflow_type: 'reply_fans_comment', category: 'engagement',
+          name_zh: MATRIX_REPLY_META[platform]?.name_zh || sid, name_en: '',
+          icon: MATRIX_REPLY_META[platform]?.icon || '💌',
+        }));
+      // 同理补「视频无水印下载」剧本快照,让 video_download 任务能按 platform 归到对应 tab。
+      const synthDownload = Object.entries(MATRIX_DOWNLOAD_SCENARIO_ID)
+        .filter(([, sid]) => !have.has(sid))
+        .map(([platform, sid]) => ({
+          id: sid, version: '1.0.0', platform, workflow_type: 'video_download', category: 'tool',
+          name_zh: MATRIX_DOWNLOAD_META[platform]?.name_zh || sid, name_en: '',
+          icon: MATRIX_DOWNLOAD_META[platform]?.icon || '⬇️',
+        }));
+      // 同理补「举报」剧本快照(白名单功能,入口另由 reportEnabled 控制;快照只为任务卡能归 tab)。
+      const synthReport = Object.entries(MATRIX_REPORT_SCENARIO_ID)
+        .filter(([, sid]) => !have.has(sid))
+        .map(([platform, sid]) => ({
+          id: sid, version: '1.0.0', platform, workflow_type: 'report', category: 'tool',
+          name_zh: MATRIX_REPORT_META[platform]?.name_zh || sid, name_en: '',
+          icon: MATRIX_REPORT_META[platform]?.icon || '📋',
+        }));
+      // 同理补「图文创作」剧本快照,让 image_text 任务能按 platform 归到对应 tab。
+      const synthImageText = Object.entries(MATRIX_IMAGETEXT_SCENARIO_ID)
+        .filter(([, sid]) => !have.has(sid))
+        .map(([platform, sid]) => ({
+          id: sid, version: '1.0.0', platform, workflow_type: 'image_text', category: 'knowledge',
+          name_zh: MATRIX_IMAGETEXT_META[platform]?.name_zh || sid, name_en: '',
+          icon: MATRIX_IMAGETEXT_META[platform]?.icon || '📝',
+        }));
+      const synthViral = Object.entries(MATRIX_VIRAL_SCENARIO_ID)
+        .filter(([, sid]) => !have.has(sid))
+        .map(([platform, sid]) => ({
+          id: sid, version: '1.0.0', platform, workflow_type: 'viral_production', category: 'knowledge',
+          name_zh: MATRIX_VIRAL_META[platform]?.name_zh || sid, name_en: '',
+          icon: MATRIX_VIRAL_META[platform]?.icon || '🔥',
+        }));
+      // 同理补「自动发推」剧本快照,让 x_post 任务能按 platform 归到推特 tab。
+      const synthTweet = Object.entries(MATRIX_TWEET_SCENARIO_ID)
+        .filter(([, sid]) => !have.has(sid))
+        .map(([platform, sid]) => ({
+          id: sid, version: '1.0.0', platform, workflow_type: 'x_post_creation', category: 'creation',
+          name_zh: MATRIX_TWEET_META[platform]?.name_zh || sid, name_en: '',
+          icon: MATRIX_TWEET_META[platform]?.icon || '🐦',
+        }));
+      // 同理补「币安广场自动发帖」剧本快照,让 binance_post 任务能按 platform 归到币安 tab。
+      const synthBinance = Object.entries(MATRIX_BINANCE_SCENARIO_ID)
+        .filter(([, sid]) => !have.has(sid))
+        .map(([platform, sid]) => ({
+          id: sid, version: '1.0.0', platform, workflow_type: 'binance_post_creation', category: 'creation',
+          name_zh: MATRIX_BINANCE_META[platform]?.name_zh || sid, name_en: '',
+          icon: MATRIX_BINANCE_META[platform]?.icon || '📊',
+        }));
+      // 同理补「批量搬运」剧本快照 —— 五家都要合成。原来只合成 binance_repost,
+      //   gate/bitget/bybit/okx 的搬运任务解析不到 scenario → 详情页落回互动样式
+      //   (累计/上次完成画成 👍➕💬、明细画 👍0/0;用户 2026-08-29 实拍)。
+      const synthRepost = Object.keys(MATRIX_REPOST_META)
+        .map((platform) => ({ platform, rsid: platform + '_repost' }))
+        .filter(({ rsid }) => !have.has(rsid))
+        .map(({ platform, rsid }) => ({
+          id: rsid, version: '1.0.0', platform, workflow_type: 'binance_repost_creation', category: 'creation',
+          name_zh: MATRIX_REPOST_META[platform] || '批量搬运', name_en: '', icon: '♻️',
+        }));
+      // 「评论区点赞评论」剧本快照(目前仅 TikTok),让 comment_like 任务能归到 TikTok tab、详情页认得出。
+      const synthCommentLike = have.has('tiktok_comment_like') ? [] : [{
+        id: 'tiktok_comment_like', version: '1.0.0', platform: 'tiktok', workflow_type: 'comment_like', category: 'engagement',
+        name_zh: 'TikTok 评论区点赞评论', name_en: 'TikTok Comment Like & Reply', icon: '💗',
+      }];
+      // 「批量拉黑」剧本快照(目前仅抖音),让 block 任务能归到抖音 tab、详情页认得出。
+      const synthBlock = have.has('douyin_block') ? [] : [{
+        id: 'douyin_block', version: '1.0.0', platform: 'douyin', workflow_type: 'block', category: 'tool',
+        name_zh: '抖音批量拉黑', name_en: 'Douyin Batch Block', icon: '🚫',
+      }];
+      // 「文件夹定时发布」快照(客户端 runner,没有后端剧本),让 folder_post 任务归到抖音 tab、详情页认得出。
+      const synthFolderPost = have.has('douyin_folder_post') ? [] : [{
+        id: 'douyin_folder_post', version: '1.0.0', platform: 'douyin', workflow_type: 'folder_post', category: 'creation',
+        name_zh: '抖音文件夹定时发布', name_en: 'Douyin Folder Scheduled Posts', icon: '📅',
+      }];
+      return [...DEFAULT_SCENARIOS, ...synth, ...synthReply, ...synthDownload, ...synthReport, ...synthImageText, ...synthViral, ...synthTweet, ...synthBinance, ...synthRepost, ...synthCommentLike, ...synthBlock, ...synthFolderPost] as unknown as Scenario[];
+    }
+    try {
+      const res = await window.electron.scenario.listScenarios();
+      return res?.scenarios || [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Filter scenarios by platform and workflow type. */
+  async listScenariosFor(platform: ScenarioPlatform, workflow?: ScenarioWorkflowType): Promise<Scenario[]> {
+    const all = await this.listScenarios();
+    return all.filter(
+      s => s.platform === platform && (!workflow || s.workflow_type === workflow)
+    );
+  }
+
+  // ── Tasks ──
+
+  async listTasks(): Promise<Task[]> {
+    if (MATRIX_EDITION) {
+      try { const r = await MX()?.listTasks?.(); return r?.ok && Array.isArray(r.tasks) ? r.tasks.map(mxTaskToScenario) : []; } catch { return []; }
+    }
+    try {
+      const r = await window.electron.scenario.listTasks();
+      return Array.isArray(r) ? r : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async listTasksFor(platform: ScenarioPlatform): Promise<Task[]> {
+    const [tasks, scenarios] = await Promise.all([this.listTasks(), this.listScenarios()]);
+    const scenarioById = new Map(scenarios.map(s => [s.id, s]));
+    // 矩阵任务行自带 platform(mxTaskToScenario 透传),优先用它 —— FB/Reddit/Ins 剧本不在注册表,
+    // 只按注册表映射会把这些任务滤没;registry 兜底照顾缺 platform 的行。
+    return tasks.filter(t => (((t as any).platform) || scenarioById.get(t.scenario_id)?.platform) === platform);
+  }
+
+  async getTask(id: string): Promise<Task | null> {
+    if (MATRIX_EDITION) { const all = await this.listTasks(); return all.find(t => t.id === id) || null; }
+    return window.electron.scenario.getTask(id);
+  }
+
+  async createTask(input: Omit<Task, 'id' | 'created_at' | 'updated_at'>): Promise<Task> {
+    if (MATRIX_EDITION) {
+      if (!ensureMatrixLogin()) throw new Error('请先登录 NoobClaw 账号');
+      const r = await MX()?.saveTask?.(scenarioInputToMxSave(input));
+      if (!r?.ok) throw new Error(({ platform_task_limit: '该平台任务已达 5 个上限', duplicate_type: '该平台已有同类型(互动)任务,直接编辑它即可', task_not_found: '任务不存在' } as any)[r?.error] || r?.error || '保存失败');
+      return mxTaskToScenario(r.task);
+    }
+    return window.electron.scenario.createTask(input);
+  }
+
+  async updateTask(id: string, patch: Partial<Task>): Promise<Task | null> {
+    if (MATRIX_EDITION) {
+      if (!ensureMatrixLogin()) return null;
+      // 把现有任务读出来合并 patch(矩阵 saveTask 是整体 upsert)。
+      const cur = await this.getTask(id);
+      if (!cur) return null;
+      const merged: any = { ...cur, ...patch };
+      const r = await MX()?.saveTask?.(scenarioInputToMxSave(merged, id));
+      return r?.ok ? mxTaskToScenario(r.task) : null;
+    }
+    return window.electron.scenario.updateTask(id, patch);
+  }
+
+  async deleteTask(id: string): Promise<boolean> {
+    if (MATRIX_EDITION) { if (!ensureMatrixLogin()) return false; const r = await MX()?.removeTask?.({ id }); return !!r?.ok; }
+    return window.electron.scenario.deleteTask(id);
+  }
+
+  /** 抖音Report 试运行:选原因、填描述,停在提交前;不占执行锁、不计费。 */
+  async runReportDryRun(id: string): Promise<RunOutcome> {
+    if (!ensureMatrixLogin()) return { status: 'skipped', reason: 'login_required' };
+    const r = await MX()?.runTaskById?.({ taskId: id, dryRun: true });
+    if (r?.ok) return { status: 'started' };
+    const reason = (r?.error === 'another_task_running' || r?.error === 'concurrency_full') ? 'concurrency_limit_reached' : (r?.error || 'unknown');
+    return { status: 'skipped', reason };
+  }
+
+  async runTaskNow(id: string): Promise<RunOutcome> {
+    if (MATRIX_EDITION) {
+      if (!ensureMatrixLogin()) return { status: 'skipped', reason: 'login_required' };
+      const r = await MX()?.runTaskById?.({ taskId: id });
+      if (r?.ok) return { status: 'started' };
+      // another_task_running = 同平台已在跑;concurrency_full = 并发已达上限。都归到「上限」提示(TaskDetailPage 有人话)。
+      const reason = (r?.error === 'another_task_running' || r?.error === 'concurrency_full') ? 'concurrency_limit_reached' : (r?.error || 'unknown');
+      return { status: 'skipped', reason };
+    }
+    return window.electron.scenario.runTaskNow(id);
+  }
+
+  /** Upload a single already-generated draft. Used by TaskDetailPage
+   *  per-draft 📤 button when auto_upload was false. */
+  uploadDraft(taskId: string, draftId: string): Promise<{ status: string; reason?: string }> {
+    return (window.electron.scenario as any).uploadDraft(taskId, draftId);
+  }
+
+  async runStatus(id: string): Promise<{ runs: ScenarioTaskRun[]; cooldown_ends_at: number }> {
+    if (MATRIX_EDITION) {
+      try { const r = await MX()?.listRuns?.({ taskId: id }); const runs = r?.ok && Array.isArray(r.runs) ? r.runs.map(mxRunToTaskRun) : []; return { runs, cooldown_ends_at: 0 }; } catch { return { runs: [], cooldown_ends_at: 0 }; }
+    }
+    return window.electron.scenario.runStatus(id);
+  }
+
+  // ── Drafts ──
+
+  async listDrafts(taskId?: string): Promise<Draft[]> {
+    if (MATRIX_EDITION) return [];   // 互动涨粉无草稿概念
+    try {
+      const r = await window.electron.scenario.listDrafts(taskId);
+      return Array.isArray(r) ? r : [];
+    } catch {
+      return [];
+    }
+  }
+
+  pushDraft(draftId: string): Promise<{ status: 'ready_for_user' | 'failed'; error?: string }> {
+    return window.electron.scenario.pushDraft(draftId);
+  }
+
+  deleteDraft(draftId: string): Promise<boolean> {
+    return window.electron.scenario.deleteDraft(draftId);
+  }
+
+  markDraftIgnored(draftId: string): Promise<Draft | null> {
+    return window.electron.scenario.markDraftIgnored(draftId);
+  }
+
+  // ── Active task management ──
+
+  setActiveTask(id: string): Promise<Task | null> {
+    return window.electron.scenario.setActiveTask(id);
+  }
+
+  getActiveTask(): Promise<Task | null> {
+    return window.electron.scenario.getActiveTask();
+  }
+
+  // ── Running state ──
+
+  async getRunningTaskId(): Promise<string | null> {
+    if (MATRIX_EDITION) { const ids = await this.getRunningTaskIds(); return ids[0] || null; }
+    try {
+      const r = await window.electron.scenario.getRunningTaskId();
+      return r?.runningTaskId || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Multi-tab concurrency (Twitter v1): returns ALL running task ids —
+   *  can be > 1 when XHS task + Twitter task are both in flight. */
+  async getRunningTaskIds(): Promise<string[]> {
+    if (MATRIX_EDITION) {
+      // 矩阵可【并发】跑多个平台任务(douyin + xhs 同时),但 matrix:getRunProgress 不传 taskId
+      // 只回「任一在跑」的一条 → 列表只有一个任务亮绿,其它在跑的(也是 running)显示「下次运行」。
+      // 改成逐任务查各自 running 态,汇总所有在跑的 id,列表才能把每个在跑的任务都标记运行中。
+      try {
+        const tasks = await this.listTasks();
+        const checks = await Promise.all(tasks.map(async (t) => {
+          try { const r = await MX()?.getRunProgress?.(t.id); return r?.running ? t.id : null; } catch { return null; }
+        }));
+        return checks.filter((x): x is string => !!x);
+      } catch { return []; }
+    }
+    try {
+      const r = await window.electron.scenario.getRunningTaskIds();
+      return Array.isArray(r?.runningTaskIds) ? r.runningTaskIds : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Connected browser extensions, with their reported versions + when
+   *  the bridge accepted the connection. Used to detect outdated
+   *  extensions: an extension that pre-dates the version-reporting
+   *  protocol (< 1.2.0) shows up with version === '' AND has been
+   *  connected for > 5s without sending hello (older versions don't
+   *  send it at all). */
+  async getConnectedExtensions(): Promise<Array<{ id: string; version: string; tabCount: number; connectedAt: number }>> {
+    if (MATRIX_EDITION) return [];   // 矩阵走指纹内核,不用扩展
+    try {
+      const r = await window.electron.scenario.getConnectedExtensions();
+      return Array.isArray(r?.extensions) ? r.extensions : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** All recorded runs across every task, newest-first. Used by the
+   *  Run History page. */
+  async getAllRuns(): Promise<Array<{
+    task_id: string;
+    started_at: number;
+    finished_at?: number;
+    status: 'success' | 'failure' | 'skipped' | 'running';
+    reason?: string;
+    collected_count?: number;
+    draft_count?: number;
+  }>> {
+    if (MATRIX_EDITION) {
+      try { const r = await MX()?.listRuns?.(); return r?.ok && Array.isArray(r.runs) ? r.runs.map((x: any) => {
+        const state = mxRunStatusOf(x);
+        return { task_id: x.taskId, started_at: x.startedAt, finished_at: x.finishedAt,
+          status: state === 'ok' ? 'success' : state === 'failed' ? 'failure' : state, reason: x.reason, collected_count: 0, draft_count: 0 };
+      }) : []; } catch { return []; }
+    }
+    try {
+      const r = await window.electron.scenario.getAllRuns();
+      return Array.isArray(r?.runs) ? r.runs : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Rich run records (v2.4.22+) — full task snapshot + step logs +
+   *  output dir. Replaces getAllRuns for the Run History UI. */
+  async listRunRecords(filter?: { task_id?: string; platform?: string; light?: boolean }): Promise<Array<any>> {
+    if (MATRIX_EDITION) {
+      // 按 platform tab 过滤:runStore 只按 taskId 过滤,不认 platform → 之前「我的矩阵运行记录」
+      // 抖音 tab 下混进币安/推特/小红书的记录。按记录真实 platform(runStore 每条都存了)再筛一遍。
+      // 仅在「无 task_id」的全局按平台列表时筛;带 task_id 时已是单任务(单平台)记录,不再叠 platform
+      // 过滤——否则 openHistoryForTask 对非 x/xhs/binance 平台回退 currentPlatform、一旦不匹配会把
+      // 该任务历史整个筛空。
+      try {
+        const r = await MX()?.listRuns?.(filter?.task_id ? { taskId: filter.task_id } : undefined);
+        const runs = r?.ok && Array.isArray(r.runs) ? r.runs : [];
+        const scoped = (filter?.platform && !filter?.task_id)
+          ? runs.filter((x: any) => (x?.platform || 'douyin') === filter.platform)
+          : runs;
+        return scoped.map(mxRunToRecord);
+      } catch { return []; }
+    }
+    try {
+      const r = await window.electron.scenario.listRunRecords(filter);
+      return Array.isArray(r?.records) ? r.records : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Single record lookup, for the read-only detail page. */
+  async getRunRecord(id: string): Promise<any | null> {
+    if (MATRIX_EDITION) {
+      try { const r = await MX()?.listRuns?.(); const rec = r?.ok && Array.isArray(r.runs) ? r.runs.find((x: any) => x.id === id) : null; return rec ? mxRunToRecord(rec) : null; } catch { return null; }
+    }
+    try {
+      const r = await window.electron.scenario.getRunRecord(id);
+      return r?.record || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async getRunProgress(taskId?: string): Promise<ScenarioRunProgress | null> {
+    if (MATRIX_EDITION) {
+      if (!taskId) return null;
+      // 按任务取进度(并发跑多个任务时各取各的,不串台)。
+      try { const r = await MX()?.getRunProgress?.(taskId); return mxProgressToScenario(taskId, r); } catch { return null; }
+    }
+    try {
+      return await window.electron.scenario.getRunProgress(taskId) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** v4.31.41: Persistent fallback for the detail page —— in-memory progress
+   *  gets cleared 30s after task end, but runRecords keeps step_logs forever.
+   *  UI mounts: read latest record, show its step_logs as a baseline; live
+   *  polling overlays in-memory progress when task is actively running. */
+  async getLatestRunRecord(taskId: string): Promise<any | null> {
+    if (MATRIX_EDITION) {
+      try { const r = await MX()?.listRuns?.({ taskId }); const recs = r?.ok && Array.isArray(r.runs) ? r.runs : []; return recs.length ? mxRunToRecord(recs[0]) : null; } catch { return null; }
+    }
+    try {
+      return await (window.electron.scenario as any).getLatestRunRecord(taskId) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async requestAbort(_taskId?: string): Promise<void> {
+    if (MATRIX_EDITION) {
+      // 按平台并发:只停【这个任务所在平台】,不连累其它平台正在跑的任务。
+      // 🚨 平台必须取 task.platform(mxTaskToScenario 一直在透传的真实字段),不能查
+      //   MATRIX_ENGAGE_ID_TO_PLATFORM —— 那张表【只收录 *_auto_engage】,搬运/发帖/图文/回粉
+      //   的 scenario_id(bitget_repost / okx_post / …)查不到 → undefined → 落到 sidecar 的
+      //   「全停」分支:abort 所有平台 + closeAllKernels 全关。用户 2026-08-06 实测:跑着币安
+      //   涨粉,停掉 OKX 的搬运,币安涨粉连窗口一起被杀。
+      // 🚨 拿不到平台时【宁可不停,也不能全停】:全停的误伤(杀掉所有平台正在跑的任务)远大于
+      //   漏停(用户再点一次任务卡上的停止,那条路带 platform)。
+      try {
+        let platform: string | undefined;
+        if (_taskId) {
+          const t = await this.getTask(_taskId);
+          platform = (t as any)?.platform || (t ? MATRIX_ENGAGE_ID_TO_PLATFORM[(t as any).scenario_id] : undefined);
+        }
+        // taskId 一起带上:sidecar 核对「该平台正在跑的确实是这个任务」才停(任务级停止语义)。
+        if (platform) await MX()?.stopTask?.({ platform, taskId: _taskId });
+        else console.warn(`[scenario] requestAbort: no platform for task ${_taskId}, refusing global stop`);
+      } catch {}
+      return;
+    }
+    try {
+      await window.electron.scenario.requestAbort(_taskId);
+    } catch {}
+  }
+
+  // ── XHS login gate ──
+
+  async checkXhsLogin(platform: 'xhs' | 'x' | 'binance' | 'tiktok' | 'youtube' | 'douyin' | 'kuaishou' | 'bilibili' | 'shipinhao' | 'toutiao' = 'xhs'): Promise<XhsLoginStatus> {
+    // 矩阵号:登录是【每个账号在各自指纹内核里】扫码完成的(在「我的矩阵账号」里),
+    // 不存在「一个浏览器登录态」这回事 → 运行前登录门禁恒通过(没登录的号跑时自动跳过)。
+    if (MATRIX_EDITION) return { loggedIn: true };
+    try {
+      return await window.electron.scenario.checkXhsLogin(platform as any);
+    } catch (err) {
+      return { loggedIn: false, reason: 'browser_not_connected' };
+    }
+  }
+
+  async openXhsLogin(platform: 'xhs' | 'x' | 'binance' | 'tiktok' | 'youtube' | 'douyin' | 'kuaishou' | 'bilibili' | 'shipinhao' | 'toutiao' = 'xhs'): Promise<{ ok: boolean; reason?: string }> {
+    if (MATRIX_EDITION) return { ok: true };
+    try {
+      return await window.electron.scenario.openXhsLogin(platform as any);
+    } catch (err) {
+      return { ok: false, reason: String(err) };
+    }
+  }
+
+  // ── Creator center secondary gate (xhs / douyin 图文创作专用) ──
+  // 首页 tab 不等于创作者中心 tab,LoginRequiredModal 额外加一行检查保证用户
+  // 真打开过 creator.* 子域、且不是停在登录重定向页。
+
+  async checkCreatorCenter(platform: 'xhs' | 'douyin' | 'kuaishou' | 'bilibili' | 'shipinhao' | 'toutiao'): Promise<XhsLoginStatus> {
+    try {
+      return await window.electron.scenario.checkCreatorCenter(platform as any);
+    } catch (err) {
+      return { loggedIn: false, reason: 'browser_not_connected' };
+    }
+  }
+
+  async openCreatorCenter(platform: 'xhs' | 'douyin' | 'kuaishou' | 'bilibili' | 'shipinhao' | 'toutiao'): Promise<{ ok: boolean; reason?: string }> {
+    try {
+      return await window.electron.scenario.openCreatorCenter(platform as any);
+    } catch (err) {
+      return { ok: false, reason: String(err) };
+    }
+  }
+
+  /** 视频任务登录预检【cookie 快路径】(req 3):返回 {loggedIn} 或 null(拿不准 → 调用方回退老校验)。 */
+  async checkVideoLoginByCookie(platform: string, which?: 'main' | 'creator'): Promise<{ loggedIn: boolean } | null> {
+    try {
+      return await (window.electron.scenario as any).checkVideoLoginByCookie(platform, which);
+    } catch {
+      return null;
+    }
+  }
+
+  /** 【多平台】一次性 cookie 预检:一次 CDP 读全部、按域名+名逐平台判。返回 { [platform]: true|false|null }。 */
+  async checkVideoLoginByCookieBatch(items: { platform: string; which?: 'main' | 'creator' }[]): Promise<Record<string, boolean | null>> {
+    try {
+      return await (window.electron.scenario as any).checkVideoLoginByCookieBatch(items) || {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** 在唯一的检查/登录窗里给某平台开一个 tab 登录(一窗多 tab,不再每点开新窗;role 各平台不同)。 */
+  async openVideoLoginInCheckWindow(url: string, role?: string): Promise<{ ok: boolean; diag?: string }> {
+    const fn = (window.electron?.scenario as any)?.openLoginInCheckWindow;
+    if (typeof fn !== 'function') {
+      return { ok: false, diag: 'preload 没暴露 openLoginInCheckWindow(typeof=' + typeof fn + ')' };
+    }
+    try {
+      const r: any = await fn(url, role);
+      if (r && typeof r === 'object' && typeof r.diag === 'string') return r;   // 主进程新代码:带 diag,透传
+      return { ok: !!(r && r.ok), diag: '主进程返回无 diag(=主bundle可能是旧的): ' + JSON.stringify(r) };
+    } catch (e: any) {
+      return { ok: false, diag: 'IPC 抛错: ' + String(e?.message || e) };       // reject:无 handler / 主进程抛异常
+    }
+  }
+
+  /** 模态关闭时收掉检查/登录窗。 */
+  async closeVideoLoginCheckWindow(): Promise<void> {
+    try { await (window.electron.scenario as any).closeLoginCheckWindow(); } catch { /* ignore */ }
+  }
+
+  // ── Derived helpers ──
+
+  /** Aggregate per-task stats the task dashboard likes to show.
+   *
+   *  v5.x+: the previous 3 cards (累计采集 / 生成草稿 / 已推送) were
+   *  replaced with 累计完成 / 累计消耗 / 上次完成 / 上次消耗. The new
+   *  fields are computed from per-run telemetry (`action_counts`,
+   *  `tokens_used`, `cost_usd`) that orchestrators emit via
+   *  `ctx.addActionCount()` + the auto-summed token/cost maps in
+   *  scenarioManager. Pre-rollout runs lack these fields, so they
+   *  contribute 0 to the cumulative totals and the UI shows '-' for
+   *  the "last run" panel until a fresh run lands. */
+  async getTaskStats(taskId: string): Promise<{
+    runs: ScenarioTaskRun[];
+    draft_count: number;
+    pending_draft_count: number;
+    pushed_draft_count: number;
+    last_run_at: number | null;
+    last_run_status: ScenarioTaskRun['status'] | null;
+    cooldown_ends_at: number;
+    /** Sum across every recorded successful run, keyed by free-form
+     *  action type ('like' / 'follow' / 'comment' / 'reply' / 'post'). */
+    cumulative_action_counts: Record<string, number>;
+    /** Sum of credits consumed across every recorded run. */
+    cumulative_tokens_used: number;
+    /** Sum of USD cost across every recorded run (computed at run-time
+     *  from system_config.token_price_per_million). */
+    cumulative_cost_usd: number;
+    /** action_counts of the most recent run, or {} if it doesn't have any. */
+    last_run_action_counts: Record<string, number>;
+    /** Credits consumed by the most recent run, or 0. */
+    last_run_tokens_used: number;
+    /** USD cost of the most recent run, or 0. */
+    last_run_cost_usd: number;
+  }> {
+    const [runStatusResult, drafts] = await Promise.all([
+      this.runStatus(taskId).catch(() => ({ runs: [], cooldown_ends_at: 0 })),
+      this.listDrafts(taskId),
+    ]);
+    const runs = Array.isArray(runStatusResult?.runs) ? runStatusResult.runs : [];
+    const cooldown_ends_at = runStatusResult?.cooldown_ends_at || 0;
+    // v6.x: '上次完成' 是上一次真正跑完的统计 — 不能选 status='running' 的当前
+    //   in-progress run(那个 action_counts 永远是空/0,会把上次的正确数据顶掉)。
+    //   优先找最近一条 status≠'running' 的 run;全是 running 才回退到末尾。
+    // 「上次完成」= 最近一次【非 running】的 run。矩阵 runStore 返回【最新在前】
+    //   (addRun unshift),而老逻辑「最高下标=最新」在这种顺序下会取到【最旧】那条
+    //   → 详情页上次完成与运行记录对不上。改为按 started_at 取最大,与数组顺序无关。
+    let last: any = null;
+    for (const r of runs) {
+      if (!r || r.status === 'running') continue;
+      if (!last || (r.started_at || 0) > (last.started_at || 0)) last = r;
+    }
+    // 全是 running / 没有非 running 时 → 回退到 started_at 最大的那条。
+    if (!last) for (const r of runs) { if (r && (!last || (r.started_at || 0) > (last.started_at || 0))) last = r; }
+
+    // Cumulative aggregation. Iterate all runs (including failed/skipped —
+    // an action that succeeded before a later failure still counts).
+    const cumulative_action_counts: Record<string, number> = {};
+    let cumulative_tokens_used = 0;
+    let cumulative_cost_usd = 0;
+    for (const r of runs) {
+      const ac = r.action_counts;
+      if (ac && typeof ac === 'object') {
+        for (const [k, v] of Object.entries(ac)) {
+          cumulative_action_counts[k] = (cumulative_action_counts[k] || 0) + (Number(v) || 0);
+        }
+      }
+      cumulative_tokens_used += Number(r.tokens_used) || 0;
+      cumulative_cost_usd    += Number(r.cost_usd)    || 0;
+    }
+
+    return {
+      runs,
+      draft_count: drafts.length,
+      pending_draft_count: drafts.filter(d => d.status === 'pending').length,
+      pushed_draft_count: drafts.filter(d => d.status === 'pushed').length,
+      last_run_at: last?.started_at || null,
+      last_run_status: last?.status || null,
+      cooldown_ends_at,
+      cumulative_action_counts,
+      cumulative_tokens_used,
+      cumulative_cost_usd,
+      last_run_action_counts: (last?.action_counts && typeof last.action_counts === 'object') ? last.action_counts : {},
+      last_run_tokens_used: Number(last?.tokens_used) || 0,
+      last_run_cost_usd: Number(last?.cost_usd) || 0,
+    };
+  }
+}
+
+export const scenarioService = new ScenarioService();

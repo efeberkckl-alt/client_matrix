@@ -1,0 +1,378 @@
+/**
+ * MatrixReplyFansWizard — 矩阵版「抖音 · 自动回复粉丝评论」向导。
+ *
+ * 由老客户端 XhsReplyFansCommentWizard(引流语 + 概率 + 频率 + 条款)迁移而来,
+ * 唯一区别 = 把「控制 1 个账号」改成「勾选多个已登录账号」(账号勾选段照搬
+ * MatrixTaskWizard 的 Step 1)。reply_fan 没有配额(回复对象是粉丝评论本身,不按
+ * 关键词搜),所以没有点赞/关注/评论滑条。
+ *
+ *   Step 1 — 勾选多个抖音账号(各号在自己的指纹浏览器创作者中心评论管理里回复)
+ *   Step 2 — 核心引流语(选填)+ 引流尾巴出现概率
+ *   Step 3 — 运行间隔 + 摘要 + 条款
+ */
+
+import React, { useEffect, useMemo, useState } from 'react';
+import { i18nService } from '../../services/i18n';
+import MatrixFunnelConfig, { FunnelUnsetConfirm, countUnconfigured, funnelAiOffError, effFunnelProb, rewriteField, anyPerAccountRaw, FUNNEL_PROB_DEFAULT as FPD } from './MatrixFunnelConfig';
+import { presetAccountIds, usePresetUsed, usePresetPrune } from '../../uiEdition';
+
+type WizardStep = number;   // 1..totalSteps(抖音 4 步:账号 / 数量 / 引流语 / 频率;其它平台 3 步,无「数量」)
+
+const FUNNEL_PHRASE_MAX = 1000;
+const FUNNEL_PROB_MIN = 1;
+const FUNNEL_PROB_MAX = 100;
+const FUNNEL_PROB_DEFAULT = 100;   // 2026-10-28:有引流语时默认 100%(原 50%);没填引流语时概率不生效
+
+export interface WizardAccount { id: string; displayName: string; status: string; keywords?: string[]; group?: string; platform?: string; nickname?: string; displayId?: string; avatar?: string }
+
+// 平台 id → 中文名(账号行里标出来)。
+const PLATFORM_NAME: Record<string, string> = { douyin: '抖音', xhs: '小红书', bilibili: 'B站', kuaishou: '快手', tiktok: 'TikTok', x: 'X', binance: '币安广场', youtube: 'YouTube', shipinhao: '视频号', toutiao: '头条' };
+
+interface Props {
+  platformLabel: string;
+  platform?: string;                       // 平台 id(用于「无账号」引导跳到对应 tab)
+  accounts: WizardAccount[];               // 可选账号(已登录)
+  accountsLoading?: boolean;
+  initialTask?: any | null;                // 编辑时传入矩阵任务
+  onCancel: () => void;
+  onSave: (input: { name: string; accountIds: string[]; concurrency: number; frequency: string; funnel: { funnel_phrase: string; funnel_probability: number }; funnelByAccount: Record<string, { funnel_phrase: string; funnel_probability: number }> | null; aiComment: boolean; maxReplyPerComment?: number; maxRepliesPerRun?: number }) => Promise<void> | void;
+}
+
+const MatrixReplyFansWizard: React.FC<Props> = ({ platformLabel, platform, accounts, accountsLoading, initialTask, onCancel, onSave }) => {
+  const editing = !!initialTask;
+  const [step, setStep] = useState<WizardStep>(1);
+
+  // 平台相关文案。小红书是唯一「逐篇笔记进详情页」的流程,其余短视频平台在各自创作者中心
+  // 「评论管理」集中回复。创作者中心中文名 + 作品/笔记 量词按平台切。
+  const isXhs = platform === 'xhs';
+  // 「单个用户评论最大回复数」只做抖音(用户 2026-08-25 明确:其余平台的回复粉丝任务不加)。
+  const showMaxReply = platform === 'douyin';
+  // 步骤表(用户 2026-09-12:两个数量单独一步、引流语+概率一步):抖音 4 步,其它平台没有数量步 → 3 步。
+  const stepKeys: Array<'accounts' | 'counts' | 'funnel' | 'terms'> = showMaxReply ? ['accounts', 'counts', 'funnel', 'terms'] : ['accounts', 'funnel', 'terms'];
+  const totalSteps = stepKeys.length;
+  //   最低 1 —— 回复粉丝任务本来就是要回的,0 没意义;默认 1 = 老行为「回过就不再回」。
+  const [maxReplyPerComment, setMaxReplyPerComment] = useState<number>(
+    typeof (initialTask as any)?.maxReplyPerComment === 'number'
+      ? Math.min(5, Math.max(1, (initialTask as any).maxReplyPerComment)) : 1);
+  // 每号本次运行最多回复几条(仅抖音):抖音单账号一天能发的评论条数有限,超了后面全发不出去还在傻发。
+  //   默认 100、可选 1~300;只管本次运行,到数就收工。老任务没配 → 显示/存 100。
+  const [maxRepliesPerRun, setDailyReplyCap] = useState<number>(
+    typeof (initialTask as any)?.maxRepliesPerRun === 'number'
+      ? Math.min(300, Math.max(1, Math.round((initialTask as any).maxRepliesPerRun))) : 100);
+  const ccNameZh = platform === 'kuaishou' ? i18nService.t('wzReplyCcKuaishou')
+    : platform === 'bilibili' ? i18nService.t('wzReplyCcBilibili')
+    : platform === 'xhs' ? i18nService.t('wzReplyCcXhs')
+    : platform === 'shipinhao' ? i18nService.t('wzReplyCcShipinhao')
+    : platform === 'toutiao' ? i18nService.t('wzReplyCcToutiao')
+    : i18nService.t('wzReplyCcDouyin');
+  const itemZh = isXhs ? i18nService.t('wzReplyItemNote') : i18nService.t('wzReplyItemWork');
+
+  // ── 账号(回复粉丝评论不需要关键词,只要已登录创作者中心) ──
+  const [selected, setSelected] = useState<Set<string>>(() => {
+    if (initialTask?.accountIds) return new Set(initialTask.accountIds);
+    if (!initialTask && presetAccountIds(platform).length) return new Set<string>(presetAccountIds(platform));   // 简洁版:创建任务时已选好的号
+    return new Set(accounts.filter((a) => a.status !== 'banned' && a.status !== 'login_required').map((a) => a.id));
+  });
+  // 简洁版预选号:账号加载完后剔除不在本向导列表里的号(见 usePresetPrune)
+  const presetUsed = usePresetUsed(initialTask, platform);
+  usePresetPrune(presetUsed, accounts, accountsLoading, (live) => setSelected((prev) => { const n = new Set(Array.from(prev).filter((id) => live.has(id))); return n.size === prev.size ? prev : n; }));
+  const toggle = (id: string) => setSelected((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+
+  // ── 引流语 + 概率 ──
+  const [funnelPhrase, setFunnelPhrase] = useState<string>(String(initialTask?.funnel?.funnel_phrase || ''));
+  const hasFunnel = funnelPhrase.trim().length > 0;
+  const [funnelProb, setFunnelProb] = useState<number>(
+    // 只在保存过【真实概率(≥ MIN)】时回填;老任务没配引流保存的是 0 →
+    //   原来 Math.max(1,0)=1 会让「编辑后补引流语」默认成 1% → 改成回落 50% 默认(用户实测)。
+    typeof initialTask?.funnel?.funnel_probability === 'number' && initialTask.funnel.funnel_probability >= FUNNEL_PROB_MIN
+      ? Math.min(FUNNEL_PROB_MAX, initialTask.funnel.funnel_probability)
+      : FUNNEL_PROB_DEFAULT
+  );
+  // ── 各账号独立引流语(同 MatrixTaskWizard;编辑回填 funnelByAccount) ──
+  // 模式判定按【字段存在】而非条目数:各账号模式但一个都没配(允许放行)保存的是 {},
+  // 用 length 判会误回共用(用户实测 bug)。兼容 camel(矩阵原始)与 snake(scenario 映射)两种形状。
+  const initFba = (initialTask as any)?.funnelByAccount ?? (initialTask as any)?.funnel_by_account;
+  const [funnelPerMode, setFunnelPerMode] = useState<boolean>(initFba !== undefined && initFba !== null && typeof initFba === 'object');
+  const [funnelPerMap, setFunnelPerMap] = useState<Record<string, { funnel_phrase: string; funnel_probability: number; funnel_rewrite?: boolean }>>(() => {
+    const src = initFba || {};
+    const out: Record<string, { funnel_phrase: string; funnel_probability: number; funnel_rewrite?: boolean }> = {};
+    for (const [id, v] of Object.entries(src) as any) out[id] = { funnel_phrase: String(v?.funnel_phrase || ''), funnel_probability: typeof v?.funnel_probability === 'number' && v.funnel_probability >= FUNNEL_PROB_MIN ? Math.min(FUNNEL_PROB_MAX, v.funnel_probability) : FPD, ...rewriteField(v) };
+    return out;
+  });
+  const [funnelUnsetConfirm, setFunnelUnsetConfirm] = useState<number | null>(null);
+  // AI改写引流语(共用模式那份;各账号模式存在各自 FunnelValue.funnel_rewrite):缺省 = 开。
+  const [funnelRewrite, setFunnelRewrite] = useState<boolean>(initialTask?.funnel?.funnel_rewrite !== false);
+  // AI自主评论(任务级 ai_comment):老任务没这个字段 = 开(老行为);只有显式存了 false 才是关。
+  const [aiComment, setAiComment] = useState<boolean>((initialTask as any)?.ai_comment !== false);
+  const selectedAccounts = accounts.filter((a) => selected.has(a.id)).map((a) => ({ id: a.id, title: a.nickname || a.displayName, group: a.group, platformName: PLATFORM_NAME[a.platform || ''] || a.platform, avatar: a.avatar }));
+
+  // ── 调度(对齐矩阵 MatrixTaskFrequency:回复评论用 once/3h/6h/每日随机) ──
+  const [runInterval, setRunInterval] = useState<string>(initialTask?.frequency || 'daily_random');
+
+  // ── 条款 ──
+  const [termsAccepted, setTermsAccepted] = useState<boolean[]>([true, true]);
+  const allTermsAccepted = termsAccepted.every(Boolean);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  useEffect(() => { if (saveError) setSaveError(null); /* eslint-disable-next-line */ }, [selected, funnelPhrase, funnelProb, runInterval, aiComment, funnelPerMode, funnelPerMap]);
+
+  const stepKey = stepKeys[Math.min(Math.max(step, 1), totalSteps) - 1];
+  const canAdvance: Record<'accounts' | 'counts' | 'funnel' | 'terms', { ok: boolean; reason?: string }> = {
+    accounts: { ok: selected.size >= 1, reason: i18nService.t('wzReplyErrSelectAccount') },
+    counts: { ok: true },
+    // 关了 AI自主评论 → 引流语必填,硬卡(不走「不管了,下一步」确认)。
+    funnel: (() => { const e = funnelAiOffError(aiComment, funnelPerMode, selectedAccounts, { funnel_phrase: funnelPhrase, funnel_probability: funnelProb }, funnelPerMap); return e ? { ok: false, reason: e } : { ok: true }; })(),
+    terms: { ok: allTermsAccepted, reason: i18nService.t('wzReplyErrAcceptTerms') },
+  };
+
+  const handleSave = async () => {
+    if (saving) return;
+    if (!canAdvance.terms.ok) { setSaveError(canAdvance.terms.reason || ''); return; }
+    if (!canAdvance.funnel.ok) { setSaveError(canAdvance.funnel.reason || ''); return; }
+    setSaving(true);
+    try {
+      await onSave({
+        name: initialTask?.name || i18nService.t('wzReplyTaskName').replace('{platform}', platformLabel).replace('{n}', String(selected.size)),
+        accountIds: [...selected],
+        concurrency: selected.size,
+        frequency: runInterval,
+        // 各账号模式:任务级 funnel 置空、逐账号走 funnelByAccount;共用模式显式传 null 清掉旧的逐账号配置。
+        funnel: !funnelPerMode ? { funnel_phrase: funnelPhrase.trim(), funnel_probability: hasFunnel ? effFunnelProb(aiComment, funnelProb) : 0, ...(hasFunnel ? rewriteField({ funnel_rewrite: funnelRewrite }) : {}) } : { funnel_phrase: '', funnel_probability: 0 },
+        funnelByAccount: funnelPerMode ? (() => {
+          const out: Record<string, { funnel_phrase: string; funnel_probability: number; funnel_rewrite?: false }> = {};
+          for (const id of selected) { const v = funnelPerMap[id]; const ph = (v?.funnel_phrase || '').trim(); if (ph) out[id] = { funnel_phrase: ph, funnel_probability: effFunnelProb(aiComment, v.funnel_probability), ...rewriteField(v) }; }
+          return out;
+        })() : null,
+        aiComment,
+        // 只有抖音会用到;其余平台不传 → 剧本回落 1 = 老行为。
+        maxReplyPerComment: showMaxReply ? maxReplyPerComment : undefined,
+        maxRepliesPerRun: showMaxReply ? maxRepliesPerRun : undefined,
+      });
+    } catch (err) {
+      setSaveError(String(err instanceof Error ? err.message : err) || i18nService.t('wzReplyErrSaveFailed'));
+    } finally { setSaving(false); }
+  };
+
+  const intervalLabel = useMemo(() => {
+    const m: Record<string, string> = { once: i18nService.t('wzReplyIntervalOnce'), '3h': i18nService.t('wzReplyInterval3h'), '6h': i18nService.t('wzReplyInterval6h'), daily_random: i18nService.t('wzReplyIntervalDailyRandomOnce') };
+    return m[runInterval] || runInterval;
+  }, [runInterval]);
+
+  return (
+    <div className="w-full max-w-2xl max-h-[90vh] mx-auto rounded-2xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 shadow-sm overflow-hidden flex flex-col">
+      <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-800 shrink-0">
+        <div className="text-base font-semibold dark:text-white">💌 {editing ? i18nService.t('wzReplyTitleEdit').replace('{platform}', platformLabel) : i18nService.t('wzReplyTitleCreate').replace('{platform}', platformLabel)}</div>
+        <div className="flex items-center gap-3">
+          <span className="text-xs px-2.5 py-1 rounded-full border border-fuchsia-500/40 text-fuchsia-500 bg-fuchsia-500/5">{i18nService.t('wzReplyStepCounter').replace('{n}', String(step)).replace('{total}', String(totalSteps))}</span>
+          <button type="button" onClick={onCancel} disabled={saving} className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">✕</button>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+        {stepKey === 'accounts' && (
+          <>
+            <div className="rounded-lg border px-3 py-2 text-[11px] leading-relaxed border-fuchsia-500/30 bg-fuchsia-500/5 text-fuchsia-700 dark:text-fuchsia-300">
+              💌 {i18nService.t('wzReplyIntroP1')}<strong>{i18nService.t('wzReplyIntroFingerprintBrowser')}</strong>{i18nService.t('wzReplyIntroP2')}<strong>{ccNameZh}</strong>{isXhs ? <>{i18nService.t('wzReplyIntroEntryXhs')}</> : <>{i18nService.t('wzReplyIntroEntryOther')}</>}{i18nService.t('wzReplyIntroP3')}<strong>{i18nService.t('wzReplyIntroSkip')}</strong>{i18nService.t('wzReplyIntroP4').replace('{item}', itemZh)}<strong>{i18nService.t('wzReplyIntroPersona')}</strong>{i18nService.t('wzReplyIntroP5')}
+            </div>
+            <div>
+              <label className="text-sm font-medium dark:text-gray-200 mb-1.5 block">
+                {i18nService.t('wzReplySelectAccountLabel').replace('{platform}', platformLabel)}<span className="text-xs text-gray-400 font-normal ml-1">{i18nService.t('wzReplySelectAccountHint').replace('{cc}', ccNameZh).replace('{n}', String(selected.size))}</span>
+              </label>
+              <div className="space-y-1.5 max-h-64 overflow-auto rounded-lg border border-gray-200 dark:border-gray-700 p-2">
+                {accounts.length === 0 && accountsLoading && (
+                  <div className="p-3 text-center text-xs text-gray-400">{i18nService.t('wzReplyAccountsLoading')}</div>
+                )}
+                {accounts.length === 0 && !accountsLoading && (
+                  <div className="p-3 text-center space-y-2.5">
+                    <div className="text-xs text-gray-400">{i18nService.t('wzReplyNoAccounts').replace('{cc}', ccNameZh)}</div>
+                    <button
+                      type="button"
+                      onClick={() => { window.dispatchEvent(new CustomEvent('noobclaw:show-matrix-accounts', { detail: { platform } })); onCancel(); }}
+                      className="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-white text-sm font-semibold bg-fuchsia-500 hover:bg-fuchsia-600 active:scale-95"
+                    >{i18nService.t('wzReplyGoAddAccounts')}</button>
+                  </div>
+                )}
+                {accounts.map((a) => {
+                  // 回复粉丝只要已登录(未封、未掉线)即可,不要求关键词。
+                  const linked = a.status !== 'login_required' && a.status !== 'banned';
+                  const ready = linked;
+                  const reason = a.status === 'banned' ? i18nService.t('wzReplyStatusBanned') : a.status === 'login_required' ? i18nService.t('wzReplyStatusDisconnected') : '';
+                  const title = a.nickname || a.displayName;
+                  return (
+                    <label key={a.id} className={`flex items-center gap-2.5 text-sm px-2 py-1.5 rounded ${ready ? 'dark:text-gray-200 cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-800' : 'opacity-45 cursor-not-allowed'}`}>
+                      <input type="checkbox" checked={selected.has(a.id)} onChange={() => ready && toggle(a.id)} disabled={saving || !ready} className="h-4 w-4 accent-fuchsia-500 shrink-0" />
+                      {a.avatar
+                        ? <img src={a.avatar.replace(/^http:/, 'https:')} referrerPolicy="no-referrer" alt="" className="w-7 h-7 rounded-full object-cover bg-gray-200 dark:bg-gray-700 shrink-0" onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }} />
+                        : <span className="w-7 h-7 rounded-full bg-fuchsia-500/20 text-fuchsia-500 flex items-center justify-center text-xs font-bold shrink-0">{(title || '?').slice(0, 1)}</span>}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-fuchsia-500/10 text-fuchsia-500">{PLATFORM_NAME[a.platform || ''] || a.platform}</span>
+                          <span className="font-medium truncate dark:text-white">{title}</span>
+                          {a.displayId && <span className="text-[11px] text-gray-500 dark:text-gray-400 shrink-0">{i18nService.t('wzReplyAccountIdLabel').replace('{platform}', PLATFORM_NAME[a.platform || ''] || '')}{a.displayId}</span>}
+                          {a.status === 'login_required'
+                            ? <button type="button" onClick={(e) => { e.preventDefault(); e.stopPropagation(); window.dispatchEvent(new CustomEvent('noobclaw:show-matrix-accounts', { detail: { platform: a.platform || platform } })); onCancel(); }} title={i18nService.t('wzReplyLoginLinkTitle')} className="text-[11px] text-amber-500 underline decoration-dotted hover:text-amber-400 shrink-0">{i18nService.t('wzReplyDisconnectedGoLogin')}</button>
+                            : reason ? <span className="text-[11px] text-amber-500 shrink-0">{reason}</span> : null}
+                        </div>
+                        <div className="text-[11px] text-gray-400 truncate">
+                          {i18nService.t('wzReplyRemarkLabel')}{a.displayName}{a.group ? ` · ${a.group}` : ''}
+                        </div>
+                      </div>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          </>
+        )}
+
+        {stepKey === 'counts' && (
+          <>
+            {/* 单个用户评论最大回复数(仅抖音)。默认 1 = 老行为「同一条评论回过就不再回」。 */}
+            {showMaxReply && (
+              <div>
+                <label className="text-sm font-medium dark:text-gray-200 mb-1.5 block">
+                  {i18nService.currentLanguage === 'zh' ? '单个用户评论最大回复数' : 'Max replies per comment'}
+                  <span className="text-xs text-gray-400 font-normal ml-1">
+                    {i18nService.currentLanguage === 'zh'
+                      ? (maxReplyPerComment === 1 ? '同一条评论只回一次(默认)' : `同一条评论最多回 ${maxReplyPerComment} 次,回满就不再回它`)
+                      : (maxReplyPerComment === 1 ? 'reply once per comment (default)' : `at most ${maxReplyPerComment} replies to the same comment`)}
+                  </span>
+                </label>
+                <div className="flex gap-2">
+                  {[1, 2, 3, 4, 5].map((c) => (
+                    <button key={c} type="button" disabled={saving} onClick={() => setMaxReplyPerComment(c)}
+                      className={`px-4 py-1.5 rounded-lg text-sm border transition-colors ${maxReplyPerComment === c ? 'border-fuchsia-500 bg-fuchsia-500 text-white font-semibold' : 'border-gray-300 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:border-fuchsia-500/40'} ${saving ? 'opacity-60 cursor-not-allowed' : ''}`}>
+                      {c}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 每号本次运行最多回复几条(仅抖音)。默认 100、1~300;到数本次收工,防抖音评论风控。 */}
+            {showMaxReply && (
+              <div>
+                <label className="text-sm font-medium dark:text-gray-200 mb-1.5 block">
+                  {i18nService.currentLanguage === 'zh' ? '每个账号本次运行最多回复' : 'Max replies per account per run'}
+                  <span className="text-xs text-gray-400 font-normal ml-1">
+                    {i18nService.currentLanguage === 'zh'
+                      ? `每个账号每次运行最多回 ${maxRepliesPerRun} 条,到数就收工(抖音限制单账号每日评论数,防风控;1~300,默认 100)`
+                      : `at most ${maxRepliesPerRun} replies per account per run, then stop (Douyin caps daily comments; 1-300, default 100)`}
+                  </span>
+                </label>
+                <div className="flex items-center gap-3">
+                  <input type="number" min={1} max={300} step={1} value={maxRepliesPerRun} disabled={saving}
+                    onChange={(e) => { const v = parseInt(e.target.value, 10); if (!Number.isNaN(v)) setDailyReplyCap(Math.min(300, Math.max(1, v))); }}
+                    className="w-28 px-3 py-2 rounded-lg text-sm border border-gray-300 dark:border-gray-700 bg-transparent dark:text-gray-200 text-right" />
+                  <span className="text-xs text-gray-400">{i18nService.currentLanguage === 'zh' ? '条/次' : '/run'}</span>
+                </div>
+              </div>
+            )}
+
+          </>
+        )}
+
+        {stepKey === 'funnel' && (
+          <>
+            {/* 引流语配置:共用一份 / 各账号各自(点账号卡逐号配,未配=该号回复不带引流)。 */}
+            <MatrixFunnelConfig
+              accounts={selectedAccounts}
+              accent="fuchsia"
+              perMode={funnelPerMode}
+              setPerMode={setFunnelPerMode}
+              shared={{ funnel_phrase: funnelPhrase, funnel_probability: funnelProb, funnel_rewrite: funnelRewrite }}
+              setShared={(v) => { setFunnelPhrase(v.funnel_phrase.slice(0, FUNNEL_PHRASE_MAX)); setFunnelProb(v.funnel_probability); setFunnelRewrite(v.funnel_rewrite !== false); }}
+              perMap={funnelPerMap}
+              setPerMap={setFunnelPerMap}
+              aiComment={aiComment}
+              setAiComment={setAiComment}
+              disabled={saving}
+            />
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-xs text-amber-700 dark:text-amber-300 leading-relaxed space-y-1">
+              <div className="font-semibold">⚠️ {i18nService.t('wzReplySafetyTitle')}</div>
+              <ul className="list-disc list-inside space-y-0.5">
+                <li>{i18nService.t('wzReplySafetyBullet1').replace('{item}', itemZh)}</li>
+                <li>{i18nService.t('wzReplySafetyBullet2')}</li>
+              </ul>
+            </div>
+          </>
+        )}
+
+        {stepKey === 'terms' && (
+          <>
+            <div>
+              <label className="text-sm font-medium dark:text-gray-200 mb-2 block">⏰ {i18nService.t('wzReplyRunIntervalLabel')}</label>
+              <div className="flex gap-2 flex-wrap">
+                {[['once', i18nService.t('wzReplyIntervalOnce')], ['3h', i18nService.t('wzReplyInterval3h')], ['6h', i18nService.t('wzReplyInterval6h')], ['daily_random', i18nService.t('wzReplyIntervalDailyRandom')]].map(([value, label]) => (
+                  <button key={value} type="button" onClick={() => setRunInterval(value)} className={`px-2.5 py-1 rounded-md text-xs border transition-colors ${runInterval === value ? 'border-fuchsia-500 bg-fuchsia-500/10 text-fuchsia-500 font-medium' : 'border-gray-300 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-fuchsia-500/50'}`}>{label}</button>
+                ))}
+              </div>
+              {runInterval === 'daily_random' && <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">✨ {i18nService.t('wzReplyDailyRandomTip')}</p>}
+            </div>
+            <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 px-4 py-3 text-sm space-y-1.5">
+              <div className="font-semibold dark:text-gray-200 mb-1">📋 {i18nService.t('wzReplySummaryTitle')}</div>
+              <SummaryRow label={i18nService.t('wzReplySumAccountsLabel')} value={i18nService.t('wzReplySumAccountsValue').replace('{n}', String(selected.size)).replace('{item}', itemZh)} />
+              <SummaryRow label={i18nService.t('wzReplySumFunnelLabel')} value={(funnelPerMode
+                ? i18nService.t('wzFunnelSummaryPer').replace('{done}', String(selectedAccounts.length - countUnconfigured(selectedAccounts, funnelPerMap))).replace('{total}', String(selectedAccounts.length)) + (anyPerAccountRaw(funnelPerMap, selectedAccounts.map((a) => a.id)) ? ` · ${i18nService.t('wzFunnelRewriteOffTag')}` : '')
+                : (hasFunnel ? `"${funnelPhrase.trim().slice(0, 40)}${funnelPhrase.trim().length > 40 ? '...' : ''}" · ${effFunnelProb(aiComment, funnelProb)}%${funnelRewrite ? '' : ` · ${i18nService.t('wzFunnelRewriteOffTag')}`}` : i18nService.t('wzReplySumFunnelEmpty'))) + (aiComment ? '' : ` · ${i18nService.t('wzFunnelAiOffTag')}`)} />
+              <SummaryRow label={i18nService.t('wzReplySumScopeLabel')} value={i18nService.t('wzReplySumScopeValue').replace('{item}', isXhs ? i18nService.t('wzReplyScopeUnitXhs') : i18nService.t('wzReplyScopeUnitOther'))} />
+              <SummaryRow label={i18nService.t('wzReplySumConcurrencyLabel')} value={i18nService.t('wzReplySumConcurrencyValue').replace('{n}', String(selected.size))} />
+              <SummaryRow label={i18nService.t('wzReplySumFrequencyLabel')} value={intervalLabel} />
+              <SummaryRow label={i18nService.t('wzReplySumRhythmLabel')} value={isXhs ? i18nService.t('wzReplySumRhythmXhs') : i18nService.t('wzReplySumRhythmOther')} />
+            </div>
+            <div className="space-y-2">
+              <div className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">{i18nService.t('wzReplyTermsTitle')}</div>
+              {[i18nService.t('wzReplyTerm1').replace('{cc}', ccNameZh), i18nService.t('wzReplyTerm2')].map((term, i) => (
+                <label key={i} className="flex items-start gap-2 text-xs text-gray-700 dark:text-gray-300 cursor-pointer">
+                  <input type="checkbox" checked={termsAccepted[i]} onChange={(e) => { const next = [...termsAccepted]; next[i] = e.target.checked; setTermsAccepted(next); }} disabled={saving} className="mt-0.5 h-4 w-4 accent-fuchsia-500 shrink-0" />
+                  <span className="leading-relaxed">{term}</span>
+                </label>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      {saveError && (
+        <div className="px-6 pt-2 pb-1 shrink-0">
+          <div className="rounded-lg border px-3 py-2 text-xs leading-relaxed border-red-500/30 bg-red-500/5 text-red-600 dark:text-red-400">❌ {saveError}</div>
+        </div>
+      )}
+
+      <div className="px-6 py-4 border-t border-gray-200 dark:border-gray-800 flex items-center gap-2 shrink-0">
+        <button type="button" onClick={onCancel} disabled={saving} className="text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 px-2">{i18nService.t('wzReplyCancel')}</button>
+        <div className="flex-1" />
+        {step > 1 && <button type="button" onClick={() => setStep((step - 1) as WizardStep)} disabled={saving} className="px-4 py-2 rounded-lg text-sm font-medium border border-gray-300 dark:border-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50">{i18nService.t('wzReplyPrevStep')}</button>}
+        {step < totalSteps ? (
+          <button type="button" onClick={() => {
+            if (!canAdvance[stepKey].ok) { setSaveError(canAdvance[stepKey].reason || ''); return; }
+            // 各账号模式下还有账号没配引流语 → 弹确认(返回配置 / 不管了下一步),新建与编辑同拦。
+            if (stepKey === 'funnel' && funnelPerMode) {
+              const unset = countUnconfigured(selectedAccounts, funnelPerMap);
+              if (unset > 0) { setFunnelUnsetConfirm(unset); return; }
+            }
+            setSaveError(null); setStep((step + 1) as WizardStep);
+          }} disabled={saving} className="px-4 py-2 rounded-lg text-sm font-semibold bg-fuchsia-500 text-white hover:bg-fuchsia-600 disabled:opacity-50">{i18nService.t('wzReplyNextStep')}</button>
+        ) : (
+          <button type="button" onClick={handleSave} disabled={saving || !allTermsAccepted} className="px-5 py-2 rounded-lg text-sm font-semibold bg-fuchsia-500 text-white hover:bg-fuchsia-600 disabled:opacity-50">{saving ? i18nService.t('wzReplySaving') : (editing ? i18nService.t('wzReplySaveEdit') : i18nService.t('wzReplyCreateTask'))}</button>
+        )}
+      </div>
+
+      {funnelUnsetConfirm !== null && (
+        <FunnelUnsetConfirm
+          count={funnelUnsetConfirm}
+          accent="fuchsia"
+          onBack={() => setFunnelUnsetConfirm(null)}
+          onContinue={() => { setFunnelUnsetConfirm(null); setSaveError(null); setStep((step + 1) as WizardStep); }}
+        />
+      )}
+    </div>
+  );
+};
+
+const SummaryRow: React.FC<{ label: string; value: string }> = ({ label, value }) => (
+  <div className="flex gap-3 text-xs"><span className="text-gray-500 dark:text-gray-400 shrink-0 w-20">{label}</span><span className="text-gray-800 dark:text-gray-200 break-all">{value}</span></div>
+);
+
+export default MatrixReplyFansWizard;

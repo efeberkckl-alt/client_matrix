@@ -1,0 +1,207 @@
+// 联系我们 — 三件套共享组件。数据源与官网同一个接口 GET /api/site/contact
+// (免鉴权,admin「💬 官网联系方式」分组可改,30s 缓存,换客服号/二维码零发版):
+//   1. useSiteContact()        — 拉取 + 模块级缓存(5min)
+//   2. <ContactInlinePanel />  — 行内联系方式区(我的充值页底部 / 联系我们页复用)
+//   3. <ContactFloatWidget />  — 右侧悬浮小组件(首页用,顶部「联系我们」字样,无回到顶部小火箭)
+// 交互:点击条目弹居中卡片(二维码 / 链接 / 复制),再点关闭;链接经 shell.openExternal 出系统浏览器。
+import React, { useEffect, useState } from 'react';
+import { i18nService } from '../../services/i18n';
+import { getBackendApiUrl } from '../../services/endpoints';
+
+export type SiteContact = Record<string, { link?: string; image?: string }>;
+
+// ── 数据 ────────────────────────────────────────────────────────────
+let _cache: { at: number; data: SiteContact } | null = null;
+const CACHE_MS = 5 * 60_000;
+
+export function useSiteContact(): SiteContact {
+  const [data, setData] = useState<SiteContact>(_cache?.data || {});
+  useEffect(() => {
+    if (_cache && Date.now() - _cache.at < CACHE_MS) { setData(_cache.data); return; }
+    fetch(`${getBackendApiUrl()}/api/site/contact`)
+      .then((r) => r.json())
+      .then((j) => {
+        const c: SiteContact = (j && j.contact) || {};
+        _cache = { at: Date.now(), data: c };
+        setData(c);
+        // 二维码预热:进浏览器缓存,点开卡片即出图
+        Object.values(c).forEach((v) => { if (v.image) { const im = new Image(); im.src = v.image; } });
+      })
+      .catch(() => { /* 拉不到就不渲染,不影响页面 */ });
+  }, []);
+  return data;
+}
+
+// ── 图标(与官网浮窗同一套 path)────────────────────────────────────
+const WECHAT_ICON = (<><path d="M8.7 3C4.9 3 1.8 5.6 1.8 8.8c0 1.8 1 3.5 2.6 4.6l-.7 2 2.3-1.2c.8.2 1.6.4 2.4.4h.6c-.1-.4-.2-.9-.2-1.3 0-3.2 3.1-5.8 6.9-5.8h.6C15.6 4.9 12.5 3 8.7 3zM6.4 7.6c-.5 0-.9-.4-.9-.9s.4-.9.9-.9.9.4.9.9-.4.9-.9.9zm4.6 0c-.5 0-.9-.4-.9-.9s.4-.9.9-.9.9.4.9.9-.4.9-.9.9z" /><path d="M22.2 13.3c0-2.7-2.7-4.9-6-4.9s-6 2.2-6 4.9 2.7 4.9 6 4.9c.7 0 1.4-.1 2-.3l1.9 1-.5-1.6c1.6-.9 2.6-2.3 2.6-4zm-8-1c-.4 0-.8-.3-.8-.8s.3-.8.8-.8.8.3.8.8-.4.8-.8.8zm4 0c-.4 0-.8-.3-.8-.8s.3-.8.8-.8.8.3.8.8-.4.8-.8.8z" /></>);
+const ICON_PATHS: Record<string, React.ReactNode> = {
+  wechat: WECHAT_ICON,
+  wechat_group: WECHAT_ICON,
+  telegram: <path d="M21.9 4.3 18.7 19.4c-.2 1.1-.9 1.3-1.8.8l-5-3.7-2.4 2.3c-.3.3-.5.5-1 .5l.4-5.1L19.1 5c.4-.4-.1-.6-.6-.2L6.1 12.6l-5-1.6c-1.1-.3-1.1-1 .2-1.5l19.5-7.5c.9-.3 1.7.2 1.4 1.6z" />,
+  qq_service: <path d="M12 2C8.7 2 6.3 4.2 6.3 7.4c0 .8-.2 1.3-.7 2-.9 1.2-1.4 2.3-1.4 3.4 0 .6.3 1 .8 1 .4 0 .7-.2 1-.7.2.9.6 1.7 1.2 2.4-.8.4-1.4 1-1.4 1.7 0 1.2 1.7 2.1 4 2.4-.3.3-.5.7-.5 1.1 0 .8.8 1.3 2.7 1.3s2.7-.5 2.7-1.3c0-.4-.2-.8-.5-1.1 2.3-.3 4-1.2 4-2.4 0-.7-.6-1.3-1.4-1.7.6-.7 1-1.5 1.2-2.4.3.5.6.7 1 .7.5 0 .8-.4.8-1 0-1.1-.5-2.2-1.4-3.4-.5-.7-.7-1.2-.7-2C17.7 4.2 15.3 2 12 2z" />,
+  qq_group: (<><circle cx="12" cy="7.5" r="3.2" /><path d="M12 12.2c-3 0-5.6 1.6-5.6 3.6V19h11.2v-3.2c0-2-2.6-3.6-5.6-3.6z" /><circle cx="4.6" cy="9.2" r="2.3" /><path d="M4.6 12.6c-1.9 0-3.9 1-4.1 2.5-.1.6.4 1.1 1 1.1h3.2v-.4c0-1.2.5-2.3 1.4-3.1-.5-.1-1-.1-1.5-.1z" /><circle cx="19.4" cy="9.2" r="2.3" /><path d="M19.4 12.6c-.5 0-1 0-1.5.1.9.8 1.4 1.9 1.4 3.1v.4h3.2c.6 0 1.1-.5 1-1.1-.2-1.5-2.2-2.5-4.1-2.5z" /></>),
+  email: <path d="M20 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm0 4.2-8 4.8-8-4.8V6l8 4.8L20 6v2.2z" />,
+};
+
+export const ContactIcon: React.FC<{ id: string; size?: number }> = ({ id, size = 20 }) => (
+  <svg viewBox="0 0 24 24" fill="currentColor" width={size} height={size} aria-hidden="true">{ICON_PATHS[id]}</svg>
+);
+
+// 渲染顺序 + 文案 key(与官网浮窗一致:微信客服/微信群聊/Telegram/QQ客服/QQ群/邮箱)
+export const CONTACT_ORDER = ['wechat', 'wechat_group', 'telegram', 'qq_service', 'qq_group', 'email'] as const;
+const LABEL_KEY: Record<string, string> = {
+  wechat: 'cuWechat', wechat_group: 'cuWechatGroup', telegram: 'cuTelegram', qq_service: 'cuQqService', qq_group: 'cuQqGroup', email: 'cuEmail',
+};
+export const contactLabel = (id: string) => i18nService.t(LABEL_KEY[id] || id);
+
+// 后端可能存裸值(QQ 号/@handle/邮箱)也可能是完整链接 — 与官网同一套归一化
+function toHref(key: string, raw?: string): string {
+  const v = String(raw || '').trim();
+  if (!v) return '';
+  if (/^https?:\/\//i.test(v) || /^mailto:/i.test(v)) return v;
+  if (key === 'email') return `mailto:${v}`;
+  if (key === 'telegram') return `https://t.me/${v.replace(/^@/, '')}`;
+  if (key === 'qq_service') return /^\d+$/.test(v) ? `tencent://message/?uin=${v}` : v;
+  if (key === 'qq_group') return /^\d+$/.test(v) ? '' : v; // 纯群号无跳转协议 → 卡片展示+复制
+  return v;
+}
+
+const openExternal = (url: string) => { try { (window as any).electron?.shell?.openExternal?.(url); } catch { /* noop */ } };
+
+// ── 弹出卡片(点击条目触发,点遮罩/×关闭)──────────────────────────
+const ContactModal: React.FC<{ id: string; conf: { link?: string; image?: string }; onClose: () => void }> = ({ id, conf, onClose }) => {
+  const [copied, setCopied] = useState(false);
+  const raw = String(conf.link || '').trim().replace(/^mailto:/i, '');
+  const href = toHref(id, conf.link);
+  const copyable = id === 'email' || (id === 'qq_group' && !href);
+  const doCopy = () => {
+    try { navigator.clipboard.writeText(raw); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* noop */ }
+  };
+  return (
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60" onClick={onClose}>
+      <div className="bg-white text-gray-900 rounded-2xl p-5 text-center shadow-2xl max-w-[280px] w-[85%]" onClick={(e) => e.stopPropagation()}>
+        <div className="font-semibold mb-3">{contactLabel(id)}</div>
+        {conf.image && (
+          <img src={conf.image} alt={contactLabel(id)} className="w-[200px] h-[200px] object-contain mx-auto mb-3" />
+        )}
+        {/* email / 纯群号:没有可跳转链接 → 展示文本 + 复制。 */}
+        {copyable && raw && (
+          <div className="flex items-center justify-center gap-2 text-sm">
+            <span className="break-all">{id === 'qq_group' ? `${i18nService.t('cuGroupNo')} ${raw}` : raw}</span>
+            <button type="button" onClick={doCopy} className="shrink-0 px-2 py-1 rounded-lg bg-gray-100 hover:bg-gray-200 text-xs">
+              {copied ? i18nService.t('cuCopied') : i18nService.t('cuCopy')}
+            </button>
+          </div>
+        )}
+        {/* 有 http(s) 链接(QQ客服/QQ群加群链接/TG…):链接本身【可点击】走系统浏览器,
+            旁边再给一个复制按钮 —— 用户既能直接打开,也能复制转发(2026-08-07 反馈:链接要能点)。 */}
+        {!copyable && href && (
+          <div className="flex items-center justify-center gap-2 text-sm">
+            <button type="button" onClick={() => openExternal(href)} className="text-blue-600 hover:underline break-all text-left">
+              {i18nService.t('cuClickContact')} {raw}
+            </button>
+            <button type="button" onClick={doCopy} className="shrink-0 px-2 py-1 rounded-lg bg-gray-100 hover:bg-gray-200 text-xs">
+              {copied ? i18nService.t('cuCopied') : i18nService.t('cuCopy')}
+            </button>
+          </div>
+        )}
+        <div className="mt-4">
+          <button type="button" onClick={onClose} className="px-4 py-1.5 rounded-lg text-xs dark:bg-gray-100 bg-gray-100 hover:bg-gray-200 text-gray-600">
+            {i18nService.t('cuClose')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ── 行内面板(充值页底部 / 联系我们页)────────────────────────────
+export const ContactInlinePanel: React.FC<{ showTitle?: boolean }> = ({ showTitle = true }) => {
+  const contact = useSiteContact();
+  const [openId, setOpenId] = useState<string | null>(null);
+  const entries = CONTACT_ORDER.filter((k) => contact[k]);
+  if (entries.length === 0) return null;
+  return (
+    <div className="mt-8 pt-5 border-t dark:border-claude-darkBorder border-claude-border">
+      {showTitle && (
+        <p className="text-sm font-medium dark:text-claude-darkText text-claude-text mb-3">{i18nService.t('contactUsMenu')}</p>
+      )}
+      <div className="flex flex-wrap gap-2">
+        {entries.map((k) => (
+          <button
+            key={k}
+            type="button"
+            onClick={() => setOpenId(k)}
+            className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border dark:border-claude-darkBorder border-claude-border dark:bg-claude-darkSurface bg-claude-surface text-xs dark:text-claude-darkTextSecondary text-claude-textSecondary hover:text-primary hover:border-primary/40 transition-colors"
+          >
+            <ContactIcon id={k} size={16} />
+            {contactLabel(k)}
+          </button>
+        ))}
+      </div>
+      {openId && contact[openId] && (
+        <ContactModal id={openId} conf={contact[openId]} onClose={() => setOpenId(null)} />
+      )}
+    </div>
+  );
+};
+
+// ── 右侧悬浮小组件(首页 / 充值页)──────────────────────────────────
+// 2026-10-29:平时只露一个显眼的「🎧 客服图标 + 联系我们」按钮;鼠标移上去或点一下才展开各联系方式,
+//   再点一下或鼠标移开就收起(弹出的二维码卡片不受影响)。
+const HEADSET_ICON = (
+  <svg viewBox="0 0 24 24" width={22} height={22} fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M3 14v-2a9 9 0 0 1 18 0v2" />
+    <path d="M21 15a2 2 0 0 1-2 2h-1v-6h1a2 2 0 0 1 2 2z" />
+    <path d="M3 15a2 2 0 0 0 2 2h1v-6H5a2 2 0 0 0-2 2z" />
+    <path d="M18 17v1a3 3 0 0 1-3 3h-3" />
+  </svg>
+);
+export const ContactFloatWidget: React.FC = () => {
+  const contact = useSiteContact();
+  const [openId, setOpenId] = useState<string | null>(null);
+  // 鼠标移上去 = 临时展开;点一下 = 钉住展开(再点收起);鼠标移开 = 全收起
+  const [hovered, setHovered] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const expanded = hovered || pinned;
+  const entries = CONTACT_ORDER.filter((k) => contact[k]);
+  if (entries.length === 0) return null;
+  return (
+    <>
+      {/* 一个竖向胶囊,贴在页面右下角(2026-10-29 改:原来 bottom-[12%] 会挡住首页教程卡片 / 订阅卡片按钮):收起时只有「耳机图标 + 联系我们(两行)」,绿底醒目;
+          展开时同一个胶囊【往上】长出各联系方式(展开后也保持绿底黑字,2026-10-29 用户:深色底看不清)。底边位置固定,展开不跳。 */}
+      <div className="fixed right-4 bottom-4 z-40"
+        onMouseEnter={() => setHovered(true)} onMouseLeave={() => { setHovered(false); setPinned(false); }}>
+        <div className={`w-[60px] flex flex-col-reverse items-center rounded-[30px] border shadow-lg transition-colors bg-primary border-transparent`}>
+          <button type="button" onClick={() => { if (pinned) { setPinned(false); setHovered(false); } else setPinned(true); }} aria-expanded={expanded} aria-label={i18nService.t('contactUsMenu')}
+            className={`w-full flex flex-col items-center gap-1 pt-2.5 pb-3 px-1 rounded-[30px] text-black`}>
+            {HEADSET_ICON}
+            <span className="text-[11px] font-bold leading-tight text-center break-all">{i18nService.t('contactUsMenu')}</span>
+          </button>
+          {expanded && (
+            <>
+              <div className="w-6 h-px bg-black/25 mt-1" />
+              <div className="flex flex-col items-center gap-1 pt-2.5">
+                {entries.map((k) => (
+                  <button
+                    key={k}
+                    type="button"
+                    title={contactLabel(k)}
+                    aria-label={contactLabel(k)}
+                    onClick={() => setOpenId(k)}
+                    className="w-10 h-10 rounded-full flex items-center justify-center text-black hover:bg-black/10 transition-all"
+                  >
+                    <ContactIcon id={k} size={20} />
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+      {openId && contact[openId] && (
+        <ContactModal id={openId} conf={contact[openId]} onClose={() => setOpenId(null)} />
+      )}
+    </>
+  );
+};

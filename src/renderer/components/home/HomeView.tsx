@@ -1,0 +1,366 @@
+import React, { useEffect, useState } from 'react';
+import { i18nService } from '../../services/i18n';
+import { noobClawAuth } from '../../services/noobclawAuth';
+import SidebarToggleIcon from '../icons/SidebarToggleIcon';
+import ComposeIcon from '../icons/ComposeIcon';
+import TickerMarquee from '../cowork/TickerMarquee';
+import WindowTitleBar from '../window/WindowTitleBar';
+import { WalletBadge } from '../common/WalletBadge';
+import { ContactFloatWidget } from '../common/ContactWidgets';
+import HomeVideoTutorials from './HomeVideoTutorials';
+import { GLOBAL_TOPBAR } from '../../uiEdition';
+import { useComplianceHidden } from '../../services/compliance';
+import { visiblePlatforms as cloudVisiblePlatforms } from '../mobile/cloudPhoneShared';
+
+export interface HomeViewProps {
+  isSidebarCollapsed?: boolean;
+  onToggleSidebar?: () => void;
+  onNewChat?: () => void;
+  updateBadge?: React.ReactNode;
+  /** 步骤①「关联矩阵账号」→ 我的矩阵账号页 */
+  onShowMatrix?: () => void;
+  /** 步骤②「创建矩阵任务并设为定期」→ 新建矩阵涨粉任务页 */
+  onShowMatrixTaskNew?: () => void;
+  /** 步骤③「查看涨粉情况」→ 我的矩阵涨粉任务页 */
+  onShowMatrixTasks?: () => void;
+  /** 充值入口 → 我的钱包 */
+  onShowWallet?: () => void;
+  /** 右上角「分享给好友」→ 邀请返佣页 */
+  onShowInvite?: () => void;
+  /** 登录过期账号数(喂步骤①的小角标) */
+  matrixExpiredCount?: number;
+  /** 简洁版:首页 = 大号「创建任务」+ 三步引导 + 教学视频 */
+  simple?: boolean;
+  /** 首页主体用简洁版的样子(标题 + 开始获取流量 + 一行视频)。2026-10-29 起专业版首页也这样;专业版自己的顶栏 / 行情条 / 联系我们照旧 */
+  simpleHome?: boolean;
+  /** 「选择获取模式」选云手机 → 我的云手机页 */
+  onShowCloudPhone?: () => void;
+}
+
+const OFFICIAL_SITE = 'https://noobclaw.com';
+// 文档首页跟界面语言走:中文→/zhong-wen-ban,其余(英/日/韩/越…)→ /english(文档仅中英两版,小语种落英文)。
+// ⚠️ 必须【调用时】求值,别写成裸 const 冻结在加载时语言。
+const tutorialHome = (): string => (i18nService.currentLanguage === 'zh' || i18nService.currentLanguage === 'zh-TW') ? 'https://docs.noobclaw.com/zhong-wen-ban' : 'https://docs.noobclaw.com/english';
+const GITHUB_URL = 'https://github.com/noobclaw';
+
+const HomeView: React.FC<HomeViewProps> = ({
+  isSidebarCollapsed,
+  onToggleSidebar,
+  onNewChat,
+  updateBadge,
+  onShowMatrix,
+  onShowMatrixTaskNew,
+  onShowMatrixTasks,
+  matrixExpiredCount = 0,
+  simple,
+  simpleHome,
+  onShowCloudPhone,
+}) => {
+  const SL = (zh: string, tw: string, en: string) => (i18nService.currentLanguage === 'zh' ? zh : i18nService.currentLanguage === 'zh-TW' ? tw : en);
+  const isMac = window.electron.platform === 'darwin';
+  const [authState, setAuthState] = useState(noobClawAuth.getState());
+  useEffect(() => noobClawAuth.subscribe(setAuthState), []);
+
+  const openExternal = (url: string) => { try { window.electron?.shell?.openExternal?.(url); } catch { /* noop */ } };
+
+  const sh = !!(simple || simpleHome);   // 主体用简洁版样子
+  // 「开始获取流量」→ 选择获取模式:浏览器窗口(新建窗口任务)/ 云手机(我的云手机页)
+  const [modeOpen, setModeOpen] = useState(false);
+  const [mode, setMode] = useState<'' | 'win' | 'phone'>('');
+  const cHidden = useComplianceHidden();
+  const phoneAvailable = !!onShowCloudPhone && cloudVisiblePlatforms(cHidden).length > 0;
+  const startTraffic = () => {
+    if (!phoneAvailable) { onShowMatrixTaskNew?.(); return; }   // 没有云手机可选 → 直接进浏览器窗口流程
+    setMode(''); setModeOpen(true);
+  };
+  const goMode = () => {
+    if (!mode) return;
+    setModeOpen(false);
+    if (mode === 'phone') onShowCloudPhone?.(); else onShowMatrixTaskNew?.();
+  };
+  return (
+    <div className="flex-1 flex flex-col dark:bg-claude-darkBg bg-claude-bg h-full">
+      {/* 右侧「联系我们」悬浮小组件 — 与官网浮窗同源同款(无回到顶部小火箭) */}
+      {/* 两版都显示(简洁版首页也要能一键联系我们) */}
+      <ContactFloatWidget />
+      {modeOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="w-full max-w-xl rounded-2xl bg-white dark:bg-[#10131e] border border-gray-200 dark:border-white/10 shadow-2xl" role="dialog" aria-label={SL('选择获取模式', '選擇獲取模式', 'Choose a mode')}>
+            <div className="flex items-center px-6 pt-5">
+              <div className="text-lg font-bold dark:text-white text-gray-900">{SL('选择获取模式', '選擇獲取模式', 'Choose a mode')}</div>
+              <button type="button" onClick={() => setModeOpen(false)} aria-label={SL('关闭', '關閉', 'Close')} className="ml-auto text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 text-lg">✕</button>
+            </div>
+            <div className="px-6 pt-1 pb-4 text-sm text-gray-500 dark:text-gray-400">{SL('用哪种方式帮你获取流量?', '用哪種方式幫你獲取流量?', 'How do you want to get traffic?')}</div>
+            <div className="grid grid-cols-2 gap-3 px-6">
+              {([
+                ['win', '🌐', SL('浏览器窗口', '瀏覽器窗口', 'Browser windows'), SL('用账号窗口在电脑上跑多个平台的账号', '用帳號窗口在電腦上跑多個平台的帳號', 'Run your accounts in account windows on this computer')],
+                ['phone', '📱', SL('云手机', '雲手機', 'Cloud phones'), SL('用云手机跑手机 App', '用雲手機跑手機 App', 'Run mobile apps on cloud phones')],
+              ] as const).map(([k, icon, title, desc]) => {
+                const on = mode === k;
+                return (
+                  <button key={k} type="button" onClick={() => setMode(k)} aria-pressed={on}
+                    className={`relative text-left p-4 rounded-2xl border flex flex-col gap-1.5 ${on ? '' : 'border-gray-200 dark:border-white/10 hover:border-gray-400 dark:hover:border-white/25'}`}
+                    style={on ? { borderColor: '#00FF88', boxShadow: '0 0 0 1px #00FF88, 0 0 0 5px rgba(0,255,136,0.10)' } : undefined}>
+                    {on && <span className="absolute right-3 top-3 w-5 h-5 rounded-full inline-flex items-center justify-center text-[11px] font-black" style={{ background: '#00FF88', color: '#04130B' }}>✓</span>}
+                    <span className="text-2xl">{icon}</span>
+                    <span className="text-base font-bold dark:text-white text-gray-900">{title}</span>
+                    <span className="text-xs leading-relaxed text-gray-500 dark:text-gray-400">{desc}</span>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="flex justify-end gap-2 px-6 py-5">
+              <button type="button" onClick={() => setModeOpen(false)} className="px-4 py-2 rounded-xl text-sm font-semibold bg-gray-100 dark:bg-[#262c40] dark:text-white text-gray-800">{SL('取消', '取消', 'Cancel')}</button>
+              <button type="button" disabled={!mode} onClick={goMode} className="px-4 py-2 rounded-xl text-sm font-bold text-[#04130B] disabled:opacity-40 disabled:cursor-not-allowed" style={{ background: '#00FF88' }}>
+                {mode === 'win' ? SL('下一步:新建窗口任务', '下一步:新建窗口任務', 'Next: new window task') : mode === 'phone' ? SL('下一步:打开我的云手机', '下一步:打開我的雲手機', 'Next: open cloud phones') : SL('下一步', '下一步', 'Next')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {!simple && !GLOBAL_TOPBAR && (<>
+      {/* ── 顶栏:与 AI对话首页同款(钱包/余额/充值/登录 + 官网/Twitter/Telegram) ── */}
+      <div className="draggable flex h-12 items-center justify-between px-4 border-b dark:border-claude-darkBorder border-claude-border shrink-0">
+        <div className="non-draggable h-8 flex items-center gap-2">
+          {isSidebarCollapsed && !GLOBAL_TOPBAR && (
+            <div className={`flex items-center gap-1 mr-1 ${isMac ? 'pl-[68px]' : ''}`}>
+              <button
+                type="button"
+                onClick={onToggleSidebar}
+                className="h-8 w-8 inline-flex items-center justify-center rounded-lg dark:text-claude-darkTextSecondary text-claude-textSecondary hover:bg-claude-surfaceHover dark:hover:bg-claude-darkSurfaceHover transition-colors"
+              >
+                <SidebarToggleIcon className="h-4 w-4" isCollapsed={true} />
+              </button>
+              <button
+                type="button"
+                onClick={onNewChat}
+                className="h-8 w-8 inline-flex items-center justify-center rounded-lg dark:text-claude-darkTextSecondary text-claude-textSecondary hover:bg-claude-surfaceHover dark:hover:bg-claude-darkSurfaceHover transition-colors"
+              >
+                <ComposeIcon className="h-4 w-4" />
+              </button>
+              {updateBadge}
+            </div>
+          )}
+          {/* BSC 钱包信息 + 订阅会员/购买积分(与矩阵头部一致) */}
+          <WalletBadge />
+        </div>
+        <div className="non-draggable flex items-center gap-1 mr-1">
+          <button
+            type="button"
+            onClick={() => openExternal(OFFICIAL_SITE)}
+            className="h-7 px-2 inline-flex items-center gap-1 rounded-md text-[11px] dark:text-claude-darkTextSecondary text-claude-textSecondary hover:bg-claude-surfaceHover dark:hover:bg-claude-darkSurfaceHover transition-colors"
+            title="Official Website"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5a17.92 17.92 0 01-8.716-2.247m0 0A9 9 0 013 12c0-1.605.42-3.113 1.157-4.418" /></svg>
+            {i18nService.t('coworkWebsite')}
+          </button>
+          <button
+            type="button"
+            onClick={() => openExternal('https://x.com/noobclaw_com')}
+            className="h-7 px-2 inline-flex items-center gap-1 rounded-md text-[11px] dark:text-claude-darkTextSecondary text-claude-textSecondary hover:bg-claude-surfaceHover dark:hover:bg-claude-darkSurfaceHover transition-colors"
+            title="Twitter / X"
+          >
+            <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" /></svg>
+            Twitter
+          </button>
+          <button
+            type="button"
+            onClick={() => openExternal('https://t.me/noobclaw')}
+            className="h-7 px-2 inline-flex items-center gap-1 rounded-md text-[11px] dark:text-claude-darkTextSecondary text-claude-textSecondary hover:bg-claude-surfaceHover dark:hover:bg-claude-darkSurfaceHover transition-colors"
+            title="Telegram"
+          >
+            <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z" /></svg>
+            Telegram
+          </button>
+        </div>
+        <WindowTitleBar inline />
+      </div>
+
+      {/* 行情跑马灯 */}
+      <TickerMarquee />
+
+      </>)}
+      {/* ── 主体 ── */}
+      <div className="flex-1 overflow-y-auto min-h-0">
+        <div className={`${sh ? 'max-w-5xl' : 'max-w-3xl'} mx-auto px-5 py-8 space-y-8`}>
+
+          {!sh && (<>
+          {/* Hero / 产品定位 */}
+          <div className="text-center space-y-3">
+            <img src="logo.png" alt="logo" className="w-14 h-14 mx-auto rounded-2xl shadow-lg" />
+            {/* 标题样式照搬官网 index.html hero:NoobClaw 绿色霓虹 + 第二行粉紫蓝渐变 */}
+            <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight leading-tight">
+              <span style={{ color: '#00ff88', textShadow: '0 0 20px rgba(0,255,136,0.5), 0 0 40px rgba(0,255,136,0.2)' }}>NoobClaw</span>
+              <span className="dark:text-white text-gray-900"> - {i18nService.t('hvHeroTitle')}</span>
+            </h1>
+            <div
+              className="text-2xl sm:text-3xl font-extrabold tracking-tight"
+              style={{
+                backgroundImage: 'linear-gradient(to right, #ff006e, #8b5cf6, #00d4ff)',
+                WebkitBackgroundClip: 'text',
+                backgroundClip: 'text',
+                color: 'transparent',
+                filter: 'drop-shadow(0 0 12px rgba(139,92,246,0.35))',
+              }}
+            >
+              {i18nService.t('hvHeroSubtitle')}
+            </div>
+            <p className="text-sm leading-relaxed dark:text-claude-darkTextSecondary text-claude-textSecondary max-w-xl mx-auto">
+              {i18nService.t('hvHeroDesc')}
+            </p>
+            {/* 平台标签行已按需求移除(2026-08-09);位置换给下方「视频教程」区 */}
+          </div>
+
+          </>)}
+
+          {/* 登录引导:未登录时给一个醒目的登录按钮(统一顶部横条右上角已有「登录」,不再重复) */}
+          {!authState.isAuthenticated && !GLOBAL_TOPBAR && (
+            <div className="rounded-2xl border dark:border-claude-accent/30 border-claude-accent/20 dark:bg-claude-accent/10 bg-claude-accent/5 px-5 py-4 flex flex-col sm:flex-row items-center justify-between gap-3">
+              <div className="text-center sm:text-left">
+                <div className="text-sm font-semibold dark:text-claude-darkText text-claude-text">
+                  {i18nService.t('hvLoginTitle')}
+                </div>
+                <div className="text-xs dark:text-claude-darkTextSecondary text-claude-textSecondary mt-0.5">
+                  {i18nService.t('hvLoginDesc')}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => noobClawAuth.requireLoginUI()}
+                className="shrink-0 px-5 py-2.5 rounded-xl text-sm font-bold bg-claude-accent text-black hover:bg-claude-accentHover transition-colors shadow-sm"
+              >
+                {i18nService.t('coworkConnectWallet')}
+              </button>
+            </div>
+          )}
+
+          {/* 简洁版首页第一屏:4 步说明 + 大一点的「创建任务」,整体在一屏正中间;教学视频(一行)在下面,往下滚才看到 */}
+          {sh && (
+            <div className={`${simple ? 'min-h-[calc(100vh-150px)]' : 'min-h-[calc(100vh-200px)]'} flex flex-col items-center justify-center gap-6`}>
+              {/* 标题:与专业版首页同款(logo + NoobClaw 霓虹绿 + 渐变副标题),不带下面那段介绍文字 */}
+              <div className="text-center space-y-2">
+                <img src="logo.png" alt="logo" className="w-12 h-12 mx-auto rounded-2xl shadow-lg" />
+                <h1 className="text-3xl font-extrabold tracking-tight leading-tight">
+                  <span style={{ color: '#00ff88', textShadow: '0 0 20px rgba(0,255,136,0.5), 0 0 40px rgba(0,255,136,0.2)' }}>NoobClaw</span>
+                  <span className="dark:text-white text-gray-900"> - {i18nService.t('hvHeroTitle')}</span>
+                </h1>
+                <div
+                  className="text-xl font-extrabold tracking-tight"
+                  style={{ backgroundImage: 'linear-gradient(to right, #ff006e, #8b5cf6, #00d4ff)', WebkitBackgroundClip: 'text', backgroundClip: 'text', color: 'transparent', filter: 'drop-shadow(0 0 12px rgba(139,92,246,0.35))' }}
+                >
+                  {i18nService.t('hvHeroSubtitle')}
+                </div>
+              </div>
+              <button type="button" onClick={startTraffic}
+                className="mt-4 inline-flex items-center gap-2 px-12 py-4 rounded-2xl text-xl font-bold bg-claude-accent hover:bg-claude-accentHover text-[#04130B] transition-colors">
+                {SL('开始获取流量', '開始獲取流量', 'Start getting traffic')}
+              </button>
+              {/* 教学视频:一行,和上面一起在第一屏里 */}
+              {/* 预留视频区的高度(标题行 + 一行卡片):还在加载时是骨架屏,拉取失败时留白 —— 上面的标题 / 4 步 / 创建任务按钮都不会被挪动 */}
+              <div className="w-full pt-2 min-h-[220px]"><HomeVideoTutorials filter={"select"} /></div>
+            </div>
+          )}
+
+          {/* 使用流程 / 涨粉教程 — 三步走(简洁版用上面那一行,这里不显示) */}
+          <div className={`space-y-4 ${sh ? 'hidden' : ''}`}>
+            <div className="flex items-center justify-between">
+              <h2 className="text-base font-bold dark:text-claude-darkText text-claude-text">
+                📖 {i18nService.t('hvStepsTitle')}
+              </h2>
+              {!simple && (
+              <button
+                type="button"
+                onClick={() => openExternal(tutorialHome())}
+                className="text-xs font-medium text-claude-accent hover:underline inline-flex items-center gap-1"
+              >
+                {i18nService.t('hvFullTutorial')}
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
+              </button>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <StepCard
+                index={1}
+                icon="👥"
+                title={i18nService.t('hvStep1Title')}
+                desc={i18nService.t('hvStep1Desc')}
+                cta={i18nService.t('hvStep1Cta')}
+                onClick={onShowMatrix}
+                badge={matrixExpiredCount > 0 ? matrixExpiredCount : undefined}
+              />
+              <StepCard
+                index={2}
+                icon="✨"
+                title={i18nService.t('hvStep2Title')}
+                desc={i18nService.t('hvStep2Desc')}
+                cta={i18nService.t('hvStep2Cta')}
+                onClick={onShowMatrixTaskNew}
+              />
+              <StepCard
+                index={3}
+                icon="📈"
+                title={i18nService.t('hvStep3Title')}
+                desc={i18nService.t('hvStep3Desc')}
+                cta={i18nService.t('hvStep3Cta')}
+                onClick={onShowMatrixTasks}
+              />
+            </div>
+          </div>
+
+          {/* 视频教程横排(与官网首页同款):数据来自 R2 清单,拉不到整个区不渲染 */}
+          {!sh && <HomeVideoTutorials filter="tags" />}
+
+          {!sh && (<>
+          {/* 开源安全提示 */}
+          <div className="flex justify-center">
+            <a
+              href="#"
+              onClick={(e) => { e.preventDefault(); openExternal(GITHUB_URL); }}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-full dark:bg-emerald-500/10 bg-emerald-50 border dark:border-emerald-500/20 border-emerald-200 hover:opacity-80 transition-opacity cursor-pointer"
+            >
+              <span className="text-base">{'🛡️'}</span>
+              <span className="text-xs dark:text-emerald-400 text-emerald-600 font-medium">
+                {i18nService.t('coworkOpenSource')}
+              </span>
+              <svg className="w-3 h-3 dark:text-emerald-400 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
+            </a>
+          </div>
+          </>)}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ── 单个步骤卡 ──
+const StepCard: React.FC<{
+  index: number;
+  icon: string;
+  title: string;
+  desc: string;
+  cta: string;
+  onClick?: () => void;
+  badge?: number;
+}> = ({ index, icon, title, desc, cta, onClick, badge }) => (
+  <div className="relative flex flex-col rounded-2xl border dark:border-white/10 border-gray-200/80 dark:bg-white/[0.03] bg-white p-4 hover:shadow-md hover:-translate-y-0.5 transition-all duration-150">
+    <div className="flex items-center gap-2 mb-2">
+      <span className="flex items-center justify-center w-7 h-7 rounded-full bg-claude-accent/15 text-claude-accent text-sm font-bold shrink-0">{index}</span>
+      <span className="text-xl">{icon}</span>
+      {badge !== undefined && (
+        <span className="ml-auto min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full bg-red-500 text-white text-[10px] font-bold leading-none">{badge}</span>
+      )}
+    </div>
+    <h3 className="text-sm font-semibold dark:text-claude-darkText text-claude-text mb-1">{title}</h3>
+    <p className="text-xs leading-relaxed dark:text-claude-darkTextSecondary text-claude-textSecondary flex-1">{desc}</p>
+    <button
+      type="button"
+      onClick={onClick}
+      className="mt-3 w-full py-2 rounded-xl text-xs font-semibold bg-claude-accent/10 text-claude-accent hover:bg-claude-accent/20 transition-colors"
+    >
+      {cta} →
+    </button>
+  </div>
+);
+
+export default HomeView;
